@@ -1,22 +1,27 @@
 # Architecture Overview
 
-_To be designed after requirements are understood._
-
 ## System Context
 
-_How does this system fit into the user's environment?_
+The time tracker runs across two environments:
+
+- **Remote** (dev server): tmux hooks capture focus events; Claude logs are parsed on-demand
+- **Local** (laptop): SQLite stores all events; reports and analysis run here
+
+User manually syncs data from remote to local via `tt sync`.
 
 ## High-Level Architecture
 
-_Major components and their relationships._
+See [components.md](components.md) for detailed component breakdown and architecture diagram.
 
-See [components.md](components.md) for component breakdown.
+**Key simplification:** No daemon on remote. tmux hooks write to a JSONL file; Claude logs are parsed on-demand during sync.
 
 ## Key Decisions
 
-_Links to ADRs for significant architectural choices._
-
-See [decisions/](decisions/) for Architecture Decision Records.
+| Decision | Summary | ADR |
+|----------|---------|-----|
+| Event transport | Pull-based sync via SSH | [ADR-001](decisions/001-event-transport.md) |
+| Tech stack | Shell stub (remote) + Python (local) | [tech-stack.md](../implementation/tech-stack.md) |
+| Event IDs | Deterministic content hash | [data-model.md](../design/data-model.md) |
 
 ---
 
@@ -40,9 +45,9 @@ _Raised during design review. To be addressed during implementation._
 
 ### Event Deduplication
 
-- May need idempotency keys if sources (tmux hooks, file watchers) can fire duplicate events
-- Format could be: `{source}:{type}:{timestamp}:{hash-of-payload}`
-- Defer until duplication is observed in practice
+**Decided:** Use deterministic content-based IDs: `id = hash(source + type + timestamp + data)`
+
+This ensures the same logical event always produces the same ID. Import is idempotent via `UNIQUE` constraint on ID — no separate deduplication logic needed.
 
 ### Watcher Health Monitoring
 

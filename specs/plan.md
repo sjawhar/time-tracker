@@ -88,16 +88,15 @@ These need to be resolved and documented in ADRs before implementation.
 
 ### Unlocks Prototype
 
-These specs are **already complete enough** to start prototype:
+These specs are **complete** and ready for implementation:
 
 | Spec | Status | Notes |
 |------|--------|-------|
-| `design/data-model.md` | Complete | Event schema defined |
-| `research/technical-foundations.md` | Complete | tmux hooks, agent logs documented |
-
-These specs **need completion** before prototype:
-
-- [ ] **Decide tech stack** — Update `implementation/tech-stack.md` with language choice (Rust vs Go vs Python)
+| `design/data-model.md` | ✅ Complete | Event schema, deterministic IDs, UTC timestamps |
+| `research/technical-foundations.md` | ✅ Complete | tmux hooks, agent logs documented |
+| `implementation/tech-stack.md` | ✅ Complete | Shell stub + Python |
+| `architecture/components.md` | ✅ Complete | Simplified architecture (no daemon) |
+| `architecture/decisions/001-event-transport.md` | ✅ Complete | Pull-based sync via SSH |
 
 ### Unlocks MVP
 
@@ -121,15 +120,27 @@ These can wait until after MVP ships:
 
 ## Prototype Implementation Tasks
 
-_Unblocked once tech stack is decided._
+_Ready to start._
 
-- [ ] Set up project structure and build system
+### Remote (deploy to dev server)
+
+- [ ] Create `tt ingest` command (shell script or Python, appends to `events.jsonl`)
+- [ ] Configure tmux hook in `~/.tmux.conf` (calls `tt ingest` on pane-focus-in)
+- [ ] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
+- [ ] Create Claude log manifest for incremental parsing
+
+### Local (laptop)
+
+- [ ] Set up Python project with `uv`
 - [ ] Implement SQLite event store (schema from `data-model.md`)
-- [ ] Implement `tt ingest` command (receive events via stdin/args)
-- [ ] Implement `tt events` command (dump raw events)
-- [ ] Create tmux hook configuration (calls `tt ingest`)
-- [ ] Implement Claude session file watcher
-- [ ] Test end-to-end: tmux activity → events in database
+- [ ] Implement `tt import` command (reads events from stdin, inserts to SQLite)
+- [ ] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
+- [ ] Implement `tt events` command (query local SQLite)
+- [ ] Implement `tt status` command (show last event time per source)
+
+### Validation
+
+- [ ] Test end-to-end: tmux focus → `events.jsonl` → sync → local SQLite
 - [ ] Deploy and start collecting real data
 
 ---
