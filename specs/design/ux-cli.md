@@ -198,17 +198,10 @@ Total: 32h 15m
   Delegated: 9h 45m  (30%)
 
 By Tag:
-  acme-webapp      18h 30m  ████████████░░░░
-    Direct:   12h 00m
-    Delegated: 6h 30m
-
-  personal          8h 45m  █████░░░░░░░░░░░
-    Direct:    6h 15m
-    Delegated: 2h 30m
-
-  untagged          5h 00m  ███░░░░░░░░░░░░░
-    Direct:    4h 15m
-    Delegated: 45m
+                    Total     Direct    Delegated
+  acme-webapp      18h 30m   12h 00m     6h 30m   ████████████████
+  personal          8h 45m    6h 15m     2h 30m   ████████░░░░░░░░
+  (untagged)        5h 00m    4h 15m        45m   ████░░░░░░░░░░░░
 ```
 
 **JSON output:**
