@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::events::EventsArgs;
 use crate::commands::export::ExportArgs;
 use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
@@ -37,6 +38,8 @@ pub enum Commands {
     Ingest(IngestArgs),
     /// Export buffered events plus Claude session events.
     Export(ExportArgs),
+    /// List local events.
+    Events(EventsArgs),
     /// Import events from stdin into the local database.
     Import(ImportArgs),
     /// Sync events from a remote host.

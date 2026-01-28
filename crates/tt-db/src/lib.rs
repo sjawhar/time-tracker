@@ -182,6 +182,36 @@ impl Database {
         tx.commit()?;
         Ok(inserted)
     }
+
+    /// Lists all events ordered by timestamp then ID.
+    pub fn list_events(&self) -> Result<Vec<EventRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            FROM events
+            ORDER BY timestamp ASC, id ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                schema_version: row.get(4)?,
+                data: row.get(5)?,
+                cwd: row.get(6)?,
+                session_id: row.get(7)?,
+                stream_id: row.get(8)?,
+                assignment_source: row.get(9)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +399,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "inferred");
+    }
+
+    #[test]
+    fn list_events_returns_ordered_rows() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        let event_a = EventRecord {
+            id: "event-a".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%1"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: None,
+            assignment_source: None,
+        };
+        let event_b = EventRecord {
+            id: "event-b".to_string(),
+            timestamp: "2025-01-01T00:02:00Z".to_string(),
+            kind: "agent_session".to_string(),
+            source: "remote.agent".to_string(),
+            schema_version: 1,
+            data: r#"{"action":"started"}"#.to_string(),
+            cwd: None,
+            session_id: Some("sess-1".to_string()),
+            stream_id: None,
+            assignment_source: Some("user".to_string()),
+        };
+
+        db.insert_events(&[event_b.clone(), event_a.clone()])
+            .expect("insert events");
+
+        let events = db.list_events().expect("list events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, event_a.id);
+        assert_eq!(events[1].id, event_b.id);
+        assert_eq!(events[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(events[1].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(events[1].assignment_source.as_deref(), Some("user"));
     }
 }

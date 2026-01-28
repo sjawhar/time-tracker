@@ -1,0 +1,6 @@
+---
+source: crates/tt-cli/src/commands/events.rs
+expression: output
+---
+{"id":"event-a","timestamp":"2025-01-01T00:00:00Z","type":"tmux_pane_focus","source":"remote.tmux","schema_version":1,"data":{"pane_id":"%1"},"cwd":"/repo","session_id":null,"stream_id":null,"assignment_source":"inferred"}
+{"id":"event-b","timestamp":"2025-01-01T00:02:00Z","type":"agent_session","source":"remote.agent","schema_version":1,"data":{"action":"started"},"cwd":null,"session_id":"sess-1","stream_id":null,"assignment_source":"user"}

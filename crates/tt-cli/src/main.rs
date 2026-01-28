@@ -30,6 +30,12 @@ fn main() -> Result<()> {
         Some(Commands::Export(args)) => {
             tt_cli::commands::export::run(args)?;
         }
+        Some(Commands::Events(_args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let mut stdout = std::io::stdout();
+            tt_cli::commands::events::run(&mut stdout, &config)?;
+        }
         Some(Commands::Import(args)) => {
             let config =
                 Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
