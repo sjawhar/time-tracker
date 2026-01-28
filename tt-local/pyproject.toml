@@ -1,0 +1,18 @@
+[project]
+name = "tt-local"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+tt = "tt_local.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
