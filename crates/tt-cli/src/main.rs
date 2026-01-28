@@ -36,6 +36,12 @@ fn main() -> Result<()> {
             let imported = tt_cli::commands::import::run(&args, &config)?;
             println!("Imported {imported} events");
         }
+        Some(Commands::Sync(args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let report = tt_cli::commands::sync::run(&args, &config)?;
+            println!("Synced {} events from {}", report.imported, report.remote);
+        }
         None => {
             // No subcommand, show help
             use clap::CommandFactory;

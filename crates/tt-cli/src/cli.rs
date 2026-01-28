@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::commands::export::ExportArgs;
 use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
+use crate::commands::sync::SyncArgs;
 
 /// AI-native time tracker.
 ///
@@ -38,4 +39,6 @@ pub enum Commands {
     Export(ExportArgs),
     /// Import events from stdin into the local database.
     Import(ImportArgs),
+    /// Sync events from a remote host.
+    Sync(SyncArgs),
 }

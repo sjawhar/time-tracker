@@ -27,7 +27,10 @@ pub fn run(args: &ImportArgs, config: &Config) -> Result<usize> {
     Ok(inserted)
 }
 
-fn parse_events<R: BufRead>(reader: R, default_source: Option<&str>) -> Result<Vec<EventRecord>> {
+pub(crate) fn parse_events<R: BufRead>(
+    reader: R,
+    default_source: Option<&str>,
+) -> Result<Vec<EventRecord>> {
     let mut events = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed to read line {}", idx + 1))?;
