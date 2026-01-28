@@ -252,6 +252,37 @@ impl Database {
         Ok(events)
     }
 
+    /// Lists events for a specific stream ordered by timestamp then ID.
+    pub fn list_events_for_stream(&self, stream_id: &str) -> Result<Vec<EventRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            FROM events
+            WHERE stream_id = ?
+            ORDER BY timestamp ASC, id ASC
+            ",
+        )?;
+        let rows = stmt.query_map([stream_id], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                schema_version: row.get(4)?,
+                data: row.get(5)?,
+                cwd: row.get(6)?,
+                session_id: row.get(7)?,
+                stream_id: row.get(8)?,
+                assignment_source: row.get(9)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     /// Lists events within a time range.
     ///
     /// The range is inclusive of `start` and exclusive of `end`.
@@ -1270,6 +1301,72 @@ mod tests {
         assert_eq!(events[0].cwd.as_deref(), Some("/repo"));
         assert_eq!(events[1].session_id.as_deref(), Some("sess-1"));
         assert_eq!(events[1].assignment_source.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn list_events_for_stream_filters_by_stream_id() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        db.conn
+            .execute(
+                "INSERT INTO streams (id, created_at, updated_at) VALUES (?, ?, ?)",
+                ["stream-1", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+            )
+            .expect("insert stream-1");
+        db.conn
+            .execute(
+                "INSERT INTO streams (id, created_at, updated_at) VALUES (?, ?, ?)",
+                ["stream-2", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+            )
+            .expect("insert stream-2");
+        let event_a = EventRecord {
+            id: "event-a".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%1"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: Some("stream-1".to_string()),
+            assignment_source: None,
+        };
+        let event_b = EventRecord {
+            id: "event-b".to_string(),
+            timestamp: "2025-01-01T00:02:00Z".to_string(),
+            kind: "agent_session".to_string(),
+            source: "remote.agent".to_string(),
+            schema_version: 1,
+            data: r#"{"action":"started"}"#.to_string(),
+            cwd: None,
+            session_id: Some("sess-1".to_string()),
+            stream_id: Some("stream-2".to_string()),
+            assignment_source: Some("user".to_string()),
+        };
+        let event_c = EventRecord {
+            id: "event-c".to_string(),
+            timestamp: "2025-01-01T00:03:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%3"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: Some("stream-1".to_string()),
+            assignment_source: None,
+        };
+
+        let first_event_id = event_a.id.clone();
+        let last_event_id = event_c.id.clone();
+
+        db.insert_events(&[event_b, event_c, event_a])
+            .expect("insert events");
+
+        let events = db
+            .list_events_for_stream("stream-1")
+            .expect("list events for stream");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, first_event_id);
+        assert_eq!(events[1].id, last_event_id);
     }
 
     #[test]

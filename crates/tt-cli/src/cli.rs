@@ -9,6 +9,7 @@ use crate::commands::export::ExportArgs;
 use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
 use crate::commands::report::ReportArgs;
+use crate::commands::suggest_tags::SuggestTagsArgs;
 use crate::commands::sync::SyncArgs;
 
 /// AI-native time tracker.
@@ -47,4 +48,6 @@ pub enum Commands {
     Sync(SyncArgs),
     /// Generate time reports.
     Report(ReportArgs),
+    /// Suggest tags for a stream.
+    SuggestTags(SuggestTagsArgs),
 }

@@ -54,6 +54,12 @@ fn main() -> Result<()> {
             let mut stdout = std::io::stdout();
             tt_cli::commands::report::run(&mut stdout, &args, &config)?;
         }
+        Some(Commands::SuggestTags(args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let mut stdout = std::io::stdout();
+            tt_cli::commands::suggest_tags::run(&mut stdout, &args, &config)?;
+        }
         None => {
             // No subcommand, show help
             use clap::CommandFactory;
