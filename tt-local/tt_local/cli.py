@@ -13,6 +13,7 @@ import click
 from pydantic import ValidationError
 
 from tt_local.db import EventStore, ImportedEvent
+from tt_local.llm import ApiKeyNotSetError, LlmError, TagSuggester
 
 
 def format_relative_time(iso_timestamp: str, *, now: datetime | None = None) -> str:
@@ -598,6 +599,261 @@ def _output_human_report(
             f"  {display_tag:<20} {format_duration(data['total_ms']):>9} "
             f"{format_duration(data['direct_ms']):>9} {format_duration(data['delegated_ms']):>9}   {bar}"
         )
+
+
+@main.group("tag")
+def tag_group():
+    """Manage stream tags."""
+    pass
+
+
+def _validate_tag(tag: str) -> str | None:
+    """Validate and normalize a tag.
+
+    Returns normalized tag or None if invalid.
+    Valid tags are lowercase alphanumeric with hyphens.
+    """
+    tag = tag.strip().lower()
+    if not tag:
+        return None
+    # Replace spaces with hyphens
+    tag = tag.replace(" ", "-")
+    # Keep only alphanumeric and hyphens
+    normalized = "".join(c for c in tag if c.isalnum() or c == "-")
+    if not normalized:
+        return None
+    return normalized[:50]
+
+
+@tag_group.command("add")
+@click.argument("stream_id")
+@click.argument("tag")
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+def tag_add(stream_id: str, tag: str, db: Path) -> None:
+    """Add a tag to a stream.
+
+    STREAM_ID can be a full ID or unique prefix.
+
+    Example:
+        tt tag add a1b2c3d acme-webapp
+        tt tag add a1b my-project
+    """
+    # Validate tag format
+    normalized_tag = _validate_tag(tag)
+    if normalized_tag is None:
+        click.echo("Error: Tag must be alphanumeric with hyphens", err=True)
+        sys.exit(1)
+
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    with EventStore.open(db) as store:
+        try:
+            stream = store.get_stream_by_prefix(stream_id)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            click.echo("Hint: Use a longer prefix to disambiguate", err=True)
+            sys.exit(1)
+
+        if stream is None:
+            click.echo(f"Error: No stream found matching '{stream_id}'", err=True)
+            click.echo("Hint: Run 'tt streams' to see available streams", err=True)
+            sys.exit(1)
+
+        if store.add_tag(stream["id"], normalized_tag):
+            click.echo(f"Tagged stream {stream['id'][:7]} with '{normalized_tag}'")
+        else:
+            click.echo(f"Stream {stream['id'][:7]} already has tag '{normalized_tag}'")
+
+
+@tag_group.command("remove")
+@click.argument("stream_id")
+@click.argument("tag")
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+def tag_remove(stream_id: str, tag: str, db: Path) -> None:
+    """Remove a tag from a stream.
+
+    STREAM_ID can be a full ID or unique prefix.
+
+    Example:
+        tt tag remove a1b2c3d old-tag
+    """
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    with EventStore.open(db) as store:
+        try:
+            stream = store.get_stream_by_prefix(stream_id)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            click.echo("Hint: Use a longer prefix to disambiguate", err=True)
+            sys.exit(1)
+
+        if stream is None:
+            click.echo(f"Error: No stream found matching '{stream_id}'", err=True)
+            click.echo("Hint: Run 'tt streams' to see available streams", err=True)
+            sys.exit(1)
+
+        if store.remove_tag(stream["id"], tag):
+            click.echo(f"Removed tag '{tag}' from stream {stream['id'][:7]}")
+        else:
+            click.echo(f"Stream {stream['id'][:7]} doesn't have tag '{tag}'")
+
+
+@tag_group.command("suggest")
+@click.argument("stream_id", required=False)
+@click.option(
+    "--all",
+    "suggest_all",
+    is_flag=True,
+    help="Suggest tags for all untagged streams",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show suggestions without applying",
+)
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+def tag_suggest(
+    stream_id: str | None,
+    suggest_all: bool,
+    dry_run: bool,
+    db: Path,
+) -> None:
+    """Suggest tags for streams using LLM.
+
+    Without arguments, suggests for untagged streams interactively.
+    With STREAM_ID, suggests for that specific stream.
+    With --all, processes all untagged streams.
+
+    Requires ANTHROPIC_API_KEY environment variable.
+
+    Example:
+        tt tag suggest           # Interactive for untagged streams
+        tt tag suggest a1b2c3d   # Suggest for specific stream
+        tt tag suggest --all     # Process all untagged streams
+    """
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    # Initialize suggester (validates API key)
+    try:
+        suggester = TagSuggester()
+    except ApiKeyNotSetError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    with EventStore.open(db) as store:
+        # Run stream inference to ensure streams exist
+        store.run_stream_inference()
+
+        # Get existing tags for consistency suggestions
+        top_tags = store.get_top_tags(limit=15)
+        existing_tags = [tag for tag, _ in top_tags]
+
+        # Determine which streams to process
+        if stream_id:
+            try:
+                stream = store.get_stream_by_prefix(stream_id)
+            except ValueError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+
+            if stream is None:
+                click.echo(f"Error: No stream found matching '{stream_id}'", err=True)
+                sys.exit(1)
+
+            streams = [stream]
+        elif suggest_all:
+            streams = store.get_untagged_streams()
+            if not streams:
+                click.echo("No untagged streams found.")
+                return
+        else:
+            # Interactive mode: process untagged streams one by one
+            streams = store.get_untagged_streams()
+            if not streams:
+                click.echo("No untagged streams found.")
+                return
+
+        # Process each stream
+        for stream in streams:
+            stream_id_str: str = stream["id"]
+            stream_name: str = stream.get("name") or "Unnamed"
+            short_id = stream_id_str[:7]
+
+            # Get events for this stream
+            events = store.get_stream_events(stream_id_str, limit=100)
+            if not events:
+                click.echo(f"Stream {short_id} ({stream_name}): no events, skipping")
+                continue
+
+            click.echo(f"\nStream {short_id} ({stream_name}):")
+
+            # Get suggestions from LLM
+            try:
+                suggestions = suggester.suggest_tags(stream_name, events, existing_tags)
+            except LlmError as e:
+                click.echo(f"  Error: {e}")
+                continue
+
+            if not suggestions:
+                click.echo("  No suggestions generated")
+                continue
+
+            click.echo(f"  Suggestions: {', '.join(suggestions)}")
+
+            if dry_run:
+                continue
+
+            # Interactive mode: ask user to confirm
+            if not suggest_all and not stream_id:
+                click.echo("  Options: [a]pply all, [s]elect, [n]one, [q]uit")
+                choice = click.getchar()
+                click.echo()
+
+                if choice == "q":
+                    click.echo("Cancelled.")
+                    return
+                elif choice == "n":
+                    click.echo("  Skipped")
+                    continue
+                elif choice == "s":
+                    # Let user select which tags to apply
+                    for i, tag in enumerate(suggestions, 1):
+                        if click.confirm(f"  Apply '{tag}'?", default=True):
+                            store.add_tag(stream_id_str, tag)
+                            click.echo(f"  Added '{tag}'")
+                elif choice == "a":
+                    # Apply all suggestions
+                    for tag in suggestions:
+                        store.add_tag(stream_id_str, tag)
+                    click.echo(f"  Applied: {', '.join(suggestions)}")
+                else:
+                    click.echo("  Invalid choice, skipping")
+            else:
+                # Non-interactive mode with --all or specific stream_id
+                for tag in suggestions:
+                    store.add_tag(stream_id_str, tag)
+                click.echo(f"  Applied: {', '.join(suggestions)}")
 
 
 if __name__ == "__main__":

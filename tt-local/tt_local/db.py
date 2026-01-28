@@ -890,3 +890,128 @@ class EventStore:
             (start, end),
         )
         return len(cursor.fetchall())
+
+    def add_tag(self, stream_id: str, tag: str) -> bool:
+        """Add a tag to a stream.
+
+        Args:
+            stream_id: The stream ID.
+            tag: The tag to add.
+
+        Returns:
+            True if tag was added, False if it already existed.
+        """
+        try:
+            self._conn.execute(
+                "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+                (stream_id, tag),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Tag already exists (PRIMARY KEY violation)
+            return False
+
+    def remove_tag(self, stream_id: str, tag: str) -> bool:
+        """Remove a tag from a stream.
+
+        Args:
+            stream_id: The stream ID.
+            tag: The tag to remove.
+
+        Returns:
+            True if tag was removed, False if it didn't exist.
+        """
+        cursor = self._conn.execute(
+            "DELETE FROM stream_tags WHERE stream_id = ? AND tag = ?",
+            (stream_id, tag),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def get_top_tags(self, limit: int = 15) -> list[tuple[str, int]]:
+        """Get most-used tags with their stream counts.
+
+        Args:
+            limit: Maximum number of tags to return.
+
+        Returns:
+            List of (tag, count) tuples, ordered by count descending.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT tag, COUNT(*) as count
+            FROM stream_tags
+            GROUP BY tag
+            ORDER BY count DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(row["tag"], row["count"]) for row in cursor.fetchall()]
+
+    def get_untagged_streams(self) -> list[dict[str, Any]]:
+        """Get streams that have no tags.
+
+        Returns:
+            List of stream dicts without tags.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT s.*
+            FROM streams s
+            LEFT JOIN stream_tags st ON s.id = st.stream_id
+            WHERE st.stream_id IS NULL
+            ORDER BY s.updated_at DESC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_stream_by_prefix(self, prefix: str) -> dict[str, Any] | None:
+        """Find a stream by ID prefix.
+
+        Args:
+            prefix: The ID prefix to match.
+
+        Returns:
+            Stream dict if exactly one match, None if no match.
+
+        Raises:
+            ValueError: If prefix matches multiple streams.
+        """
+        # Escape LIKE metacharacters to prevent pattern injection
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cursor = self._conn.execute(
+            "SELECT * FROM streams WHERE id LIKE ? ESCAPE '\\'",
+            (escaped + "%",),
+        )
+        rows = cursor.fetchall()
+        if len(rows) == 0:
+            return None
+        if len(rows) > 1:
+            ids = [row["id"][:7] for row in rows]
+            raise ValueError(f"Ambiguous prefix '{prefix}' matches: {', '.join(ids)}")
+        return dict(rows[0])
+
+    def get_stream_events(
+        self,
+        stream_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get events for a specific stream.
+
+        Args:
+            stream_id: The stream ID.
+            limit: Maximum number of events to return.
+
+        Returns:
+            List of event dicts ordered by timestamp ascending.
+        """
+        query = "SELECT * FROM events WHERE stream_id = ? ORDER BY timestamp ASC"
+        params: list[str | int] = [stream_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self._conn.execute(query, params)
+        return [dict(row) for row in cursor.fetchall()]

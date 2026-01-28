@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "click>=8.0",
     "pydantic>=2.0",
+    "anthropic>=0.40.0",
 ]
 
 [project.scripts]

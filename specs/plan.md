@@ -43,9 +43,9 @@ Linear task list for Time Tracker MVP.
 
 - [x] Implement stream inference (directory + temporal clustering)
 - [x] Implement direct/delegated time calculation
-- [ ] Implement `tt report --week` command
-- [ ] Implement LLM tag suggestion (calls Claude API)
-- [ ] Implement `tt tag <stream> <tag>` for corrections
+- [x] Implement `tt report --week` command
+- [x] Implement LLM tag suggestion (calls Claude API)
+- [x] Implement `tt tag <stream> <tag>` for corrections
 - [ ] Implement `tt streams` to list/manage streams
 - [ ] Validate against success criteria (<5 min/week manual work)
 
