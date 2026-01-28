@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::export::ExportArgs;
 use crate::commands::ingest::IngestArgs;
 
 /// AI-native time tracker.
@@ -32,4 +33,6 @@ pub enum Commands {
     Status,
     /// Append events to the remote buffer.
     Ingest(IngestArgs),
+    /// Export buffered events plus Claude session events.
+    Export(ExportArgs),
 }

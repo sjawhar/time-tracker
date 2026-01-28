@@ -14,7 +14,7 @@ Linear task list for Time Tracker MVP.
 
 - [x] Create `tt ingest` command (shell script or Python, appends to `events.jsonl`)
 - [x] Configure tmux hook in `~/.tmux.conf` (calls `tt ingest` on pane-focus-in)
-- [ ] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
+- [x] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
 - [ ] Create Claude log manifest for incremental parsing
 
 ## Prototype Implementation (Local)

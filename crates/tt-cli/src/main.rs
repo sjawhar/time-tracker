@@ -27,6 +27,9 @@ fn main() -> Result<()> {
         Some(Commands::Ingest(args)) => {
             tt_cli::commands::ingest::run(args)?;
         }
+        Some(Commands::Export(args)) => {
+            tt_cli::commands::export::run(args)?;
+        }
         None => {
             // No subcommand, show help
             use clap::CommandFactory;
