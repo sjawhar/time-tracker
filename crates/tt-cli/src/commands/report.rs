@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
-use clap::Args;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, SecondsFormat, TimeZone, Utc};
+use clap::Args;
 use tt_db::{Database, StreamRecord, TimeTotals};
 
 use crate::Config;
@@ -176,10 +176,8 @@ fn build_daily_totals(
 
         let day_end = day_start + Duration::days(1);
         let day_end = if day_end > now { now } else { day_end };
-        let events = db.list_events_in_range(
-            day_start.with_timezone(&Utc),
-            day_end.with_timezone(&Utc),
-        )?;
+        let events =
+            db.list_events_in_range(day_start.with_timezone(&Utc), day_end.with_timezone(&Utc))?;
         let day_totals = db.allocate_time_for_events(events)?;
         let summed = sum_totals(&day_totals);
         totals.push(DailyTotal::new(day_label, summed));
