@@ -259,3 +259,20 @@ class EventStore:
         )
         self._conn.commit()
         return stream_id
+
+    def get_last_event_per_source(self) -> list[dict[str, Any]]:
+        """Get the most recent event timestamp for each source.
+
+        Returns list of dicts with keys: source, last_timestamp, event_count.
+        Ordered by last_timestamp descending (most recent first).
+        """
+        cursor = self._conn.execute("""
+            SELECT
+                source,
+                MAX(timestamp) as last_timestamp,
+                COUNT(*) as event_count
+            FROM events
+            GROUP BY source
+            ORDER BY last_timestamp DESC
+        """)
+        return [dict(row) for row in cursor.fetchall()]

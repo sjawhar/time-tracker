@@ -675,3 +675,242 @@ class TestEventsCommand:
 
             assert result.exit_code == 0
             assert result.output == ""
+
+
+class TestStatusCommand:
+    """Tests for the status command."""
+
+    def test_status_no_database(self):
+        """No database file exits with code 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "nonexistent.db"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["status", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "No database found" in result.output
+
+    def test_status_empty_database(self):
+        """Empty database shows no events message."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            # Create empty database
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["status", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "No events recorded" in result.output
+
+    def test_status_single_source(self):
+        """Single source shows source with count and relative time."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="tmux_pane_focus",
+                    source="remote.tmux",
+                    data={},
+                )
+            )
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e2",
+                    timestamp="2025-01-25T10:01:00Z",
+                    type="tmux_pane_focus",
+                    source="remote.tmux",
+                    data={},
+                )
+            )
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["status", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "remote.tmux" in result.output
+            assert "2 events" in result.output
+            assert "Total events: 2" in result.output
+
+    def test_status_multiple_sources(self):
+        """Multiple sources sorted by most recent first."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            # remote.agent has more recent event
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="tmux_pane_focus",
+                    source="remote.tmux",
+                    data={},
+                )
+            )
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e2",
+                    timestamp="2025-01-25T12:00:00Z",
+                    type="agent_tool_use",
+                    source="remote.agent",
+                    data={},
+                )
+            )
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["status", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # remote.agent should appear before remote.tmux (more recent)
+            agent_pos = result.output.find("remote.agent")
+            tmux_pos = result.output.find("remote.tmux")
+            assert agent_pos < tmux_pos, "Sources should be sorted by most recent first"
+
+
+class TestFormatRelativeTime:
+    """Tests for format_relative_time helper."""
+
+    def test_just_now(self):
+        """Less than 60 seconds shows 'just now'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+        ts = "2025-01-25T09:59:30Z"  # 30 seconds ago
+
+        result = format_relative_time(ts, now=now)
+        assert result == "just now"
+
+    def test_minutes_ago(self):
+        """1-59 minutes shows 'X minutes ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+
+        # 1 minute ago
+        assert format_relative_time("2025-01-25T09:59:00Z", now=now) == "1 minute ago"
+        # 30 minutes ago
+        assert format_relative_time("2025-01-25T09:30:00Z", now=now) == "30 minutes ago"
+
+    def test_hours_ago(self):
+        """1-23 hours shows 'X hours ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+
+        # 1 hour ago
+        assert format_relative_time("2025-01-25T09:00:00Z", now=now) == "1 hour ago"
+        # 5 hours ago
+        assert format_relative_time("2025-01-25T05:00:00Z", now=now) == "5 hours ago"
+
+    def test_days_ago(self):
+        """24+ hours shows 'X days ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+
+        # 1 day ago
+        assert format_relative_time("2025-01-24T10:00:00Z", now=now) == "1 day ago"
+        # 3 days ago
+        assert format_relative_time("2025-01-22T10:00:00Z", now=now) == "3 days ago"
+
+    def test_boundary_59_seconds(self):
+        """Exactly 59 seconds shows 'just now'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 59, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "just now"
+
+    def test_boundary_60_seconds(self):
+        """Exactly 60 seconds shows '1 minute ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 1, 0, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "1 minute ago"
+
+    def test_boundary_3599_seconds(self):
+        """59 minutes 59 seconds shows '59 minutes ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 59, 59, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "59 minutes ago"
+
+    def test_boundary_3600_seconds(self):
+        """Exactly 1 hour shows '1 hour ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 11, 0, 0, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "1 hour ago"
+
+    def test_boundary_86399_seconds(self):
+        """23 hours 59 minutes 59 seconds shows '23 hours ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 26, 9, 59, 59, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "23 hours ago"
+
+    def test_boundary_86400_seconds(self):
+        """Exactly 24 hours shows '1 day ago'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 26, 10, 0, 0, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:00:00Z"
+
+        result = format_relative_time(ts, now=now)
+        assert result == "1 day ago"
+
+    def test_future_timestamp(self):
+        """Future timestamp (clock skew) shows 'just now'."""
+        from datetime import datetime, timezone
+        from tt_local.cli import format_relative_time
+
+        now = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+        ts = "2025-01-25T10:05:00Z"  # 5 minutes in the future
+
+        result = format_relative_time(ts, now=now)
+        assert result == "just now"
+
+    def test_malformed_timestamp(self):
+        """Malformed timestamp returns raw value."""
+        from tt_local.cli import format_relative_time
+
+        result = format_relative_time("not-a-timestamp")
+        assert result == "not-a-timestamp"
+
+        result = format_relative_time("garbage")
+        assert result == "garbage"

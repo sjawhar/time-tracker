@@ -5,12 +5,50 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 from pydantic import ValidationError
 
 from tt_local.db import EventStore, ImportedEvent
+
+
+def format_relative_time(iso_timestamp: str, *, now: datetime | None = None) -> str:
+    """Format ISO timestamp as relative time (e.g., '5 minutes ago').
+
+    Args:
+        iso_timestamp: ISO 8601 timestamp string
+        now: Optional current time for testing (defaults to UTC now)
+
+    Returns:
+        Relative time string, or the raw timestamp if parsing fails.
+    """
+    try:
+        dt = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        # Malformed timestamp - return raw value
+        return iso_timestamp
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    delta = now - dt
+
+    seconds = delta.total_seconds()
+    if seconds < 0:
+        # Future timestamp (clock skew from remote)
+        return "just now"
+    elif seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    else:
+        days = int(seconds / 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
 
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "tt" / "events.db"
 
@@ -204,6 +242,42 @@ def events_command(
             limit=limit,
         ):
             click.echo(json.dumps(event))
+
+
+@main.command("status")
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+def status_command(db: Path) -> None:
+    """Show time tracker status.
+
+    Displays the last event time for each source and overall stats.
+    """
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    with EventStore.open(db) as store:
+        sources = store.get_last_event_per_source()
+
+    if not sources:
+        click.echo("No events recorded")
+        return
+
+    click.echo(f"Database: {db}")
+    click.echo()
+
+    total_events = sum(s["event_count"] for s in sources)
+    click.echo(f"Total events: {total_events}")
+    click.echo()
+
+    click.echo("Last event per source:")
+    for source in sources:
+        relative = format_relative_time(source["last_timestamp"])
+        click.echo(f"  {source['source']}: {relative} ({source['event_count']} events)")
 
 
 if __name__ == "__main__":

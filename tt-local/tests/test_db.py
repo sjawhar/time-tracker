@@ -221,3 +221,79 @@ class TestImportedEvent:
         # Still only one event
         events = store.get_events()
         assert len(events) == 1
+
+
+class TestGetLastEventPerSource:
+    """Tests for get_last_event_per_source method."""
+
+    def test_empty_database(self):
+        """Empty database returns empty list."""
+        store = EventStore.open_in_memory()
+        result = store.get_last_event_per_source()
+        assert result == []
+
+    def test_single_source(self):
+        """Single source returns one row with correct values."""
+        store = EventStore.open_in_memory()
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-25T10:00:00Z",
+                type="t1",
+                source="remote.tmux",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e2",
+                timestamp="2025-01-25T11:00:00Z",
+                type="t2",
+                source="remote.tmux",
+                data={},
+            )
+        )
+
+        result = store.get_last_event_per_source()
+        assert len(result) == 1
+        assert result[0]["source"] == "remote.tmux"
+        assert result[0]["last_timestamp"] == "2025-01-25T11:00:00Z"
+        assert result[0]["event_count"] == 2
+
+    def test_multiple_sources_ordered_by_most_recent(self):
+        """Multiple sources returned ordered by most recent first."""
+        store = EventStore.open_in_memory()
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-25T10:00:00Z",
+                type="t1",
+                source="remote.tmux",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e2",
+                timestamp="2025-01-25T12:00:00Z",
+                type="t2",
+                source="remote.agent",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e3",
+                timestamp="2025-01-25T11:00:00Z",
+                type="t3",
+                source="local.window",
+                data={},
+            )
+        )
+
+        result = store.get_last_event_per_source()
+        assert len(result) == 3
+        # Should be ordered by last_timestamp DESC
+        assert result[0]["source"] == "remote.agent"
+        assert result[1]["source"] == "local.window"
+        assert result[2]["source"] == "remote.tmux"
