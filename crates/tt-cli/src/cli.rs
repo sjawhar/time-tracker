@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// AI-native time tracker.
 ///
@@ -28,4 +28,32 @@ pub struct Cli {
 pub enum Commands {
     /// Show current tracking status.
     Status,
+    /// Ingest an event from tmux hooks.
+    ///
+    /// Called by tmux hooks on pane focus changes. Appends events to JSONL buffer.
+    Ingest(IngestArgs),
+}
+
+/// Arguments for the ingest command.
+#[derive(Debug, Args)]
+pub struct IngestArgs {
+    /// Event type (e.g., "pane-focus").
+    #[arg(value_name = "TYPE")]
+    pub event_type: String,
+
+    /// Pane ID (e.g., "%3").
+    #[arg(long)]
+    pub pane: String,
+
+    /// Current working directory.
+    #[arg(long)]
+    pub cwd: String,
+
+    /// tmux session name.
+    #[arg(long)]
+    pub session: String,
+
+    /// tmux window index.
+    #[arg(long, default_value = "0")]
+    pub window: u32,
 }

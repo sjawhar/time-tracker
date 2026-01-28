@@ -6,9 +6,11 @@
 //! - Time entries: consolidated entries for reporting
 
 mod event;
+pub mod id;
 mod stream;
 mod types;
 
-pub use event::{Event, EventKind};
+pub use event::{Event, EventKind, RawEvent};
+pub use id::generate_event_id;
 pub use stream::Stream;
 pub use types::{EventId, StreamId, ValidationError};

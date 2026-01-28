@@ -2,12 +2,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::{Cli, Commands, Config};
+use tt_cli::{Cli, Commands, Config, commands};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing with verbose flag support
+    // Fast path for ingest - skip config and tracing for performance
+    // This is critical because ingest is called on every tmux focus change
+    if let Some(Commands::Ingest(args)) = cli.command {
+        return commands::ingest::run(args);
+    }
+
+    // Normal path with config and tracing
     let filter = if cli.verbose {
         EnvFilter::new("debug")
     } else {
@@ -26,6 +32,10 @@ fn main() -> Result<()> {
         Some(Commands::Status) => {
             println!("Time tracker status: idle");
             println!("Database: {}", config.database_path.display());
+        }
+        Some(Commands::Ingest(_)) => {
+            // Already handled above
+            unreachable!();
         }
         None => {
             // No subcommand, show help

@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 figment.workspace = true
 dirs.workspace = true
+fs4.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
