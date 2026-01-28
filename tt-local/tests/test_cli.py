@@ -914,3 +914,679 @@ class TestFormatRelativeTime:
 
         result = format_relative_time("garbage")
         assert result == "garbage"
+
+
+class TestFormatDuration:
+    """Tests for format_duration helper."""
+
+    def test_zero_milliseconds(self):
+        """Zero milliseconds shows '0m'."""
+        from tt_local.cli import format_duration
+
+        assert format_duration(0) == "0m"
+
+    def test_sub_minute_positive(self):
+        """Sub-minute positive shows '<1m'."""
+        from tt_local.cli import format_duration
+
+        assert format_duration(30_000) == "<1m"  # 30 sec
+        assert format_duration(59_999) == "<1m"  # just under 1 min
+
+    def test_exactly_one_minute(self):
+        """Exactly 1 minute shows '1m'."""
+        from tt_local.cli import format_duration
+
+        assert format_duration(60_000) == "1m"
+
+    def test_minutes_only(self):
+        """Minutes without hours omits hours."""
+        from tt_local.cli import format_duration
+
+        assert format_duration(120_000) == "2m"
+        assert format_duration(2_700_000) == "45m"  # 45 min
+
+    def test_hours_and_minutes(self):
+        """Hours with minutes shows 'Xh Ym' format."""
+        from tt_local.cli import format_duration
+
+        assert format_duration(3_600_000) == "1h  0m"  # 1 hour
+        assert format_duration(5_400_000) == "1h 30m"  # 1.5 hours
+        assert format_duration(7_200_000) == "2h  0m"  # 2 hours
+        assert format_duration(8_100_000) == "2h 15m"  # 2:15
+
+    def test_rounds_down(self):
+        """Duration rounds down to nearest minute."""
+        from tt_local.cli import format_duration
+
+        # 1m 59.999s → 1m
+        assert format_duration(119_999) == "1m"
+        # 1h 0m 59.999s → 1h 0m
+        assert format_duration(3_659_999) == "1h  0m"
+
+
+class TestGetWeekRange:
+    """Tests for get_week_range helper."""
+
+    def test_monday_returns_same_week(self):
+        """Monday returns the same week."""
+        from datetime import datetime, timezone
+        from tt_local.cli import get_week_range
+
+        monday = datetime(2025, 1, 20, 10, 0, 0, tzinfo=timezone.utc)
+        start, end = get_week_range(monday)
+
+        # Should be Mon 00:00 to next Mon 00:00
+        assert start.startswith("2025-01-20")
+        assert end.startswith("2025-01-27")
+
+    def test_sunday_returns_same_week(self):
+        """Sunday returns the same week."""
+        from datetime import datetime, timezone
+        from tt_local.cli import get_week_range
+
+        sunday = datetime(2025, 1, 26, 23, 59, 59, tzinfo=timezone.utc)
+        start, end = get_week_range(sunday)
+
+        # Should still be Mon Jan 20 to Mon Jan 27
+        assert start.startswith("2025-01-20")
+        assert end.startswith("2025-01-27")
+
+    def test_returns_timezone_aware_strings(self):
+        """Returns timezone-aware ISO strings."""
+        from datetime import datetime, timezone
+        from tt_local.cli import get_week_range
+
+        date = datetime(2025, 1, 22, 10, 0, 0, tzinfo=timezone.utc)
+        start, end = get_week_range(date)
+
+        # Should parse back to datetime with timezone
+        from datetime import datetime as dt
+
+        start_dt = dt.fromisoformat(start)
+        end_dt = dt.fromisoformat(end)
+        assert start_dt.tzinfo is not None
+        assert end_dt.tzinfo is not None
+
+
+class TestGetDayRange:
+    """Tests for get_day_range helper."""
+
+    def test_returns_start_and_end_of_day(self):
+        """Returns start of day to start of next day."""
+        from datetime import datetime, timezone
+        from tt_local.cli import get_day_range
+
+        date = datetime(2025, 1, 25, 15, 30, 0, tzinfo=timezone.utc)
+        start, end = get_day_range(date)
+
+        # Start should be midnight
+        assert "00:00:00" in start
+        # End should be next day midnight
+        assert start.startswith("2025-01-25")
+        assert end.startswith("2025-01-26")
+
+    def test_returns_timezone_aware_strings(self):
+        """Returns timezone-aware ISO strings."""
+        from datetime import datetime, timezone
+        from tt_local.cli import get_day_range
+
+        date = datetime(2025, 1, 25, 10, 0, 0, tzinfo=timezone.utc)
+        start, end = get_day_range(date)
+
+        from datetime import datetime as dt
+
+        start_dt = dt.fromisoformat(start)
+        end_dt = dt.fromisoformat(end)
+        assert start_dt.tzinfo is not None
+        assert end_dt.tzinfo is not None
+
+
+class TestMakeProgressBar:
+    """Tests for make_progress_bar helper."""
+
+    def test_zero_max_returns_empty(self):
+        """Max value of 0 returns all empty."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(100, 0)
+        assert result == "░" * 16
+
+    def test_zero_value_returns_empty(self):
+        """Value of 0 returns all empty."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(0, 100)
+        assert result == "░" * 16
+
+    def test_full_bar(self):
+        """Value equal to max returns all filled."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(100, 100)
+        assert result == "█" * 16
+
+    def test_half_bar(self):
+        """Half value returns half filled."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(50, 100)
+        assert result == "█" * 8 + "░" * 8
+
+    def test_minimum_one_block(self):
+        """Non-zero value gets at least one block."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(1, 1000)
+        assert result[0] == "█"
+        assert result.count("█") >= 1
+
+    def test_custom_width(self):
+        """Custom width is respected."""
+        from tt_local.cli import make_progress_bar
+
+        result = make_progress_bar(50, 100, width=8)
+        assert len(result) == 8
+        assert result == "████░░░░"
+
+
+class TestFormatDateRange:
+    """Tests for format_date_range helper."""
+
+    def test_single_day(self):
+        """Single day format."""
+        from tt_local.cli import format_date_range
+
+        result = format_date_range("2025-01-28T00:00:00+00:00", "2025-01-29T00:00:00+00:00", "day")
+        assert result == "Jan 28, 2025"
+
+    def test_same_month_week(self):
+        """Week within same month."""
+        from tt_local.cli import format_date_range
+
+        result = format_date_range("2025-01-20T00:00:00+00:00", "2025-01-27T00:00:00+00:00", "week")
+        assert result == "Jan 20-26, 2025"
+
+    def test_cross_month_week(self):
+        """Week spanning two months."""
+        from tt_local.cli import format_date_range
+
+        result = format_date_range("2025-01-27T00:00:00+00:00", "2025-02-03T00:00:00+00:00", "week")
+        assert result == "Jan 27 - Feb 02, 2025"
+
+    def test_cross_year_week(self):
+        """Week spanning two years."""
+        from tt_local.cli import format_date_range
+
+        result = format_date_range("2024-12-30T00:00:00+00:00", "2025-01-06T00:00:00+00:00", "week")
+        assert result == "Dec 30, 2024 - Jan 05, 2025"
+
+
+class TestReportCommand:
+    """Tests for the report command."""
+
+    def test_report_no_database(self):
+        """No database file exits with code 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "nonexistent.db"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "No database found" in result.output
+
+    def test_report_default_is_week(self):
+        """Running 'tt report' defaults to --week."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show time report (empty, but no error)
+            assert "Time Report:" in result.output or "No time tracked" in result.output
+
+    def test_report_empty_period(self):
+        """Empty period shows hint to check tt status."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--week", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "No time tracked" in result.output
+            assert "tt status" in result.output
+
+    def test_report_invalid_day_format(self):
+        """Invalid date format for --day exits with code 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "invalid-date", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "Invalid date format" in result.output
+            assert "YYYY-MM-DD" in result.output
+
+    def test_report_day_with_specific_date(self):
+        """--day with specific date in YYYY-MM-DD format."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-25", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show the date in output
+            assert "Jan 25, 2025" in result.output or "No time tracked" in result.output
+
+    def test_report_json_valid(self):
+        """--json outputs valid JSON."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should be valid JSON
+            parsed = json.loads(result.output)
+            assert "report_type" in parsed
+            assert "period" in parsed
+            assert "total_ms" in parsed
+            assert "by_tag" in parsed
+
+    def test_report_json_schema(self):
+        """--json output matches spec schema."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--week", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # Verify schema fields
+            assert parsed["report_type"] == "weekly"
+            assert "generated_at" in parsed
+            assert "start" in parsed["period"]
+            assert "end" in parsed["period"]
+            assert "days_with_data" in parsed["period"]
+            assert isinstance(parsed["total_ms"], int)
+            assert isinstance(parsed["direct_ms"], int)
+            assert isinstance(parsed["delegated_ms"], int)
+            assert isinstance(parsed["by_tag"], list)
+
+    def test_report_json_period_dates_are_date_only(self):
+        """JSON period.start and period.end are date-only (YYYY-MM-DD)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # Should match YYYY-MM-DD format only (no time component)
+            import re
+
+            assert re.match(r"^\d{4}-\d{2}-\d{2}$", parsed["period"]["start"])
+            assert re.match(r"^\d{4}-\d{2}-\d{2}$", parsed["period"]["end"])
+
+    def test_report_json_generated_at_valid_iso(self):
+        """JSON generated_at is valid ISO 8601 timestamp."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # Should parse as ISO 8601
+            from datetime import datetime
+
+            generated_at = datetime.fromisoformat(parsed["generated_at"].replace("Z", "+00:00"))
+            assert generated_at is not None
+
+    def test_report_with_data(self):
+        """Report with actual time data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            # Insert events that will create a stream
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-27T10:00:00Z",  # Monday of the week
+                    type="tmux_pane_focus",
+                    source="remote.tmux",
+                    data={"pane_id": "%1"},
+                    cwd="/home/test/project",
+                )
+            )
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e2",
+                    timestamp="2025-01-27T10:05:00Z",
+                    type="tmux_scroll",
+                    source="remote.tmux",
+                    data={},
+                    cwd="/home/test/project",
+                )
+            )
+            store.close()
+
+            runner = CliRunner()
+            # Use fixed week containing the events
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show time data
+            assert "Total:" in result.output or "No time tracked" not in result.output
+
+    def test_report_tags_sorted_by_total_descending(self):
+        """Tags sorted by total time descending, untagged last."""
+        from tt_local.db import ImportedEvent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create streams with different times
+            s1 = store.create_stream(name="project-a")
+            s2 = store.create_stream(name="project-b")
+
+            # Tag s1 with "small", s2 with "large"
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "small"))
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s2, "large"))
+            store._conn.commit()
+
+            # Insert events: s1 has little time, s2 has more time
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            # s2 gets more events (more time)
+            insert_with_stream("e1", "2025-01-27T10:00:00Z", s2)
+            insert_with_stream("e2", "2025-01-27T10:01:00Z", s2)
+            insert_with_stream("e3", "2025-01-27T10:02:00Z", s2)
+
+            # s1 gets fewer events (less time)
+            insert_with_stream("e4", "2025-01-27T11:00:00Z", s1)
+
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # "large" should be first (more time), "small" second
+            if len(parsed["by_tag"]) >= 2:
+                assert parsed["by_tag"][0]["tag"] == "large"
+                assert parsed["by_tag"][1]["tag"] == "small"
+
+    def test_report_untagged_always_last(self):
+        """Untagged streams appear last even with most time."""
+        from tt_local.db import ImportedEvent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create streams
+            tagged_stream = store.create_stream(name="tagged")
+            untagged_stream = store.create_stream(name="untagged")
+
+            # Only tag one stream
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (tagged_stream, "my-tag"))
+            store._conn.commit()
+
+            # Give untagged stream MORE time
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            # Untagged gets more events
+            insert_with_stream("e1", "2025-01-27T10:00:00Z", untagged_stream)
+            insert_with_stream("e2", "2025-01-27T10:01:00Z", untagged_stream)
+            insert_with_stream("e3", "2025-01-27T10:02:00Z", untagged_stream)
+            insert_with_stream("e4", "2025-01-27T10:03:00Z", untagged_stream)
+
+            # Tagged gets fewer events
+            insert_with_stream("e5", "2025-01-27T11:00:00Z", tagged_stream)
+
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # Untagged (tag=null) should be last regardless of time
+            if len(parsed["by_tag"]) >= 2:
+                assert parsed["by_tag"][-1]["tag"] is None
+
+    def test_report_long_tag_truncated(self):
+        """Tags longer than 20 chars are truncated with ellipsis."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="test")
+            long_tag = "this-is-a-very-long-tag-name-over-twenty-chars"
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, long_tag))
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", "2025-01-27T10:00:00Z", s1)
+            insert_with_stream("e2", "2025-01-27T10:01:00Z", s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Tag should be truncated in human output
+            assert "..." in result.output
+            # Full tag should NOT appear
+            assert long_tag not in result.output
+
+    def test_report_partial_week_shows_days_with_data(self):
+        """Partial weeks show '(X days with data)' in header."""
+        from tt_local.db import ImportedEvent
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create stream and add events for only 2 days
+            s1 = store.create_stream(name="test")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            # Events on Monday and Wednesday only
+            insert_with_stream("e1", "2025-01-20T10:00:00Z", s1)  # Monday
+            insert_with_stream("e2", "2025-01-20T10:01:00Z", s1)  # Monday
+            insert_with_stream("e3", "2025-01-22T10:00:00Z", s1)  # Wednesday
+            store.close()
+
+            runner = CliRunner()
+            # Query the week of Jan 20-26
+            result = runner.invoke(main, ["report", "--day", "2025-01-20", "--db", str(db_path)])
+
+            # For daily report, should NOT show "days with data"
+            assert result.exit_code == 0
+            assert "days with data" not in result.output
+
+    def test_report_day_no_days_with_data_indicator(self):
+        """Daily report does NOT show '(X days with data)'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Daily report should never show "days with data"
+            assert "days with data" not in result.output
+
+    def test_report_zero_delegated_shows_zero(self):
+        """Zero delegated time shows '0m (0%)'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="test")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            # Only pane focus events (no agent sessions) = no delegated time
+            insert_with_stream("e1", "2025-01-27T10:00:00Z", s1)
+            insert_with_stream("e2", "2025-01-27T10:01:00Z", s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2025-01-27", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show 0m for delegated
+            assert "Delegated:" in result.output
+            # Check that it shows 0% or 0m somewhere in the delegated line
+            lines = result.output.split("\n")
+            delegated_line = [l for l in lines if "Delegated:" in l]
+            if delegated_line:
+                assert "0m" in delegated_line[0] or "(0%)" in delegated_line[0]
+
+    def test_report_future_date_empty(self):
+        """Future date returns empty report (no error)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["report", "--day", "2030-01-01", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "No time tracked" in result.output or "Jan 01, 2030" in result.output

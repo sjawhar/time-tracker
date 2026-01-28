@@ -297,3 +297,253 @@ class TestGetLastEventPerSource:
         assert result[0]["source"] == "remote.agent"
         assert result[1]["source"] == "local.window"
         assert result[2]["source"] == "remote.tmux"
+
+
+class TestGetStreamTags:
+    """Tests for get_stream_tags method."""
+
+    def test_empty_database(self):
+        """Empty database returns empty dict."""
+        store = EventStore.open_in_memory()
+        result = store.get_stream_tags()
+        assert result == {}
+
+    def test_no_tags_returns_empty(self):
+        """Stream with no tags returns empty dict."""
+        store = EventStore.open_in_memory()
+        stream_id = store.create_stream(name="Test")
+        result = store.get_stream_tags([stream_id])
+        assert result == {}
+
+    def test_single_stream_single_tag(self):
+        """Single stream with one tag."""
+        store = EventStore.open_in_memory()
+        stream_id = store.create_stream(name="Test")
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (stream_id, "acme-webapp"),
+        )
+        store._conn.commit()
+
+        result = store.get_stream_tags([stream_id])
+        assert result == {stream_id: ["acme-webapp"]}
+
+    def test_single_stream_multiple_tags(self):
+        """Single stream with multiple tags."""
+        store = EventStore.open_in_memory()
+        stream_id = store.create_stream(name="Test")
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (stream_id, "acme-webapp"),
+        )
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (stream_id, "billable"),
+        )
+        store._conn.commit()
+
+        result = store.get_stream_tags([stream_id])
+        assert stream_id in result
+        assert set(result[stream_id]) == {"acme-webapp", "billable"}
+
+    def test_multiple_streams_filtered_by_ids(self):
+        """Filter by specific stream IDs."""
+        store = EventStore.open_in_memory()
+        s1 = store.create_stream(name="S1")
+        s2 = store.create_stream(name="S2")
+        s3 = store.create_stream(name="S3")
+
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (s1, "tag-a"),
+        )
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (s2, "tag-b"),
+        )
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (s3, "tag-c"),
+        )
+        store._conn.commit()
+
+        # Only get tags for s1 and s3
+        result = store.get_stream_tags([s1, s3])
+        assert len(result) == 2
+        assert s1 in result
+        assert s3 in result
+        assert s2 not in result
+
+    def test_get_all_tags_when_no_filter(self):
+        """Get all stream tags when stream_ids is None."""
+        store = EventStore.open_in_memory()
+        s1 = store.create_stream(name="S1")
+        s2 = store.create_stream(name="S2")
+
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (s1, "tag-a"),
+        )
+        store._conn.execute(
+            "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            (s2, "tag-b"),
+        )
+        store._conn.commit()
+
+        result = store.get_stream_tags()  # No filter
+        assert len(result) == 2
+        assert s1 in result
+        assert s2 in result
+
+    def test_large_stream_list_batching(self):
+        """Large stream ID list is batched to avoid SQLite parameter limit."""
+        store = EventStore.open_in_memory()
+
+        # Create 600 streams (exceeds 500 batch size)
+        stream_ids = []
+        for i in range(600):
+            sid = store.create_stream(name=f"S{i}")
+            stream_ids.append(sid)
+            # Add a tag to every 10th stream
+            if i % 10 == 0:
+                store._conn.execute(
+                    "INSERT INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+                    (sid, f"tag-{i}"),
+                )
+        store._conn.commit()
+
+        # Should not raise sqlite3.OperationalError: too many SQL variables
+        result = store.get_stream_tags(stream_ids)
+        assert len(result) == 60  # 600 / 10 streams have tags
+
+
+class TestCountDaysWithData:
+    """Tests for count_days_with_data method."""
+
+    def test_empty_database(self):
+        """Empty database returns 0."""
+        store = EventStore.open_in_memory()
+        result = store.count_days_with_data(
+            "2025-01-20T00:00:00Z", "2025-01-27T00:00:00Z"
+        )
+        assert result == 0
+
+    def test_single_day(self):
+        """Single day with events."""
+        store = EventStore.open_in_memory()
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-25T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+
+        result = store.count_days_with_data(
+            "2025-01-20T00:00:00Z", "2025-01-27T00:00:00Z"
+        )
+        assert result == 1
+
+    def test_multiple_events_same_day(self):
+        """Multiple events on same day count as 1 day."""
+        store = EventStore.open_in_memory()
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-25T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e2",
+                timestamp="2025-01-25T15:00:00Z",
+                type="t2",
+                source="s1",
+                data={},
+            )
+        )
+
+        result = store.count_days_with_data(
+            "2025-01-20T00:00:00Z", "2025-01-27T00:00:00Z"
+        )
+        assert result == 1
+
+    def test_multiple_days(self):
+        """Events on multiple days."""
+        store = EventStore.open_in_memory()
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-20T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e2",
+                timestamp="2025-01-22T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e3",
+                timestamp="2025-01-25T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+
+        result = store.count_days_with_data(
+            "2025-01-20T00:00:00Z", "2025-01-27T00:00:00Z"
+        )
+        assert result == 3
+
+    def test_excludes_events_outside_range(self):
+        """Events outside range not counted."""
+        store = EventStore.open_in_memory()
+        # Event before range
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e1",
+                timestamp="2025-01-19T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+        # Event in range
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e2",
+                timestamp="2025-01-22T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+        # Event after range
+        store.insert_imported_event(
+            ImportedEvent(
+                id="e3",
+                timestamp="2025-01-28T10:00:00Z",
+                type="t1",
+                source="s1",
+                data={},
+            )
+        )
+
+        result = store.count_days_with_data(
+            "2025-01-20T00:00:00Z", "2025-01-27T00:00:00Z"
+        )
+        assert result == 1

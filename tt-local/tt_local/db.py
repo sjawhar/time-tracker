@@ -838,3 +838,55 @@ class EventStore:
             WHERE e.stream_id IS NOT NULL
         """)
         return {row["session_id"]: row["stream_id"] for row in cursor.fetchall()}
+
+    def get_stream_tags(
+        self, stream_ids: list[str] | None = None
+    ) -> dict[str, list[str]]:
+        """Get tags for specified streams (or all if None).
+
+        Args:
+            stream_ids: List of stream IDs to filter by, or None for all.
+
+        Returns:
+            Dict mapping stream_id to list of tags.
+        """
+        result: dict[str, list[str]] = defaultdict(list)
+
+        if stream_ids:
+            # Batch queries to stay under SQLite's 999-parameter limit
+            batch_size = 500
+            for i in range(0, len(stream_ids), batch_size):
+                batch = stream_ids[i : i + batch_size]
+                placeholders = ",".join("?" * len(batch))
+                cursor = self._conn.execute(
+                    f"SELECT stream_id, tag FROM stream_tags WHERE stream_id IN ({placeholders})",
+                    batch,
+                )
+                for row in cursor:
+                    result[row["stream_id"]].append(row["tag"])
+        else:
+            cursor = self._conn.execute("SELECT stream_id, tag FROM stream_tags")
+            for row in cursor:
+                result[row["stream_id"]].append(row["tag"])
+
+        return dict(result)
+
+    def count_days_with_data(self, start: str, end: str) -> int:
+        """Count distinct local-time days with at least one event.
+
+        Args:
+            start: ISO 8601 timestamp (inclusive lower bound)
+            end: ISO 8601 timestamp (exclusive upper bound)
+
+        Returns:
+            Number of distinct days with events.
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT DISTINCT DATE(timestamp, 'localtime')
+            FROM events
+            WHERE timestamp >= ? AND timestamp < ?
+            """,
+            (start, end),
+        )
+        return len(cursor.fetchall())
