@@ -171,3 +171,248 @@ class TestImportCommand:
             store = EventStore.open(db_path)
             assert len(store.get_events()) == 2
             store.close()
+
+
+class TestSyncCommand:
+    """Tests for the sync command."""
+
+    def test_sync_success(self):
+        """Sync events from remote via SSH."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            events = [
+                {"id": "abc123", "timestamp": "2025-01-25T10:00:00Z", "type": "t1", "source": "s1", "data": {}},
+                {"id": "def456", "timestamp": "2025-01-25T10:01:00Z", "type": "t2", "source": "s2", "data": {}},
+            ]
+            jsonl_output = "\n".join(json.dumps(e) for e in events) + "\n"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = jsonl_output.encode("utf-8")
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result) as mock_run:
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "user@devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "2" in result.output  # 2 events imported
+            assert "user@devserver" in result.output
+
+            # Verify events in database
+            store = EventStore.open(db_path)
+            assert len(store.get_events()) == 2
+            store.close()
+
+            # Verify SSH command was correct
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args
+            assert call_args[0][0] == ["ssh", "user@devserver", "tt", "export"]
+
+    def test_sync_empty_output(self):
+        """Empty output from remote (no events)."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = b""
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "No events" in result.output or "0" in result.output
+
+    def test_sync_ssh_connection_failure(self):
+        """SSH connection failure (exit code 255)."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+
+            mock_result = Mock()
+            mock_result.returncode = 255
+            mock_result.stdout = b""
+            mock_result.stderr = b"ssh: connect to host devserver: Connection refused"
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "connection" in result.output.lower() or "failed" in result.output.lower()
+
+    def test_sync_remote_command_failure(self):
+        """Remote command failure (non-255 exit code)."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+
+            mock_result = Mock()
+            mock_result.returncode = 1
+            mock_result.stdout = b""
+            mock_result.stderr = b"tt: command not found"
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "failed" in result.output.lower()
+
+    def test_sync_timeout(self):
+        """SSH timeout."""
+        import subprocess
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+
+            with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 60)):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "timeout" in result.output.lower() or "timed out" in result.output.lower()
+
+    def test_sync_idempotent(self):
+        """Running sync twice imports no duplicates."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            event = {"id": "abc123", "timestamp": "2025-01-25T10:00:00Z", "type": "t1", "source": "s1", "data": {}}
+            jsonl_output = json.dumps(event) + "\n"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = jsonl_output.encode("utf-8")
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                # First sync
+                result1 = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+                assert result1.exit_code == 0
+
+                # Second sync
+                result2 = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+                assert result2.exit_code == 0
+
+            # Should still have only 1 event
+            store = EventStore.open(db_path)
+            assert len(store.get_events()) == 1
+            store.close()
+
+    def test_sync_partial_errors(self):
+        """Some malformed lines in output."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            jsonl_output = (
+                '{"id":"abc123","timestamp":"2025-01-25T10:00:00Z","type":"t1","source":"s1","data":{}}\n'
+                "not valid json\n"
+                '{"id":"def456","timestamp":"2025-01-25T10:01:00Z","type":"t2","source":"s2","data":{}}\n'
+            )
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = jsonl_output.encode("utf-8")
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should still import the valid events
+            store = EventStore.open(db_path)
+            assert len(store.get_events()) == 2
+            store.close()
+
+    def test_sync_calls_ssh_correctly(self):
+        """Verify subprocess.run called with list args (NOT shell=True) to prevent command injection."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = b""
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result) as mock_run:
+                runner = CliRunner()
+                runner.invoke(main, ["sync", "user@host", "--db", str(db_path)])
+
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args
+            # Must be a list, not a string (prevents command injection)
+            assert call_args[0][0] == ["ssh", "user@host", "tt", "export"]
+            # Verify shell=True is NOT used
+            assert call_args.kwargs.get("shell") is not True
+
+    def test_sync_unicode_in_output(self):
+        """UTF-8 output is decoded correctly."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            # Event with unicode characters in data
+            event = {
+                "id": "abc123",
+                "timestamp": "2025-01-25T10:00:00Z",
+                "type": "t1",
+                "source": "s1",
+                "data": {"message": "Hello, 世界! 🌍"},
+            }
+            jsonl_output = json.dumps(event) + "\n"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = jsonl_output.encode("utf-8")
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+
+            store = EventStore.open(db_path)
+            events = store.get_events()
+            assert len(events) == 1
+            data = json.loads(events[0]["data"])
+            assert data["message"] == "Hello, 世界! 🌍"
+            store.close()
+
+    def test_sync_all_invalid_exits_nonzero(self):
+        """Exit code 1 if all lines were invalid (non-empty input, zero imports)."""
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            # All lines are invalid JSON
+            jsonl_output = "not valid json\nalso not valid\n"
+
+            mock_result = Mock()
+            mock_result.returncode = 0
+            mock_result.stdout = jsonl_output.encode("utf-8")
+            mock_result.stderr = b""
+
+            with patch("subprocess.run", return_value=mock_result):
+                runner = CliRunner()
+                result = runner.invoke(main, ["sync", "devserver", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "0" in result.output  # 0 events synced
