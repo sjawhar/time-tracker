@@ -19,7 +19,7 @@ Linear task list for Time Tracker MVP.
 
 ## Prototype Implementation (Local)
 
-- [x] Set up Python project with `uv`
+- [x] Set up Rust workspace
 - [x] Implement SQLite event store (schema from `data-model.md`)
 - [x] Implement `tt import` command (reads events from stdin, inserts to SQLite)
 - [x] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)

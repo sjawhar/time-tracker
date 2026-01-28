@@ -87,6 +87,13 @@ pub struct EventRecord {
     pub assignment_source: Option<String>,
 }
 
+/// Stream metadata stored in the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRecord {
+    pub id: String,
+    pub name: Option<String>,
+}
+
 /// Latest event timestamp grouped by source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceLastEvent {
@@ -243,6 +250,128 @@ impl Database {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    /// Lists events within a time range.
+    ///
+    /// The range is inclusive of `start` and exclusive of `end`.
+    pub fn list_events_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<EventRecord>, DbError> {
+        if end <= start {
+            return Ok(Vec::new());
+        }
+        let start = format_timestamp(start);
+        let end = format_timestamp(end);
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            FROM events
+            WHERE timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC, id ASC
+            ",
+        )?;
+        let rows = stmt.query_map([start, end], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                schema_version: row.get(4)?,
+                data: row.get(5)?,
+                cwd: row.get(6)?,
+                session_id: row.get(7)?,
+                stream_id: row.get(8)?,
+                assignment_source: row.get(9)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Lists events for a specific stream, ordered by timestamp.
+    pub fn list_events_for_stream(&self, stream_id: &str) -> Result<Vec<EventRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            FROM events
+            WHERE stream_id = ?
+            ORDER BY timestamp ASC, id ASC
+            ",
+        )?;
+        let rows = stmt.query_map([stream_id], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                schema_version: row.get(4)?,
+                data: row.get(5)?,
+                cwd: row.get(6)?,
+                session_id: row.get(7)?,
+                stream_id: row.get(8)?,
+                assignment_source: row.get(9)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Lists streams ordered by ID.
+    pub fn list_streams(&self) -> Result<Vec<StreamRecord>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM streams ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StreamRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
+        let mut streams = Vec::new();
+        for row in rows {
+            streams.push(row?);
+        }
+        Ok(streams)
+    }
+
+    /// Lists tags for all streams.
+    pub fn list_stream_tags(&self) -> Result<HashMap<String, Vec<String>>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT stream_id, tag
+            FROM stream_tags
+            ORDER BY stream_id ASC, tag ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let stream_id: String = row.get(0)?;
+            let tag: String = row.get(1)?;
+            Ok((stream_id, tag))
+        })?;
+        let mut tags: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (stream_id, tag) = row?;
+            tags.entry(stream_id).or_default().push(tag);
+        }
+        Ok(tags)
+    }
+
+    /// Adds a tag to a stream, ignoring duplicates.
+    pub fn add_stream_tag(&mut self, stream_id: &str, tag: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO stream_tags (stream_id, tag) VALUES (?, ?)",
+            params![stream_id, tag],
+        )?;
+        Ok(())
     }
 
     /// Lists the last event timestamp per source, ordered by most recent.
@@ -551,9 +680,9 @@ const ATTENTION_WINDOW: chrono::Duration = chrono::Duration::seconds(120);
 const AGENT_ACTIVITY_WINDOW: chrono::Duration = chrono::Duration::seconds(300);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TimeTotals {
-    direct_ms: i64,
-    delegated_ms: i64,
+pub struct TimeTotals {
+    pub direct_ms: i64,
+    pub delegated_ms: i64,
 }
 
 #[derive(Debug)]
@@ -656,6 +785,15 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Computes direct/delegated time totals for the provided events.
+    pub fn allocate_time_for_events(
+        &self,
+        events: Vec<EventRecord>,
+    ) -> Result<HashMap<Option<String>, TimeTotals>, DbError> {
+        let timeline = build_timeline_events(events)?;
+        Ok(allocate_time(&timeline))
     }
 }
 
@@ -938,7 +1076,6 @@ fn is_browser_app(app: &str) -> bool {
         || app.contains("edge")
         || app.contains("brave")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
