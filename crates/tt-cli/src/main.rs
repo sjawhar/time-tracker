@@ -54,6 +54,12 @@ fn main() -> Result<()> {
             let mut stdout = std::io::stdout();
             tt_cli::commands::report::run(&mut stdout, &args, &config)?;
         }
+        Some(Commands::Streams(_args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let mut stdout = std::io::stdout();
+            tt_cli::commands::streams::run(&mut stdout, &config)?;
+        }
         Some(Commands::SuggestTags(args)) => {
             let config =
                 Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;

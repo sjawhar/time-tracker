@@ -1,0 +1,8 @@
+---
+source: crates/tt-cli/src/commands/streams.rs
+expression: output
+---
+STREAMS
+Stream ID                             Name    Tags
+d11718be-e82d-59d8-9078-ac18657cf3b2  /repo   project:time-tracker
+e9b87005-fde1-517e-b9b0-171d41352c42  /notes  -

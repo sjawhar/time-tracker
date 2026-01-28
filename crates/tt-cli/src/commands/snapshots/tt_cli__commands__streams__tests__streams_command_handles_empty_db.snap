@@ -1,0 +1,5 @@
+---
+source: crates/tt-cli/src/commands/streams.rs
+expression: output
+---
+No streams recorded.

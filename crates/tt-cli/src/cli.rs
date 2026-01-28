@@ -9,6 +9,7 @@ use crate::commands::export::ExportArgs;
 use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
 use crate::commands::report::ReportArgs;
+use crate::commands::streams::StreamsArgs;
 use crate::commands::suggest_tags::SuggestTagsArgs;
 use crate::commands::sync::SyncArgs;
 use crate::commands::tag::TagArgs;
@@ -49,6 +50,8 @@ pub enum Commands {
     Sync(SyncArgs),
     /// Generate time reports.
     Report(ReportArgs),
+    /// List inferred streams.
+    Streams(StreamsArgs),
     /// Suggest tags for a stream.
     SuggestTags(SuggestTagsArgs),
     /// Add a manual tag to a stream.
