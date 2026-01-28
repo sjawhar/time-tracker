@@ -47,7 +47,7 @@ Linear task list for Time Tracker MVP.
 - [x] Implement LLM tag suggestion (calls Claude API)
 - [x] Implement `tt tag <stream> <tag>` for corrections
 - [x] Implement `tt streams` to list/manage streams
-- [ ] Validate against success criteria (<5 min/week manual work)
+- [x] Validate against success criteria (<5 min/week manual work)
 
 ## Deferred (Post-MVP)
 
