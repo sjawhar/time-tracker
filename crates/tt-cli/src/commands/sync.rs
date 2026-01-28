@@ -32,9 +32,18 @@ pub struct SyncReport {
 
 pub fn run(args: &SyncArgs, config: &Config) -> Result<SyncReport> {
     let state_path = default_sync_state_path()?;
-    let mut state = SyncState::load(&state_path)?;
+    run_with_state_path(args, config, "ssh", &state_path)
+}
 
-    let mut child = Command::new("ssh")
+fn run_with_state_path(
+    args: &SyncArgs,
+    config: &Config,
+    ssh_command: &str,
+    state_path: &Path,
+) -> Result<SyncReport> {
+    let mut state = SyncState::load(state_path)?;
+
+    let mut child = Command::new(ssh_command)
         .arg(&args.remote)
         .arg("tt")
         .arg("export")
@@ -74,7 +83,7 @@ pub fn run(args: &SyncArgs, config: &Config) -> Result<SyncReport> {
         last_event_timestamp.clone(),
         synced_at,
     );
-    state.save(&state_path)?;
+    state.save(state_path)?;
 
     Ok(SyncReport {
         remote: args.remote.clone(),
@@ -154,6 +163,16 @@ fn default_sync_state_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::commands::ingest::{IngestArgs, IngestCommand, PaneFocusArgs, run_with_base_dir};
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(unix)]
+    use tt_db::Database;
 
     #[test]
     fn load_missing_state_returns_default() {
@@ -184,5 +203,59 @@ mod tests {
             Some("2025-01-01T00:00:00Z")
         );
         assert_eq!(position.last_synced_at, "2025-01-02T00:00:00Z");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_to_end_tmux_focus_syncs_into_sqlite() {
+        let remote_root = TempDir::new().expect("remote temp dir");
+        let remote_base = remote_root.path().join(".time-tracker");
+        let ingest_args = IngestArgs {
+            command: IngestCommand::PaneFocus(PaneFocusArgs {
+                pane: "%1".to_string(),
+                cwd: "/tmp/project".to_string(),
+                session: "dev".to_string(),
+                window_index: Some(1),
+            }),
+        };
+        run_with_base_dir(ingest_args, &remote_base).expect("run tt ingest");
+
+        let events_path = remote_base.join("events.jsonl");
+        let events_contents = fs::read_to_string(&events_path).expect("events.jsonl written");
+        assert_eq!(events_contents.lines().count(), 1);
+
+        let fake_bin = TempDir::new().expect("fake bin dir");
+        let ssh_path = fake_bin.path().join("ssh");
+        let script = format!("#!/bin/sh\nset -eu\ncat \"{}\"\n", events_path.display());
+        fs::write(&ssh_path, script).expect("write fake ssh");
+        let mut perms = fs::metadata(&ssh_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ssh_path, perms).unwrap();
+
+        let local_dir = TempDir::new().expect("local temp dir");
+        let local_db = local_dir.path().join("tt.db");
+        let state_path = local_dir.path().join("sync.json");
+        let config = Config {
+            database_path: local_db.clone(),
+            api_key: None,
+        };
+        let args = SyncArgs {
+            remote: "devbox".to_string(),
+        };
+        run_with_state_path(&args, &config, ssh_path.to_str().unwrap(), &state_path)
+            .expect("run tt sync");
+
+        let db = Database::open(&local_db).expect("open local db");
+        let events = db.list_events().expect("list events");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.kind, "tmux_pane_focus");
+        assert_eq!(event.source, "remote.tmux");
+        assert_eq!(event.cwd.as_deref(), Some("/tmp/project"));
+        let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(data["pane_id"], "%1");
+        assert_eq!(data["session_name"], "dev");
+        assert_eq!(data["window_index"], 1);
+        assert_eq!(data["cwd"], "/tmp/project");
     }
 }

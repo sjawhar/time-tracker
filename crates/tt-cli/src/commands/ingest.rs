@@ -46,7 +46,13 @@ pub struct PaneFocusArgs {
 }
 
 pub fn run(args: IngestArgs) -> Result<()> {
-    let writer = EventWriter::from_default_dir()?;
+    let home = dirs::home_dir().context("failed to determine home directory")?;
+    let base_dir = home.join(".time-tracker");
+    run_with_base_dir(args, &base_dir)
+}
+
+pub(crate) fn run_with_base_dir(args: IngestArgs, base_dir: &Path) -> Result<()> {
+    let writer = EventWriter::from_base_dir(base_dir);
     match args.command {
         IngestCommand::PaneFocus(pane_args) => {
             let now = Utc::now();
@@ -65,12 +71,6 @@ struct EventWriter {
 }
 
 impl EventWriter {
-    fn from_default_dir() -> Result<Self> {
-        let home = dirs::home_dir().context("failed to determine home directory")?;
-        let base_dir = home.join(".time-tracker");
-        Ok(Self::from_base_dir(&base_dir))
-    }
-
     fn from_base_dir(base_dir: &Path) -> Self {
         Self {
             events_file: base_dir.join("events.jsonl"),

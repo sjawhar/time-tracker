@@ -28,7 +28,7 @@ Linear task list for Time Tracker MVP.
 
 ## Prototype Validation
 
-- [ ] Test end-to-end: tmux focus → `events.jsonl` → sync → local SQLite
+- [x] Test end-to-end: tmux focus → `events.jsonl` → sync → local SQLite
 - [ ] Deploy and start collecting real data
 
 ## Specs (unlocks MVP)
