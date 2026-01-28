@@ -1,64 +1,81 @@
 # UX: Command-Line Interface
 
-_To be designed after user stories are established._
+## Problem Statement
+
+The CLI documentation must reflect the **actual** commands available in the current prototype so users can run the remote collection flow and local queries without guessing.
 
 ## Design Principles
 
-_What principles guide CLI design?_
+- **Event-first**: Commands append or query immutable events; no manual timers.
+- **Fast hooks**: Remote ingestion must be quick and safe to call on every focus change.
+- **Local analysis**: Reporting and inspection happen on the local machine.
+- **Minimal surface**: Only the commands needed for the current workflow are documented.
 
 ## Command Structure
 
-_What commands are available?_
+```
+tt [--verbose] [--config <path>] <command>
+```
+
+Global flags:
+- `-v`, `--verbose` — extra logging
+- `-c`, `--config <path>` — load config from a specific file
+
+## Command Reference
+
+Remote-only commands (run on the dev server):
+
+- `tt ingest pane-focus --pane <id> --cwd <path> --session <name> [--window-index <idx>]`
+  - Append a tmux pane focus event to the remote JSONL buffer.
+- `tt export`
+  - Write buffered events and Claude session events as JSONL to stdout (used by sync).
+
+Local-only commands (run on the laptop):
+
+- `tt sync <remote>`
+  - Pull events over SSH by running `tt export` remotely, then import into SQLite.
+- `tt import [--source <source>]`
+  - Read JSONL from stdin and insert into SQLite (default source applies when missing).
+- `tt events`
+  - Output all local events as JSONL (for debugging).
+- `tt status`
+  - Show last event time per source and the database path.
 
 ## Examples
 
-_Usage examples for common workflows._
-
----
-
-## Preliminary Ideas
-
-> **Note**: The following are preliminary ideas from early brainstorming. They should be validated against user stories and refined before implementation.
-
-### Command Sketch
+tmux focus hook (remote):
 
 ```bash
-# Status
-tt status                    # Show current contexts, running agents, today's summary
-tt status --watch            # Live updating status
-
-# Quick operations
-tt start "task description"  # Start explicit tracking (creates context)
-tt stop                      # Stop explicit tracking
-tt note "made progress on X" # Add annotation to current time
-
-# Queries
-tt today                     # Today's time breakdown
-tt week                      # This week's summary
-tt report --from 2024-01-01 --to 2024-01-31 --project acme
-tt report --client "Acme Corp" --format csv
-
-# Context management
-tt contexts                  # List active contexts
-tt context show <id>         # Show context details
-tt context close <id>        # Archive a context
-
-# Agent time analysis
-tt agents                    # Show active agent sessions
-tt agent-time --week         # Agent vs human time breakdown
-tt agent-cost --month        # Token usage and costs by context
-
-# Configuration
-tt config                    # Show current config
-tt rules                     # Show/edit context rules
-tt calibrate                 # Interactive calibration wizard
+tt ingest pane-focus --pane %3 --cwd /home/sami/project --session dev --window-index 1
 ```
 
-### Prototype CLI (Minimal)
-
-For the data collection prototype, only these commands are needed:
+Sync from remote host (local):
 
 ```bash
-tt ingest                    # Receive events (called by tmux hooks)
-tt events                    # Dump raw events (for debugging)
+tt sync devbox
 ```
+
+Manual export/import (local):
+
+```bash
+ssh devbox tt export | tt import --source devbox
+```
+
+Inspect local events:
+
+```bash
+tt events
+```
+
+## MVP Roadmap (Not Implemented Yet)
+
+- `tt streams` — list/manage inferred streams
+- `tt tag <stream> <tag>` — correction tags
+- `tt report --week` — weekly summary report
+
+## Acceptance Criteria
+
+- `specs/design/ux-cli.md` documents only commands that exist today.
+- Examples are copy/pasteable and match real flags and subcommands.
+- Remote-only vs local-only usage is explicit.
+- Placeholder text from the previous draft is removed.
