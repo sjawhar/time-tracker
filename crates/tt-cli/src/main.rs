@@ -21,8 +21,8 @@ fn main() -> Result<()> {
             let config =
                 Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
             tracing::debug!(?config, "loaded configuration");
-            println!("Time tracker status: idle");
-            println!("Database: {}", config.database_path.display());
+            let mut stdout = std::io::stdout();
+            tt_cli::commands::status::run(&mut stdout, &config)?;
         }
         Some(Commands::Ingest(args)) => {
             tt_cli::commands::ingest::run(args)?;

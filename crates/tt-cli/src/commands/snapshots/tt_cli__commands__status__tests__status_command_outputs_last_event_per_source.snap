@@ -1,0 +1,9 @@
+---
+source: crates/tt-cli/src/commands/status.rs
+expression: output
+---
+Time tracker status
+Database: [TEMP]/tt.db
+Sources:
+- remote.agent: 2025-01-01T00:02:00Z
+- remote.tmux: 2025-01-01T00:00:00Z

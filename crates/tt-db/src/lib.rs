@@ -69,6 +69,13 @@ pub struct EventRecord {
     pub assignment_source: Option<String>,
 }
 
+/// Latest event timestamp grouped by source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLastEvent {
+    pub source: String,
+    pub last_event: String,
+}
+
 impl Database {
     /// Opens a database at the given path, creating it if necessary.
     ///
@@ -211,6 +218,29 @@ impl Database {
             events.push(row?);
         }
         Ok(events)
+    }
+
+    /// Lists the last event timestamp per source, ordered by most recent.
+    pub fn last_event_times_by_source(&self) -> Result<Vec<SourceLastEvent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT source, MAX(timestamp) AS last_event
+            FROM events
+            GROUP BY source
+            ORDER BY last_event DESC, source ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SourceLastEvent {
+                source: row.get(0)?,
+                last_event: row.get(1)?,
+            })
+        })?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(row?);
+        }
+        Ok(sources)
     }
 }
 
@@ -439,5 +469,58 @@ mod tests {
         assert_eq!(events[0].cwd.as_deref(), Some("/repo"));
         assert_eq!(events[1].session_id.as_deref(), Some("sess-1"));
         assert_eq!(events[1].assignment_source.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn last_event_times_by_source_returns_latest_per_source() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        let event_a1 = EventRecord {
+            id: "event-a1".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%1"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: None,
+            assignment_source: None,
+        };
+        let event_a2 = EventRecord {
+            id: "event-a2".to_string(),
+            timestamp: "2025-01-01T00:03:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%2"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: None,
+            assignment_source: None,
+        };
+        let event_b = EventRecord {
+            id: "event-b".to_string(),
+            timestamp: "2025-01-01T00:02:00Z".to_string(),
+            kind: "agent_session".to_string(),
+            source: "remote.agent".to_string(),
+            schema_version: 1,
+            data: r#"{"action":"started"}"#.to_string(),
+            cwd: None,
+            session_id: Some("sess-1".to_string()),
+            stream_id: None,
+            assignment_source: None,
+        };
+
+        db.insert_events(&[event_a1, event_b, event_a2])
+            .expect("insert events");
+
+        let sources = db
+            .last_event_times_by_source()
+            .expect("fetch last event times");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].source, "remote.tmux");
+        assert_eq!(sources[0].last_event, "2025-01-01T00:03:00Z");
+        assert_eq!(sources[1].source, "remote.agent");
+        assert_eq!(sources[1].last_event, "2025-01-01T00:02:00Z");
     }
 }
