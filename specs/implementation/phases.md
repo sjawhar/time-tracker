@@ -31,8 +31,8 @@ _For each phase: scope, deliverables, success criteria._
 - Context linking
 
 **Phase 3: Agent Integration**
-- Claude Code session log parsing
-- Codex session log parsing
+- Claude Code session watcher
+- Codex session watcher
 - Generic agent event protocol
 - Human/agent time classification
 

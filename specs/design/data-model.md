@@ -17,14 +17,10 @@
 
 The atomic unit of observation. Immutable once recorded.
 
-**ID generation:** Deterministic hash of content: `id = hash(source + type + timestamp + data)`. This ensures the same logical event always produces the same ID, making imports idempotent without separate deduplication logic.
-
-**Timestamps:** Always UTC with `Z` suffix. Shell hooks must use `date -u +%Y-%m-%dT%H:%M:%SZ`.
-
 ```
 Event {
-  id: UUID (deterministic, content-based)
-  timestamp: DateTime (UTC, with Z suffix)
+  id: UUID
+  timestamp: DateTime (UTC)
   type: EventType
   source: Source
   schema_version: Integer     # payload schema version (start at 1)

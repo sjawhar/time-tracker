@@ -9,11 +9,11 @@ Traditional time trackers assume **one thing at a time**. You start a timer, wor
 - Work happens *concurrently*, not sequentially
 - The currently active window doesn't reflect where your attention is
 
-This time tracker uses a different model: **observe events, infer streams, distinguish human attention from agent execution**.
+River uses a different model: **observe events, infer streams, distinguish human attention from agent execution**.
 
 ### Key Shifts
 
-| Traditional Tracker | This System |
+| Traditional Tracker | River |
 |---------------------|-------|
 | One task at a time | Multiple concurrent streams |
 | Start/stop timers | Events are observed automatically |
@@ -29,7 +29,7 @@ This time tracker uses a different model: **observe events, infer streams, disti
 
 ## Key Abstractions
 
-The system has four core concepts:
+River has four core concepts:
 
 ### 1. Event
 
@@ -40,7 +40,7 @@ Examples:
 - "Claude session started in /home/user/project-x at 14:32:15"
 - "git commit in /home/user/project-x at 15:47:22"
 
-Events are **immutable**. Once recorded, they don't change. Everything else is derived from events.
+Events are **immutable**. Once recorded, they don't change. Everything else in River is derived from events.
 
 Events have:
 - `timestamp` — when it happened
@@ -80,7 +80,7 @@ Streams have:
 
 ### 3. Direct / Delegated Time
 
-The system distinguishes two types of time within a stream:
+River distinguishes two types of time within a stream:
 
 **Direct time** — moments when you are actively engaged:
 - Reading agent output
@@ -108,7 +108,7 @@ When multiple streams are active simultaneously (common with parallel agents), d
 The allocation model:
 - At any moment, your direct attention can only be on **one stream**
 - Delegated time can accumulate on **multiple streams** in parallel
-- When streams overlap, `tt` allocates direct time based on which stream has focus
+- When streams overlap, River allocates direct time based on which stream has focus
 - Total direct time across all streams ≤ wall clock time (no double-counting attention)
 - Total delegated time can exceed wall clock time (parallel execution)
 
@@ -125,7 +125,7 @@ A **tag** is flexible metadata attached to a stream. Tags enable categorization,
 
 Examples:
 - Activity types: `development`, `code-review`, `research`, `documentation`
-- Projects: `project:time-tracker`, `project:client-website`
+- Projects: `project:river`, `project:client-website`
 - Clients: `client:acme-corp`
 - Priority: `high-priority`, `tech-debt`
 - Custom: anything useful for your workflow
@@ -139,7 +139,7 @@ Tags are:
 #### Future: Typed Tags
 
 Post-MVP, tags may evolve to carry properties (like Tana's supertags):
-- `project:time-tracker` could have fields: `status: active`, `repo: github.com/...`
+- `project:river` could have fields: `status: active`, `repo: github.com/...`
 - `client:acme` could have fields: `billable: true`, `rate: $150/hr`
 
 For MVP, tags are simple strings. The system doesn't distinguish "project tags" from "activity tags" — that's a convention you choose.
@@ -148,7 +148,7 @@ For MVP, tags are simple strings. The system doesn't distinguish "project tags" 
 
 ## User Operations
 
-While `tt` infers streams automatically, users have full control to correct and refine:
+While River infers streams automatically, users have full control to correct and refine:
 
 ### Event Operations
 - **Create event** — manually log something that wasn't captured (e.g., "I was thinking about this from 2-3pm")
@@ -177,7 +177,7 @@ Tags can help track correction needs. A user might tag streams as `needs-review`
 
 | Term | Definition |
 |------|------------|
-| **Event** | An atomic, immutable observation with a timestamp. The raw input to `tt`. |
+| **Event** | An atomic, immutable observation with a timestamp. The raw input to River. |
 | **Stream** | A coherent unit of work, inferred from related events. The primary unit for reporting. |
 | **Direct time** | Time when the human is actively engaged — reading, deciding, providing input. |
 | **Delegated time** | Time when agents work autonomously without human attention. |
@@ -190,7 +190,7 @@ Tags can help track correction needs. A user might tag streams as `needs-review`
 
 ## Non-Concepts
 
-Things `tt` intentionally does **not** have (at least for MVP):
+Things River intentionally does **not** have (at least for MVP):
 
 | Avoided Concept | Why |
 |-----------------|-----|

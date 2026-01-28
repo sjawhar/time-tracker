@@ -1,6 +1,0 @@
-/target/
-.direnv
-.envrc
-.idea/
-.vscode/
-*.db-journal
