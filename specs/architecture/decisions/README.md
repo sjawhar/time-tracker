@@ -26,6 +26,5 @@ What becomes easier or harder as a result of this decision?
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| _None yet_ | | |
-
-_ADRs will be added as architectural decisions are made._
+| 001 | Event Transport from Remote to Local | Accepted |
+| 002 | Remote Analysis Architecture (Pane Context) | Accepted |
