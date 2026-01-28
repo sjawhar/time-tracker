@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::ingest::IngestArgs;
+
 /// AI-native time tracker.
 ///
 /// Passively collects activity signals from development tools and uses LLMs
@@ -28,4 +30,6 @@ pub struct Cli {
 pub enum Commands {
     /// Show current tracking status.
     Status,
+    /// Append events to the remote buffer.
+    Ingest(IngestArgs),
 }
