@@ -1,13 +1,14 @@
 //! Export command for combining remote buffer events with Claude logs.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Args;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -30,6 +31,7 @@ pub fn run(_args: ExportArgs) -> Result<()> {
 struct Exporter {
     events_file: PathBuf,
     claude_projects_dir: PathBuf,
+    claude_manifest_path: PathBuf,
 }
 
 impl Exporter {
@@ -39,9 +41,11 @@ impl Exporter {
     }
 
     fn from_home_dir(home: &Path) -> Self {
+        let manifest_path = home.join(".time-tracker").join("claude-manifest.json");
         Self {
             events_file: home.join(".time-tracker").join("events.jsonl"),
             claude_projects_dir: home.join(".claude").join("projects"),
+            claude_manifest_path: manifest_path,
         }
     }
 
@@ -67,29 +71,59 @@ impl Exporter {
             writer
                 .write_all(line.as_bytes())
                 .context("failed to write event line")?;
-            writer
-                .write_all(b"\n")
-                .context("failed to write newline")?;
+            writer.write_all(b"\n").context("failed to write newline")?;
         }
         Ok(())
     }
 
     fn export_claude_events<W: Write>(&self, writer: &mut W) -> Result<()> {
         let log_files = find_claude_log_files(&self.claude_projects_dir)?;
+        if log_files.is_empty() {
+            return Ok(());
+        }
+
+        let manifest = ClaudeManifest::load(&self.claude_manifest_path)?;
+        let mut updated_manifest = ClaudeManifest::default();
+
         for log_file in log_files {
             let session_fallback = log_file
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .map(ToString::to_string);
-            let file = File::open(&log_file)
+            let key = log_file.to_string_lossy().to_string();
+            let previous_offset = manifest
+                .sessions
+                .get(&key)
+                .map_or(0, |entry| entry.byte_offset);
+            let metadata = fs::metadata(&log_file)
+                .with_context(|| format!("failed to stat {}", log_file.display()))?;
+            let start_offset = if previous_offset > metadata.len() {
+                0
+            } else {
+                previous_offset
+            };
+            let mut file = File::open(&log_file)
                 .with_context(|| format!("failed to open {}", log_file.display()))?;
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = line.context("failed to read Claude log line")?;
-                if line.trim().is_empty() {
+            if start_offset > 0 {
+                file.seek(SeekFrom::Start(start_offset)).with_context(|| {
+                    format!("failed to seek {} to {}", log_file.display(), start_offset)
+                })?;
+            }
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .context("failed to read Claude log line")?;
+                if bytes == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-                let parsed: Value = match serde_json::from_str(&line) {
+                let parsed: Value = match serde_json::from_str(trimmed) {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
@@ -104,7 +138,50 @@ impl Exporter {
                         .context("failed to write Claude newline")?;
                 }
             }
+            let end_offset = reader
+                .stream_position()
+                .with_context(|| format!("failed to read offset for {}", log_file.display()))?;
+            updated_manifest.sessions.insert(
+                key,
+                ClaudeManifestSession {
+                    byte_offset: end_offset,
+                },
+            );
         }
+
+        updated_manifest.write_to(&self.claude_manifest_path)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ClaudeManifest {
+    sessions: BTreeMap<String, ClaudeManifestSession>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ClaudeManifestSession {
+    byte_offset: u64,
+}
+
+impl ClaudeManifest {
+    fn load(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(serde_json::from_str(&contents).unwrap_or_default()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(err)
+                .with_context(|| format!("failed to read Claude manifest {}", path.display())),
+        }
+    }
+
+    fn write_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create manifest dir {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("failed to encode manifest")?;
+        fs::write(path, json)
+            .with_context(|| format!("failed to write Claude manifest {}", path.display()))?;
         Ok(())
     }
 }
@@ -130,7 +207,8 @@ struct ExportEvent {
 
 fn parse_claude_event(value: &Value, session_fallback: Option<&str>) -> Option<ExportEvent> {
     let timestamp = extract_timestamp(value)?;
-    let session_id = extract_session_id(value).or_else(|| session_fallback.map(ToString::to_string));
+    let session_id =
+        extract_session_id(value).or_else(|| session_fallback.map(ToString::to_string));
     let cwd = extract_cwd(value);
 
     let kind = extract_event_kind(value)?;
@@ -166,7 +244,12 @@ fn parse_claude_event(value: &Value, session_fallback: Option<&str>) -> Option<E
 
     let timestamp_str = format_timestamp(timestamp);
     let data_json = serde_json::to_string(&data).ok()?;
-    let id = deterministic_event_id(EVENT_SOURCE_REMOTE_AGENT, event_type, &timestamp_str, &data_json);
+    let id = deterministic_event_id(
+        EVENT_SOURCE_REMOTE_AGENT,
+        event_type,
+        &timestamp_str,
+        &data_json,
+    );
 
     Some(ExportEvent {
         id,
@@ -325,14 +408,11 @@ fn extract_message_details(value: &Value) -> (usize, bool) {
             (text_len, has_image)
         }
         Some(Value::Object(map)) => {
-            let text_len = map
-                .get("text")
-                .and_then(Value::as_str)
-                .map_or(0, str::len);
+            let text_len = map.get("text").and_then(Value::as_str).map_or(0, str::len);
             let has_image = map
                 .get("type")
                 .and_then(Value::as_str)
-                .map_or(false, |kind| kind.contains("image"));
+                .is_some_and(|kind| kind.contains("image"));
             (text_len, has_image)
         }
         _ => (0, false),
@@ -357,13 +437,12 @@ fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
             .ok()
             .map(|dt| dt.with_timezone(&Utc)),
         Value::Number(num) => {
-            let Some(raw) = num.as_i64() else {
-                return None;
-            };
+            let raw = num.as_i64()?;
             if raw >= 1_000_000_000_000 {
                 let secs = raw / 1000;
                 let nanos = (raw % 1000) * 1_000_000;
-                DateTime::<Utc>::from_timestamp(secs, nanos as u32)
+                let nanos = u32::try_from(nanos).ok()?;
+                DateTime::<Utc>::from_timestamp(secs, nanos)
             } else {
                 DateTime::<Utc>::from_timestamp(raw, 0)
             }
@@ -386,7 +465,7 @@ fn extract_session_id(value: &Value) -> Option<String> {
     for pointer in pointers {
         if let Some(Value::String(val)) = value.pointer(pointer) {
             if !val.trim().is_empty() {
-                return Some(val.to_string());
+                return Some(val.clone());
             }
         }
     }
@@ -404,7 +483,7 @@ fn extract_cwd(value: &Value) -> Option<String> {
     for pointer in pointers {
         if let Some(Value::String(val)) = value.pointer(pointer) {
             if !val.trim().is_empty() {
-                return Some(val.to_string());
+                return Some(val.clone());
             }
         }
     }
@@ -431,7 +510,7 @@ fn find_claude_log_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>> {
                     "failed to read Claude projects dir {}",
                     claude_projects_dir.display()
                 )
-            })
+            });
         }
     };
 
@@ -450,11 +529,7 @@ fn find_claude_log_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>> {
         {
             let session = session.context("failed to read session entry")?;
             let session_path = session.path();
-            if session_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                == Some("jsonl")
-            {
+            if session_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
                 files.push(session_path);
             }
         }
@@ -468,7 +543,8 @@ fn find_claude_log_files(claude_projects_dir: &Path) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
 
-    use std::io::Cursor;
+    use std::fs::OpenOptions;
+    use std::io::{Cursor, Write};
 
     use serde_json::Value;
     use tempfile::TempDir;
@@ -539,5 +615,73 @@ mod tests {
             .unwrap();
         assert_eq!(session["data"]["action"], "started");
         assert_eq!(session["data"]["cwd"], "/repo");
+    }
+
+    #[test]
+    fn exports_claude_events_incrementally() {
+        let (temp_dir, exporter) = exporter_for_temp();
+        let session_dir = temp_dir
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("proj1")
+            .join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let log_path = session_dir.join("session-1.jsonl");
+        let log_contents = format!(
+            "{}\n{}\n",
+            r#"{"type":"message","timestamp":"2025-01-01T00:10:00Z","session_id":"sess1","message":{"role":"user","content":"Hello"}}"#,
+            r#"{"type":"tool_use","timestamp":"2025-01-01T00:11:00Z","session_id":"sess1","tool":{"name":"Edit","file":"/repo/main.rs"}}"#,
+        );
+        fs::write(&log_path, log_contents).unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        exporter.export(&mut buffer).unwrap();
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        let mut count = 0;
+        for line in output.lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 2);
+
+        let manifest_path = temp_dir
+            .path()
+            .join(".time-tracker")
+            .join("claude-manifest.json");
+        let manifest_contents = fs::read_to_string(&manifest_path).expect("manifest written");
+        let manifest: Value = serde_json::from_str(&manifest_contents).unwrap();
+        let key = log_path.to_string_lossy();
+        let recorded_offset = manifest["sessions"][key.as_ref()]["byte_offset"]
+            .as_u64()
+            .unwrap();
+        let log_len = fs::metadata(&log_path).unwrap().len();
+        assert_eq!(recorded_offset, log_len);
+
+        let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+        file.write_all(
+            br#"{"type":"session_end","timestamp":"2025-01-01T00:12:00Z","session_id":"sess1"}
+"#,
+        )
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        exporter.export(&mut buffer).unwrap();
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        let lines: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "agent_session");
+
+        let manifest_contents = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: Value = serde_json::from_str(&manifest_contents).unwrap();
+        let updated_offset = manifest["sessions"][key.as_ref()]["byte_offset"]
+            .as_u64()
+            .unwrap();
+        let updated_len = fs::metadata(&log_path).unwrap().len();
+        assert_eq!(updated_offset, updated_len);
     }
 }
