@@ -48,6 +48,12 @@ fn main() -> Result<()> {
             let report = tt_cli::commands::sync::run(&args, &config)?;
             println!("Synced {} events from {}", report.imported, report.remote);
         }
+        Some(Commands::Report(args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let mut stdout = std::io::stdout();
+            tt_cli::commands::report::run(&mut stdout, &args, &config)?;
+        }
         None => {
             // No subcommand, show help
             use clap::CommandFactory;

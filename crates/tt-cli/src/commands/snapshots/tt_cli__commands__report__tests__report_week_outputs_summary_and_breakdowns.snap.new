@@ -1,0 +1,28 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+assertion_line: 413
+expression: output
+---
+TIME REPORT (WEEK)
+Week: 2026-01-26..2026-02-01 (Mon-Sun)
+Generated: 2026-01-28T09:42:10+00:00
+
+SUMMARY
+Total tracked: 0h 09m
+Direct time:   0h 06m ( 67%)
+Delegated:     0h 03m ( 33%)
+Unassigned:    0h 06m ( 67%)
+
+DAILY TOTALS
+Mon 01-26  0h 03m  (D 0h 03m / A 0h 00m)
+Tue 01-27  0h 04m  (D 0h 01m / A 0h 03m)
+Wed 01-28  0h 00m  (D 0h 00m / A 0h 00m)
+Thu 01-29  0h 00m  (D 0h 00m / A 0h 00m)
+Fri 01-30  0h 00m  (D 0h 00m / A 0h 00m)
+Sat 01-31  0h 00m  (D 0h 00m / A 0h 00m)
+Sun 02-01  0h 00m  (D 0h 00m / A 0h 00m)
+
+BY STREAM
+Stream                           Direct   Delegated   Total  Tags
+Uncategorized                    0h 06m      0h 00m   0h 06m  -
+infra-docs                       0h 00m      0h 03m   0h 03m  writing

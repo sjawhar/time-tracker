@@ -8,6 +8,7 @@ use crate::commands::events::EventsArgs;
 use crate::commands::export::ExportArgs;
 use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
+use crate::commands::report::ReportArgs;
 use crate::commands::sync::SyncArgs;
 
 /// AI-native time tracker.
@@ -44,4 +45,6 @@ pub enum Commands {
     Import(ImportArgs),
     /// Sync events from a remote host.
     Sync(SyncArgs),
+    /// Generate time reports.
+    Report(ReportArgs),
 }
