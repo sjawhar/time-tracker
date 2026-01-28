@@ -28,3 +28,4 @@ What becomes easier or harder as a result of this decision?
 |-----|-------|--------|
 | [001](001-event-transport.md) | Event Transport from Remote to Local | Accepted |
 | [002](002-remote-analysis.md) | Remote Analysis Architecture | Proposed |
+| [003](003-activitywatch-integration.md) | ActivityWatch Integration | Proposed |
