@@ -24,7 +24,7 @@ Linear task list for Time Tracker MVP.
 - [x] Implement `tt import` command (reads events from stdin, inserts to SQLite)
 - [x] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
 - [x] Implement `tt events` command (query local SQLite)
-- [ ] Implement `tt status` command (show last event time per source)
+- [x] Implement `tt status` command (show last event time per source)
 
 ## Prototype Validation
 
