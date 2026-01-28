@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use thiserror::Error;
 
 /// Database errors.
@@ -52,6 +52,21 @@ pub enum DbError {
 /// See the [module documentation](self) for thread safety considerations.
 pub struct Database {
     conn: Connection,
+}
+
+/// A raw event ready to be stored in the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub id: String,
+    pub timestamp: String,
+    pub kind: String,
+    pub source: String,
+    pub schema_version: i64,
+    pub data: String,
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub assignment_source: Option<String>,
 }
 
 impl Database {
@@ -131,6 +146,41 @@ impl Database {
             ",
         )?;
         Ok(())
+    }
+
+    /// Inserts a batch of events, ignoring duplicates by ID.
+    pub fn insert_events(&mut self, events: &[EventRecord]) -> Result<usize, DbError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare(
+                "
+                INSERT OR IGNORE INTO events
+                (id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+            for event in events {
+                let assignment_source = event.assignment_source.as_deref().unwrap_or("inferred");
+                inserted += stmt.execute(params![
+                    event.id,
+                    event.timestamp,
+                    event.kind,
+                    event.source,
+                    event.schema_version,
+                    event.data,
+                    event.cwd,
+                    event.session_id,
+                    event.stream_id,
+                    assignment_source,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 }
 
@@ -264,5 +314,60 @@ mod tests {
             })
             .expect("query foreign_key_list");
         rows.map(|row| row.expect("foreign_key_list row")).collect()
+    }
+
+    #[test]
+    fn insert_events_is_idempotent() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        let event = EventRecord {
+            id: "event-1".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            kind: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
+            schema_version: 1,
+            data: r#"{"pane_id":"%1"}"#.to_string(),
+            cwd: Some("/repo".to_string()),
+            session_id: None,
+            stream_id: None,
+            assignment_source: None,
+        };
+
+        let inserted = db.insert_events(&[event.clone(), event]).unwrap();
+        assert_eq!(inserted, 1);
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_events_applies_default_assignment_source() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        let event = EventRecord {
+            id: "event-2".to_string(),
+            timestamp: "2025-01-01T00:01:00Z".to_string(),
+            kind: "agent_session".to_string(),
+            source: "remote.agent".to_string(),
+            schema_version: 1,
+            data: r#"{"action":"started"}"#.to_string(),
+            cwd: None,
+            session_id: Some("sess-1".to_string()),
+            stream_id: None,
+            assignment_source: None,
+        };
+
+        db.insert_events(&[event]).unwrap();
+
+        let stored: String = db
+            .conn
+            .query_row(
+                "SELECT assignment_source FROM events WHERE id = ?",
+                ["event-2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "inferred");
     }
 }

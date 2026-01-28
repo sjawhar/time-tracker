@@ -30,6 +30,12 @@ fn main() -> Result<()> {
         Some(Commands::Export(args)) => {
             tt_cli::commands::export::run(args)?;
         }
+        Some(Commands::Import(args)) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            let imported = tt_cli::commands::import::run(&args, &config)?;
+            println!("Imported {imported} events");
+        }
         None => {
             // No subcommand, show help
             use clap::CommandFactory;

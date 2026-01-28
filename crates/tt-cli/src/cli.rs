@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::commands::export::ExportArgs;
+use crate::commands::import::ImportArgs;
 use crate::commands::ingest::IngestArgs;
 
 /// AI-native time tracker.
@@ -35,4 +36,6 @@ pub enum Commands {
     Ingest(IngestArgs),
     /// Export buffered events plus Claude session events.
     Export(ExportArgs),
+    /// Import events from stdin into the local database.
+    Import(ImportArgs),
 }
