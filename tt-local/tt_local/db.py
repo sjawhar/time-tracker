@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -246,8 +247,14 @@ class EventStore:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
-    def create_stream(self, *, name: str | None = None) -> str:
-        """Create a new stream and return its ID."""
+    def create_stream(self, *, name: str | None = None, commit: bool = True) -> str:
+        """Create a new stream and return its ID.
+
+        Args:
+            name: Optional stream name.
+            commit: Whether to commit immediately (default True).
+                    Set to False when called within a larger transaction.
+        """
         stream_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._conn.execute(
@@ -257,7 +264,8 @@ class EventStore:
             """,
             (stream_id, now, now, name),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         return stream_id
 
     def get_last_event_per_source(self) -> list[dict[str, Any]]:
@@ -276,3 +284,107 @@ class EventStore:
             ORDER BY last_timestamp DESC
         """)
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_streams(self) -> list[dict[str, Any]]:
+        """Get all streams."""
+        cursor = self._conn.execute("SELECT * FROM streams ORDER BY created_at")
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_unassigned_events(self) -> list[dict[str, Any]]:
+        """Get events where assignment_source != 'user' and stream_id IS NULL."""
+        cursor = self._conn.execute("""
+            SELECT * FROM events
+            WHERE stream_id IS NULL AND assignment_source != 'user'
+            ORDER BY timestamp ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def assign_events_to_stream(self, event_ids: list[str], stream_id: str) -> None:
+        """Assign multiple events to a stream (sets assignment_source = 'inferred').
+
+        Uses batching (500 IDs per query) to stay under SQLite's 999-parameter limit.
+        Does not commit - caller is responsible for transaction management.
+        """
+        if not event_ids:
+            return
+        batch_size = 500
+        for i in range(0, len(event_ids), batch_size):
+            batch = event_ids[i : i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            self._conn.execute(
+                f"""
+                UPDATE events
+                SET stream_id = ?, assignment_source = 'inferred'
+                WHERE id IN ({placeholders})
+                """,
+                [stream_id] + batch,
+            )
+
+    def run_stream_inference(self, gap_threshold_ms: int = 1_800_000) -> int:
+        """Run stream inference on all unassigned events.
+
+        Clusters events by working directory and temporal proximity.
+        Events within gap_threshold_ms of each other in the same directory
+        belong to the same stream.
+
+        Returns the number of events assigned.
+        """
+        events = self.get_unassigned_events()
+        if not events:
+            return 0
+
+        # Group events by normalized cwd
+        cwd_groups: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for event in events:
+            cwd = event["cwd"] or ""
+            # Strip trailing slashes but preserve "/" as-is
+            normalized_cwd = cwd.rstrip("/") or cwd
+            cwd_groups[normalized_cwd].append(event)
+
+        assigned_count = 0
+
+        with self._conn:  # Automatic transaction handling (commits on success)
+            for normalized_cwd, group_events in cwd_groups.items():
+                # Events already sorted by timestamp from get_unassigned_events()
+                # Split into temporal clusters
+                clusters: list[list[dict[str, Any]]] = []
+                current_cluster: list[dict[str, Any]] = []
+
+                for event in group_events:
+                    if not current_cluster:
+                        current_cluster.append(event)
+                    else:
+                        # Calculate gap from previous event
+                        prev_ts = datetime.fromisoformat(
+                            current_cluster[-1]["timestamp"].replace("Z", "+00:00")
+                        )
+                        curr_ts = datetime.fromisoformat(
+                            event["timestamp"].replace("Z", "+00:00")
+                        )
+                        gap_ms = (curr_ts - prev_ts).total_seconds() * 1000
+
+                        if gap_ms > gap_threshold_ms:
+                            # Start new cluster
+                            clusters.append(current_cluster)
+                            current_cluster = [event]
+                        else:
+                            current_cluster.append(event)
+
+                if current_cluster:
+                    clusters.append(current_cluster)
+
+                # Create streams and assign events
+                for cluster in clusters:
+                    # Stream name from cwd: basename, or "/" for root, or "Uncategorized"
+                    stream_name = (
+                        normalized_cwd.rsplit("/", 1)[-1]
+                        or normalized_cwd
+                        or "Uncategorized"
+                    )
+
+                    stream_id = self.create_stream(name=stream_name, commit=False)
+                    event_ids = [e["id"] for e in cluster]
+                    self.assign_events_to_stream(event_ids, stream_id)
+                    assigned_count += len(event_ids)
+
+        return assigned_count
