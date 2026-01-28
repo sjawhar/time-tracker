@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Sami"]
+
+[workspace.dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+
+# Async runtime
+tokio = { version = "1.43", features = ["rt", "macros", "fs", "process"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+dirs = "6.0"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Testing
+insta = "1.42"
+tempfile = "3.15"
+
+# Internal crates
+tt-core = { path = "crates/tt-core" }
+tt-db = { path = "crates/tt-db" }
+tt-llm = { path = "crates/tt-llm" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Pedantic lints we don't want
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
