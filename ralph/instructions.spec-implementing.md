@@ -17,10 +17,10 @@ Each spec task gets its own commit. Verify you're starting fresh.
    - Edge cases and failure modes
    - Acceptance criteria (how do we know it's done?)
 
-3. **Review**: Launch agents to review the spec:
-   - **code-architect**: Is the approach sound? Simpler alternatives?
-   - **ux-designer**: Is this intuitive for users?
-   - **bug-finder**: What edge cases would break this?
+3. **Review**: Do a focused self-review of the spec:
+   - Is the approach sound? Simpler alternatives?
+   - Is this intuitive for users?
+   - What edge cases would break this?
 
 4. **Refine**: Address valid concerns. Document trade-offs.
 

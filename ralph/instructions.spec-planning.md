@@ -10,7 +10,7 @@ You're researching a topic before writing a spec.
    - How do similar tools solve this? (ActivityWatch, Toggl, Clockify, WakaTime)
    - What are established best practices?
    - What pitfalls have others documented?
-   - Use WebSearch to find real-world approaches
+   - Use `web.run` to find real-world approaches
 
 3. **Investigate codebase**: Read existing specs and code. Understand what's already decided.
 
@@ -26,7 +26,7 @@ You're researching a topic before writing a spec.
    - Open questions resolved
    - Outline of what the spec will cover
 
-6. **Review**: Launch **code-architect** and **ux-designer** to review your plan.
+6. **Review**: Do a focused self-review of the research and recommended approach.
 
 7. **Hand off**: Plan is ready for the implementing phase.
 

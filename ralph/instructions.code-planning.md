@@ -24,7 +24,7 @@ You're preparing to implement a code task.
    - Implementation approach
    - Any resolved questions
 
-6. **Review**: Launch **code-architect** to review your plan. Are there simpler approaches?
+6. **Review**: Do a focused self-review of your plan. Are there simpler approaches?
 
 7. **Hand off**: Plan is ready for the implementing phase.
 

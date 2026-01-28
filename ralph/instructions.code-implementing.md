@@ -27,10 +27,10 @@ Each code task gets its own commit. Verify you're starting fresh.
 
 5. **Measure performance**: If spec has perf requirements, benchmark before done.
 
-6. **Review**: Launch agents:
-   - **bug-finder**: Edge cases, error handling gaps
-   - **code-simplifier**: Unnecessary complexity, dead code
-   - **performance-engineer**: Bottlenecks, memory issues (especially remote CLI)
+6. **Review**: Do a focused self-review:
+   - Edge cases and error handling gaps
+   - Unnecessary complexity or dead code
+   - Bottlenecks or memory issues (especially remote CLI)
 
 7. **Fix**: Address issues. Re-run tests.
 
