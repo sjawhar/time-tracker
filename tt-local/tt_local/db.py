@@ -209,18 +209,22 @@ class EventStore:
         *,
         start: str | None = None,
         end: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Query events, optionally filtered by time range.
+        """Query events, optionally filtered by time range and type.
 
         Args:
             start: ISO 8601 timestamp (inclusive lower bound)
             end: ISO 8601 timestamp (exclusive upper bound)
+            event_type: Filter by event type
+            limit: Maximum number of events to return
 
         Returns:
             List of event dicts ordered by timestamp ascending.
         """
         query = "SELECT * FROM events WHERE 1=1"
-        params: list[str] = []
+        params: list[str | int] = []
 
         if start is not None:
             query += " AND timestamp >= ?"
@@ -228,8 +232,15 @@ class EventStore:
         if end is not None:
             query += " AND timestamp < ?"
             params.append(end)
+        if event_type is not None:
+            query += " AND type = ?"
+            params.append(event_type)
 
         query += " ORDER BY timestamp ASC"
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
 
         cursor = self._conn.execute(query, params)
         rows = cursor.fetchall()

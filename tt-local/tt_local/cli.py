@@ -157,5 +157,54 @@ def sync_events(remote: str, db: Path, timeout: int) -> None:
         sys.exit(1)
 
 
+@main.command("events")
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+@click.option(
+    "--since",
+    help="ISO 8601 timestamp (show events at or after this time)",
+)
+@click.option(
+    "--type",
+    "event_type",
+    help="Filter by event type",
+)
+@click.option(
+    "--limit",
+    type=int,
+    help="Maximum number of events to output",
+)
+def events_command(
+    db: Path,
+    since: str | None,
+    event_type: str | None,
+    limit: int | None,
+) -> None:
+    """Query events from local database.
+
+    Outputs events in JSONL format for debugging and analysis.
+
+    Example:
+        tt events
+        tt events --since 2025-01-25T10:00:00Z
+        tt events --type tmux_pane_focus --limit 10
+    """
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    with EventStore.open(db) as store:
+        for event in store.get_events(
+            start=since,
+            event_type=event_type,
+            limit=limit,
+        ):
+            click.echo(json.dumps(event))
+
+
 if __name__ == "__main__":
     main()

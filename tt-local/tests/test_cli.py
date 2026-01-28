@@ -416,3 +416,262 @@ class TestSyncCommand:
 
             assert result.exit_code == 1
             assert "0" in result.output  # 0 events synced
+
+
+class TestEventsCommand:
+    """Tests for the events command."""
+
+    def test_events_empty_db(self):
+        """Empty database outputs nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            # Create empty database
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["events", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert result.output == ""
+
+    def test_events_outputs_jsonl(self):
+        """Events output as JSONL format."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            # Insert test events
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            events = [
+                ImportedEvent(
+                    id="abc123",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="tmux_pane_focus",
+                    source="remote.tmux",
+                    data={"pane_id": "%1"},
+                    cwd="/home/sami/project",
+                ),
+                ImportedEvent(
+                    id="def456",
+                    timestamp="2025-01-25T10:01:00Z",
+                    type="agent_tool_use",
+                    source="remote.agent",
+                    data={"tool": "Edit"},
+                    cwd="/home/sami/project",
+                ),
+            ]
+            for e in events:
+                store.insert_imported_event(e)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["events", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            lines = result.output.strip().split("\n")
+            assert len(lines) == 2
+
+            # Verify JSON format
+            parsed = [json.loads(line) for line in lines]
+            assert parsed[0]["id"] == "abc123"
+            assert parsed[1]["id"] == "def456"
+
+    def test_events_since_filter(self):
+        """--since filters events by timestamp."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            events = [
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="t1",
+                    source="s1",
+                    data={},
+                ),
+                ImportedEvent(
+                    id="e2",
+                    timestamp="2025-01-25T11:00:00Z",
+                    type="t2",
+                    source="s2",
+                    data={},
+                ),
+                ImportedEvent(
+                    id="e3",
+                    timestamp="2025-01-25T12:00:00Z",
+                    type="t3",
+                    source="s3",
+                    data={},
+                ),
+            ]
+            for e in events:
+                store.insert_imported_event(e)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["events", "--db", str(db_path), "--since", "2025-01-25T11:00:00Z"]
+            )
+
+            assert result.exit_code == 0
+            lines = result.output.strip().split("\n")
+            assert len(lines) == 2
+
+            parsed = [json.loads(line) for line in lines]
+            assert parsed[0]["id"] == "e2"
+            assert parsed[1]["id"] == "e3"
+
+    def test_events_type_filter(self):
+        """--type filters events by event type."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            events = [
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="tmux_pane_focus",
+                    source="s1",
+                    data={},
+                ),
+                ImportedEvent(
+                    id="e2",
+                    timestamp="2025-01-25T10:01:00Z",
+                    type="agent_tool_use",
+                    source="s2",
+                    data={},
+                ),
+                ImportedEvent(
+                    id="e3",
+                    timestamp="2025-01-25T10:02:00Z",
+                    type="tmux_pane_focus",
+                    source="s3",
+                    data={},
+                ),
+            ]
+            for e in events:
+                store.insert_imported_event(e)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["events", "--db", str(db_path), "--type", "tmux_pane_focus"]
+            )
+
+            assert result.exit_code == 0
+            lines = result.output.strip().split("\n")
+            assert len(lines) == 2
+
+            parsed = [json.loads(line) for line in lines]
+            assert all(p["type"] == "tmux_pane_focus" for p in parsed)
+
+    def test_events_limit(self):
+        """--limit caps output to N events."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            for i in range(10):
+                store.insert_imported_event(
+                    ImportedEvent(
+                        id=f"e{i}",
+                        timestamp=f"2025-01-25T10:0{i}:00Z",
+                        type="t",
+                        source="s",
+                        data={},
+                    )
+                )
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["events", "--db", str(db_path), "--limit", "3"])
+
+            assert result.exit_code == 0
+            lines = result.output.strip().split("\n")
+            assert len(lines) == 3
+
+    def test_events_combined_filters(self):
+        """Multiple filters work together."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            events = [
+                ImportedEvent(id="e1", timestamp="2025-01-25T10:00:00Z", type="A", source="s", data={}),
+                ImportedEvent(id="e2", timestamp="2025-01-25T11:00:00Z", type="B", source="s", data={}),
+                ImportedEvent(id="e3", timestamp="2025-01-25T12:00:00Z", type="A", source="s", data={}),
+                ImportedEvent(id="e4", timestamp="2025-01-25T13:00:00Z", type="A", source="s", data={}),
+                ImportedEvent(id="e5", timestamp="2025-01-25T14:00:00Z", type="A", source="s", data={}),
+            ]
+            for e in events:
+                store.insert_imported_event(e)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                [
+                    "events",
+                    "--db",
+                    str(db_path),
+                    "--since",
+                    "2025-01-25T11:00:00Z",
+                    "--type",
+                    "A",
+                    "--limit",
+                    "2",
+                ],
+            )
+
+            assert result.exit_code == 0
+            lines = result.output.strip().split("\n")
+            assert len(lines) == 2
+
+            parsed = [json.loads(line) for line in lines]
+            # Should get e3 and e4 (type A, after 11:00, limit 2)
+            assert parsed[0]["id"] == "e3"
+            assert parsed[1]["id"] == "e4"
+
+    def test_events_no_db_exists(self):
+        """Error if database doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "nonexistent.db"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["events", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "No database found" in result.output
+
+    def test_events_type_no_match(self):
+        """--type with no matching events outputs nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            from tt_local.db import ImportedEvent
+
+            store.insert_imported_event(
+                ImportedEvent(
+                    id="e1",
+                    timestamp="2025-01-25T10:00:00Z",
+                    type="A",
+                    source="s",
+                    data={},
+                )
+            )
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main, ["events", "--db", str(db_path), "--type", "nonexistent"]
+            )
+
+            assert result.exit_code == 0
+            assert result.output == ""
