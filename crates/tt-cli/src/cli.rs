@@ -32,6 +32,11 @@ pub enum Commands {
     ///
     /// Called by tmux hooks on pane focus changes. Appends events to JSONL buffer.
     Ingest(IngestArgs),
+    /// Export all events as JSONL to stdout.
+    ///
+    /// Reads events from the local buffer and parses Claude Code session logs,
+    /// outputting a combined event stream sorted by timestamp.
+    Export,
 }
 
 /// Arguments for the ingest command.

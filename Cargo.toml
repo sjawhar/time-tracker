@@ -48,6 +48,9 @@ hex = "0.4"
 # File locking
 fs4 = "0.12"
 
+# Glob patterns
+glob = "0.3"
+
 # Testing
 insta = "1.42"
 tempfile = "3.15"
