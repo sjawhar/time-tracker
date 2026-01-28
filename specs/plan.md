@@ -52,5 +52,5 @@ Linear task list for Time Tracker MVP.
 ## Deferred (Post-MVP)
 
 - [x] `ux-tui.md` — TUI dashboard design
-- [ ] `architecture/integrations.md` — Rules engine, webhooks, API server
+- [x] `architecture/integrations.md` — Rules engine, webhooks, API server
 - [ ] `implementation/phases.md` — Long-term roadmap
