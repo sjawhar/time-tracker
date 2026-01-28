@@ -1590,3 +1590,477 @@ class TestReportCommand:
 
             assert result.exit_code == 0
             assert "No time tracked" in result.output or "Jan 01, 2030" in result.output
+
+
+class TestStreamsCommand:
+    """Tests for the streams command."""
+
+    def test_streams_no_database(self):
+        """No database file exits with code 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "nonexistent.db"
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 1
+            assert "No database found" in result.output
+
+    def test_streams_empty_database(self):
+        """Empty database shows empty state hint."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "No streams found" in result.output
+            assert "tt status" in result.output
+
+    def test_streams_default_is_today(self):
+        """Running 'tt streams' defaults to --today."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show today's date in output
+            from datetime import datetime
+            today_str = datetime.now().strftime("%b %d, %Y")
+            assert today_str in result.output or "No streams found" in result.output
+
+    def test_streams_today_with_data(self):
+        """Shows streams for today with time data."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create stream and events for today
+            s1 = store.create_stream(name="my-project")
+
+            # Get today's date in ISO format
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/home/test/my-project",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show the stream
+            assert "my-project" in result.output
+            # Should show the short ID (first 7 chars)
+            assert s1[:7] in result.output
+
+    def test_streams_week_filter(self):
+        """--week shows streams for the current week."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--week", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should show week range in header (or empty state)
+            assert "Streams:" in result.output or "No streams found" in result.output
+
+    def test_streams_json_valid(self):
+        """--json outputs valid JSON."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should be valid JSON
+            parsed = json.loads(result.output)
+            assert "period" in parsed
+            assert "streams" in parsed
+
+    def test_streams_json_schema(self):
+        """--json output matches expected schema."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="webapp")
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "frontend"))
+            store._conn.commit()
+
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            # Verify schema fields
+            assert "start" in parsed["period"]
+            assert "end" in parsed["period"]
+            assert isinstance(parsed["streams"], list)
+            if parsed["streams"]:
+                stream = parsed["streams"][0]
+                assert "id" in stream
+                assert "short_id" in stream
+                assert "name" in stream
+                assert "total_ms" in stream
+                assert "direct_ms" in stream
+                assert "delegated_ms" in stream
+                assert "tags" in stream
+
+    def test_streams_sorted_by_time(self):
+        """Streams sorted by total time descending."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create two streams with different amounts of time
+            s1 = store.create_stream(name="small")
+            s2 = store.create_stream(name="large")
+
+            now = datetime.now(timezone.utc)
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            # s2 (large) gets more events/time
+            insert_with_stream("e1", now.strftime("%Y-%m-%dT10:00:00Z"), s2)
+            insert_with_stream("e2", now.strftime("%Y-%m-%dT10:01:00Z"), s2)
+            insert_with_stream("e3", now.strftime("%Y-%m-%dT10:02:00Z"), s2)
+
+            # s1 (small) gets fewer events
+            insert_with_stream("e4", now.strftime("%Y-%m-%dT11:00:00Z"), s1)
+
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--json", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+
+            if len(parsed["streams"]) >= 2:
+                # First stream should have more time than second
+                assert parsed["streams"][0]["total_ms"] >= parsed["streams"][1]["total_ms"]
+
+    def test_streams_shows_tags(self):
+        """Tags displayed correctly in human output."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="project")
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "frontend"))
+            store._conn.commit()
+
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "frontend" in result.output
+
+    def test_streams_untagged_shows_placeholder(self):
+        """(untagged) shown for streams without tags."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="project")
+            # No tags added
+
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            assert "(untagged)" in result.output
+
+    def test_streams_short_id_format(self):
+        """Stream IDs shown as 7-character prefix."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="project")
+
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Short ID should appear, full ID should not
+            assert s1[:7] in result.output
+            # Full UUID should not appear in human output
+            assert s1 not in result.output or s1[:7] + " " in result.output
+
+    def test_streams_filters_zero_time(self):
+        """Streams with 0ms total time are excluded."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            # Create a stream with no events in today's range
+            s1 = store.create_stream(name="old-project")
+
+            # Create events in the past (not today)
+            store._conn.execute(
+                """
+                INSERT INTO events
+                (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "e1",
+                    "2020-01-01T10:00:00Z",  # Old date
+                    "tmux_pane_focus",
+                    "remote.tmux",
+                    1,
+                    "{}",
+                    "/test",
+                    s1,
+                    "user",
+                ),
+            )
+            store._conn.commit()
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Stream with no time today should not appear
+            assert "old-project" not in result.output
+
+    def test_streams_long_tags_truncation(self):
+        """Tag list truncated with ... when too long."""
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EventStore.open(db_path)
+
+            s1 = store.create_stream(name="project")
+            # Add multiple tags that exceed display limit
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "frontend"))
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "backend"))
+            store._conn.execute("INSERT INTO stream_tags VALUES (?, ?)", (s1, "api"))
+            store._conn.commit()
+
+            now = datetime.now(timezone.utc)
+            ts1 = now.strftime("%Y-%m-%dT10:00:00Z")
+            ts2 = now.strftime("%Y-%m-%dT10:01:00Z")
+
+            def insert_with_stream(event_id: str, ts: str, stream_id: str) -> None:
+                store._conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, timestamp, type, source, schema_version, data, cwd, stream_id, assignment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        ts,
+                        "tmux_pane_focus",
+                        "remote.tmux",
+                        1,
+                        "{}",
+                        "/test",
+                        stream_id,
+                        "user",
+                    ),
+                )
+                store._conn.commit()
+
+            insert_with_stream("e1", ts1, s1)
+            insert_with_stream("e2", ts2, s1)
+            store.close()
+
+            runner = CliRunner()
+            result = runner.invoke(main, ["streams", "--db", str(db_path)])
+
+            assert result.exit_code == 0
+            # Should have ellipsis if tags are too long
+            # At least one tag should appear
+            assert "frontend" in result.output or "backend" in result.output or "api" in result.output

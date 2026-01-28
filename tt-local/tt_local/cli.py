@@ -712,6 +712,195 @@ def tag_remove(stream_id: str, tag: str, db: Path) -> None:
             click.echo(f"Stream {stream['id'][:7]} doesn't have tag '{tag}'")
 
 
+@main.command("streams")
+@click.option(
+    "--db",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_DB_PATH,
+    help="Path to SQLite database",
+)
+@click.option(
+    "--today",
+    "period",
+    flag_value="today",
+    default=True,
+    help="Streams active today (default)",
+)
+@click.option(
+    "--week",
+    "period",
+    flag_value="week",
+    help="Streams active this week",
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help="Output as JSON",
+)
+def streams_command(db: Path, period: str, output_json: bool) -> None:
+    """List inferred work streams.
+
+    Shows streams with time tracked for the specified period. By default shows
+    today's streams. Use --week for the current week.
+    """
+    if not db.exists():
+        click.echo("No database found", err=True)
+        sys.exit(1)
+
+    # Parse date range
+    if period == "week":
+        start, end = get_week_range()
+        period_type = "week"
+    else:
+        start, end = get_day_range()
+        period_type = "day"
+
+    with EventStore.open(db) as store:
+        # Run stream inference to ensure streams exist
+        store.run_stream_inference()
+
+        # Calculate time per stream
+        time_by_stream = store.calculate_time(start, end)
+
+        # Filter out zero-time streams
+        time_by_stream = {
+            sid: times
+            for sid, times in time_by_stream.items()
+            if times["direct_ms"] > 0 or times["delegated_ms"] > 0
+        }
+
+        if not time_by_stream:
+            if output_json:
+                _output_json_streams(period_type, start, end, [], {}, {}, {})
+            else:
+                click.echo(f"Streams: {format_date_range(start, end, period_type)}")
+                click.echo()
+                click.echo(f"No streams found for {'today' if period_type == 'day' else 'this week'}.")
+                click.echo("Hint: Run 'tt status' to check collection health.")
+            return
+
+        # Get stream IDs
+        stream_ids = list(time_by_stream.keys())
+
+        # Get stream names
+        placeholders = ",".join("?" * len(stream_ids))
+        cursor = store._conn.execute(
+            f"SELECT id, name FROM streams WHERE id IN ({placeholders})",
+            stream_ids,
+        )
+        stream_names = {row["id"]: row["name"] for row in cursor}
+
+        # Get stream tags
+        stream_tags = store.get_stream_tags(stream_ids)
+
+    # Sort streams by total time descending
+    sorted_streams = sorted(
+        stream_ids,
+        key=lambda sid: time_by_stream[sid]["direct_ms"] + time_by_stream[sid]["delegated_ms"],
+        reverse=True,
+    )
+
+    if output_json:
+        _output_json_streams(period_type, start, end, sorted_streams, time_by_stream, stream_names, stream_tags)
+    else:
+        _output_human_streams(period_type, start, end, sorted_streams, time_by_stream, stream_names, stream_tags)
+
+
+def _output_json_streams(
+    period_type: str,
+    start: str,
+    end: str,
+    sorted_streams: list[str],
+    time_by_stream: dict[str, dict[str, int]],
+    stream_names: dict[str, str | None],
+    stream_tags: dict[str, list[str]],
+) -> None:
+    """Output JSON streams list."""
+
+    # Extract date-only strings
+    start_date = datetime.fromisoformat(start).strftime("%Y-%m-%d")
+    end_date = (datetime.fromisoformat(end) - timedelta(seconds=1)).strftime("%Y-%m-%d")
+
+    streams_data = []
+    for sid in sorted_streams:
+        times = time_by_stream[sid]
+        streams_data.append({
+            "id": sid,
+            "short_id": sid[:7],
+            "name": stream_names.get(sid) or "Unnamed",
+            "total_ms": times["direct_ms"] + times["delegated_ms"],
+            "direct_ms": times["direct_ms"],
+            "delegated_ms": times["delegated_ms"],
+            "tags": stream_tags.get(sid, []),
+        })
+
+    output = {
+        "period": {
+            "start": start_date,
+            "end": end_date,
+        },
+        "streams": streams_data,
+    }
+    click.echo(json.dumps(output, indent=2))
+
+
+def _output_human_streams(
+    period_type: str,
+    start: str,
+    end: str,
+    sorted_streams: list[str],
+    time_by_stream: dict[str, dict[str, int]],
+    stream_names: dict[str, str | None],
+    stream_tags: dict[str, list[str]],
+) -> None:
+    """Output human-readable streams list."""
+    header = format_date_range(start, end, period_type)
+    click.echo(f"Streams: {header}")
+    click.echo()
+    click.echo("ID       Time     Tags           Description")
+    click.echo("───────────────────────────────────────────────────────────")
+
+    for sid in sorted_streams:
+        times = time_by_stream[sid]
+        total_ms = times["direct_ms"] + times["delegated_ms"]
+
+        short_id = sid[:7]
+        duration = format_duration(total_ms)
+        name = stream_names.get(sid) or "Unnamed"
+
+        tags = stream_tags.get(sid, [])
+        if tags:
+            # Format tags, truncating if too long (~14 chars)
+            tag_str = _format_tags_column(tags, max_width=14)
+        else:
+            tag_str = "(untagged)"
+
+        click.echo(f"{short_id}  {duration:>7}   {tag_str:<14} {name}")
+
+
+def _format_tags_column(tags: list[str], max_width: int = 14) -> str:
+    """Format tags for display, truncating with ... if needed.
+
+    Assumes tags is non-empty (caller handles empty case).
+    """
+    # Sort tags alphabetically for consistent display
+    sorted_tags = sorted(tags)
+
+    # Try to fit as many tags as possible
+    result = sorted_tags[0]
+    for tag in sorted_tags[1:]:
+        candidate = f"{result}, {tag}"
+        if len(candidate) > max_width - 3:  # Leave room for "..."
+            return f"{result}, ..."
+        result = candidate
+
+    if len(result) > max_width:
+        return result[: max_width - 3] + "..."
+
+    return result
+
+
 @tag_group.command("suggest")
 @click.argument("stream_id", required=False)
 @click.option(
