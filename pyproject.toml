@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tt"
+version = "0.0.0"
+description = "AI-native time tracker (local CLI)."
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+tt = "tt.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,6 +1,10 @@
 /target/
 .direnv
 .envrc
+.venv/
 .idea/
 .vscode/
+__pycache__/
+.pytest_cache/
+*.pyc
 *.db-journal
