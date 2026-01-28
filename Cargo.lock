@@ -1676,6 +1676,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tt-core",
+ "uuid",
 ]
 
 [[package]]

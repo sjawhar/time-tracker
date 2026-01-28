@@ -34,10 +34,13 @@
 //!
 //! Consider adding a schema version table for future migrations.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, params};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Database errors.
 #[derive(Debug, Error)]
@@ -45,6 +48,17 @@ pub enum DbError {
     /// An error from the underlying database.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// Stream inference gap threshold is invalid.
+    #[error("invalid stream gap threshold: {0}")]
+    InvalidStreamGap(i64),
+    /// Failed to parse an event timestamp.
+    #[error("invalid timestamp for event {event_id}: {timestamp}")]
+    TimestampParse {
+        event_id: String,
+        timestamp: String,
+        #[source]
+        source: chrono::ParseError,
+    },
 }
 
 /// Database connection wrapper.
@@ -74,6 +88,13 @@ pub struct EventRecord {
 pub struct SourceLastEvent {
     pub source: String,
     pub last_event: String,
+}
+
+/// Summary of a stream inference pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInferenceStats {
+    pub events_assigned: usize,
+    pub streams_created: usize,
 }
 
 impl Database {
@@ -242,12 +263,290 @@ impl Database {
         }
         Ok(sources)
     }
+
+    /// Infers streams for events using directory + temporal clustering.
+    pub fn infer_streams(
+        &mut self,
+        gap_threshold_ms: i64,
+    ) -> Result<StreamInferenceStats, DbError> {
+        let now = Utc::now();
+        self.infer_streams_at(gap_threshold_ms, now)
+    }
+
+    fn infer_streams_at(
+        &mut self,
+        gap_threshold_ms: i64,
+        now: DateTime<Utc>,
+    ) -> Result<StreamInferenceStats, DbError> {
+        if gap_threshold_ms < 0 {
+            return Err(DbError::InvalidStreamGap(gap_threshold_ms));
+        }
+        let gap_threshold = chrono::Duration::milliseconds(gap_threshold_ms);
+        let events = self.stream_events()?;
+        let plan = build_inference_plan(events, gap_threshold)?;
+
+        let updated_at = format_timestamp(now);
+        let tx = self.conn.transaction()?;
+        {
+            let mut stream_stmt = tx.prepare(
+                "
+                INSERT INTO streams (id, created_at, updated_at, name, first_event_at, last_event_at, needs_recompute)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    name = COALESCE(streams.name, excluded.name),
+                    first_event_at = excluded.first_event_at,
+                    last_event_at = excluded.last_event_at,
+                    needs_recompute = 0
+                ",
+            )?;
+            for (stream_id, bounds) in &plan.stream_bounds {
+                stream_stmt.execute(params![
+                    stream_id,
+                    bounds.first_event_at,
+                    updated_at,
+                    bounds.name,
+                    bounds.first_event_at,
+                    bounds.last_event_at,
+                ])?;
+            }
+        }
+        {
+            let mut event_stmt = tx.prepare(
+                "
+                UPDATE events
+                SET stream_id = ?
+                WHERE id = ? AND assignment_source = 'inferred'
+                ",
+            )?;
+            for assignment in &plan.assignments {
+                event_stmt.execute(params![assignment.stream_id, assignment.event_id])?;
+            }
+        }
+        tx.commit()?;
+
+        Ok(StreamInferenceStats {
+            events_assigned: plan.assignments.len(),
+            streams_created: plan.created_streams.len(),
+        })
+    }
+
+    fn stream_events(&self) -> Result<Vec<StreamEventRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, timestamp, cwd, stream_id, assignment_source
+            FROM events
+            ORDER BY timestamp ASC, id ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StreamEventRow {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                cwd: row.get(2)?,
+                stream_id: row.get(3)?,
+                assignment_source: row.get(4)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+}
+
+#[derive(Debug)]
+struct StreamEventRow {
+    id: String,
+    timestamp: String,
+    cwd: Option<String>,
+    stream_id: Option<String>,
+    assignment_source: Option<String>,
+}
+
+#[derive(Debug)]
+struct StreamState {
+    stream_id: String,
+    last_event_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct StreamBounds {
+    first_event_at: String,
+    last_event_at: String,
+    name: Option<String>,
+    first_event_at_parsed: DateTime<Utc>,
+    last_event_at_parsed: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct EventAssignment {
+    event_id: String,
+    stream_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct InferencePlan {
+    stream_bounds: HashMap<String, StreamBounds>,
+    assignments: Vec<EventAssignment>,
+    created_streams: HashSet<String>,
+}
+
+fn build_inference_plan(
+    events: Vec<StreamEventRow>,
+    gap_threshold: chrono::Duration,
+) -> Result<InferencePlan, DbError> {
+    let mut cwd_state: HashMap<String, StreamState> = HashMap::new();
+    let mut stream_bounds: HashMap<String, StreamBounds> = HashMap::new();
+    let mut assignments: Vec<EventAssignment> = Vec::new();
+    let mut created_streams: HashSet<String> = HashSet::new();
+
+    for event in events {
+        let timestamp = parse_timestamp(&event.timestamp, &event.id)?;
+        let assignment_source = event.assignment_source.as_deref().unwrap_or("inferred");
+        let is_inferred = assignment_source == "inferred";
+
+        if !is_inferred {
+            handle_user_assignment(&event, timestamp, &mut stream_bounds, &mut cwd_state);
+            continue;
+        }
+
+        let Some(cwd) = event.cwd.as_deref() else {
+            assignments.push(EventAssignment {
+                event_id: event.id,
+                stream_id: None,
+            });
+            continue;
+        };
+
+        let stream_id = match cwd_state.get(cwd) {
+            Some(state)
+                if timestamp.signed_duration_since(state.last_event_at) <= gap_threshold =>
+            {
+                state.stream_id.clone()
+            }
+            _ => {
+                let stream_id = deterministic_stream_id(cwd, &event.timestamp);
+                created_streams.insert(stream_id.clone());
+                stream_id
+            }
+        };
+
+        assignments.push(EventAssignment {
+            event_id: event.id,
+            stream_id: Some(stream_id.clone()),
+        });
+        update_bounds(
+            &mut stream_bounds,
+            &stream_id,
+            &event.timestamp,
+            timestamp,
+            Some(cwd),
+        );
+        cwd_state.insert(
+            cwd.to_string(),
+            StreamState {
+                stream_id,
+                last_event_at: timestamp,
+            },
+        );
+    }
+
+    Ok(InferencePlan {
+        stream_bounds,
+        assignments,
+        created_streams,
+    })
+}
+
+fn handle_user_assignment(
+    event: &StreamEventRow,
+    timestamp: DateTime<Utc>,
+    stream_bounds: &mut HashMap<String, StreamBounds>,
+    cwd_state: &mut HashMap<String, StreamState>,
+) {
+    let Some(stream_id) = event.stream_id.as_deref() else {
+        return;
+    };
+
+    update_bounds(
+        stream_bounds,
+        stream_id,
+        &event.timestamp,
+        timestamp,
+        event.cwd.as_deref(),
+    );
+    if let Some(cwd) = event.cwd.as_deref() {
+        cwd_state.insert(
+            cwd.to_string(),
+            StreamState {
+                stream_id: stream_id.to_string(),
+                last_event_at: timestamp,
+            },
+        );
+    }
+}
+
+fn deterministic_stream_id(cwd: &str, timestamp: &str) -> String {
+    let content = format!("stream|{cwd}|{timestamp}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, content.as_bytes()).to_string()
+}
+
+fn parse_timestamp(timestamp: &str, event_id: &str) -> Result<DateTime<Utc>, DbError> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|source| DbError::TimestampParse {
+            event_id: event_id.to_string(),
+            timestamp: timestamp.to_string(),
+            source,
+        })
+}
+
+fn format_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn update_bounds(
+    bounds: &mut HashMap<String, StreamBounds>,
+    stream_id: &str,
+    timestamp: &str,
+    timestamp_parsed: DateTime<Utc>,
+    cwd: Option<&str>,
+) {
+    match bounds.get_mut(stream_id) {
+        Some(existing) => {
+            if timestamp_parsed < existing.first_event_at_parsed {
+                existing.first_event_at_parsed = timestamp_parsed;
+                existing.first_event_at = timestamp.to_string();
+            }
+            if timestamp_parsed > existing.last_event_at_parsed {
+                existing.last_event_at_parsed = timestamp_parsed;
+                existing.last_event_at = timestamp.to_string();
+            }
+            if existing.name.is_none() {
+                existing.name = cwd.map(str::to_string);
+            }
+        }
+        None => {
+            bounds.insert(
+                stream_id.to_string(),
+                StreamBounds {
+                    first_event_at: timestamp.to_string(),
+                    last_event_at: timestamp.to_string(),
+                    name: cwd.map(str::to_string),
+                    first_event_at_parsed: timestamp_parsed,
+                    last_event_at_parsed: timestamp_parsed,
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn open_in_memory_database() {
@@ -522,5 +821,184 @@ mod tests {
         assert_eq!(sources[0].last_event, "2025-01-01T00:03:00Z");
         assert_eq!(sources[1].source, "remote.agent");
         assert_eq!(sources[1].last_event, "2025-01-01T00:02:00Z");
+    }
+
+    #[test]
+    fn infer_streams_clusters_by_cwd_and_gap() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        let events = vec![
+            EventRecord {
+                id: "event-a1".to_string(),
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                kind: "tmux_pane_focus".to_string(),
+                source: "remote.tmux".to_string(),
+                schema_version: 1,
+                data: r#"{"pane_id":"%1"}"#.to_string(),
+                cwd: Some("/repo-a".to_string()),
+                session_id: None,
+                stream_id: None,
+                assignment_source: None,
+            },
+            EventRecord {
+                id: "event-a2".to_string(),
+                timestamp: "2025-01-01T00:10:00Z".to_string(),
+                kind: "tmux_pane_focus".to_string(),
+                source: "remote.tmux".to_string(),
+                schema_version: 1,
+                data: r#"{"pane_id":"%2"}"#.to_string(),
+                cwd: Some("/repo-a".to_string()),
+                session_id: None,
+                stream_id: None,
+                assignment_source: None,
+            },
+            EventRecord {
+                id: "event-b1".to_string(),
+                timestamp: "2025-01-01T00:05:00Z".to_string(),
+                kind: "tmux_pane_focus".to_string(),
+                source: "remote.tmux".to_string(),
+                schema_version: 1,
+                data: r#"{"pane_id":"%3"}"#.to_string(),
+                cwd: Some("/repo-b".to_string()),
+                session_id: None,
+                stream_id: None,
+                assignment_source: None,
+            },
+            EventRecord {
+                id: "event-a3".to_string(),
+                timestamp: "2025-01-01T01:00:00Z".to_string(),
+                kind: "tmux_pane_focus".to_string(),
+                source: "remote.tmux".to_string(),
+                schema_version: 1,
+                data: r#"{"pane_id":"%4"}"#.to_string(),
+                cwd: Some("/repo-a".to_string()),
+                session_id: None,
+                stream_id: None,
+                assignment_source: None,
+            },
+            EventRecord {
+                id: "event-none".to_string(),
+                timestamp: "2025-01-01T00:20:00Z".to_string(),
+                kind: "agent_session".to_string(),
+                source: "remote.agent".to_string(),
+                schema_version: 1,
+                data: r#"{"action":"started"}"#.to_string(),
+                cwd: None,
+                session_id: Some("sess-1".to_string()),
+                stream_id: None,
+                assignment_source: None,
+            },
+        ];
+
+        db.insert_events(&events).expect("insert events");
+
+        let now = DateTime::parse_from_rfc3339("2025-01-01T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stats = db.infer_streams_at(1_800_000, now).expect("infer streams");
+        assert_eq!(stats.streams_created, 3);
+
+        let events = db.list_events().expect("list events");
+        let mut by_id: HashMap<String, Option<String>> = HashMap::new();
+        for event in events {
+            by_id.insert(event.id, event.stream_id);
+        }
+
+        let a1 = by_id.get("event-a1").unwrap().clone();
+        let a2 = by_id.get("event-a2").unwrap().clone();
+        let a3 = by_id.get("event-a3").unwrap().clone();
+        let b1 = by_id.get("event-b1").unwrap().clone();
+        let none = by_id.get("event-none").unwrap().clone();
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, a3);
+        assert_ne!(a1, b1);
+        assert_ne!(a3, b1);
+        assert!(none.is_none());
+
+        let stream_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM streams", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stream_count, 3);
+    }
+
+    #[test]
+    fn infer_streams_respects_user_assignments() {
+        let mut db = Database::open_in_memory().expect("open in-memory db");
+        db.conn
+            .execute(
+                "
+                INSERT INTO streams (id, created_at, updated_at, name, first_event_at, last_event_at, needs_recompute)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                ",
+                params![
+                    "user-stream",
+                    "2025-01-01T00:00:00Z",
+                    "2025-01-01T00:00:00Z",
+                    "manual",
+                    "2025-01-01T00:00:00Z",
+                    "2025-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+
+        let events = vec![
+            EventRecord {
+                id: "event-user".to_string(),
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                kind: "manual".to_string(),
+                source: "local.manual".to_string(),
+                schema_version: 1,
+                data: r#"{"note":"seed"}"#.to_string(),
+                cwd: Some("/repo-c".to_string()),
+                session_id: None,
+                stream_id: Some("user-stream".to_string()),
+                assignment_source: Some("user".to_string()),
+            },
+            EventRecord {
+                id: "event-inferred".to_string(),
+                timestamp: "2025-01-01T00:10:00Z".to_string(),
+                kind: "tmux_pane_focus".to_string(),
+                source: "remote.tmux".to_string(),
+                schema_version: 1,
+                data: r#"{"pane_id":"%5"}"#.to_string(),
+                cwd: Some("/repo-c".to_string()),
+                session_id: None,
+                stream_id: None,
+                assignment_source: None,
+            },
+        ];
+
+        db.insert_events(&events).expect("insert events");
+        let now = DateTime::parse_from_rfc3339("2025-01-01T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        db.infer_streams_at(1_800_000, now).expect("infer streams");
+
+        let events = db.list_events().expect("list events");
+        let mut by_id: HashMap<String, Option<String>> = HashMap::new();
+        for event in events {
+            by_id.insert(event.id, event.stream_id);
+        }
+
+        assert_eq!(
+            by_id.get("event-user").unwrap().as_deref(),
+            Some("user-stream")
+        );
+        assert_eq!(
+            by_id.get("event-inferred").unwrap().as_deref(),
+            Some("user-stream")
+        );
+
+        let (first_event_at, last_event_at): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT first_event_at, last_event_at FROM streams WHERE id = ?",
+                ["user-stream"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first_event_at, "2025-01-01T00:00:00Z");
+        assert_eq!(last_event_at, "2025-01-01T00:10:00Z");
     }
 }
