@@ -1,62 +1,90 @@
 # UX: Terminal UI Dashboard
 
-_To be designed after user stories are established._
+## Problem Statement
 
-## Purpose
+Users need a fast, read-only terminal dashboard to scan current activity and
+weekly totals without running multiple CLI commands. The CLI remains the source
+of truth for reporting, tagging, and export, but a TUI can provide a quick
+overview and drill-down in one place while staying within the CLI startup
+budget.
 
-_When would users use the TUI vs CLI?_
+## Research Findings
 
-## Layout
+- ActivityWatch organizes around a dashboard plus drill-down views (timeline,
+  activity browser, raw data), suggesting a split between overview and detail.
+- Toggl and WakaTime emphasize weekly and daily summaries with grouped
+  breakdowns (project, language), reinforcing week-first navigation and
+  rollups.
+- Timewarrior's terminal summary uses tables with daily totals, indicating that
+  scan-friendly tables are effective in TUIs.
+- Privacy-first, local-first tools keep interaction lightweight and avoid heavy
+  charts; a TUI should do the same.
 
-_Screen layout and information hierarchy._
+## Proposed Approach
 
-## Interactions
+Build a **read-only TUI dashboard** with a small set of views. It mirrors the
+CLI report format while adding quick "today" stats and a limited drill-down.
 
-_How do users interact with the TUI?_
+### View Hierarchy
 
----
+1. **Dashboard (default)**
+   - Today totals (direct, delegated, combined)
+   - Week-to-date totals (direct, delegated, combined)
+   - Top streams list with tags and totals
+   - Active agents/panes list if recent events exist
+2. **Streams view**
+   - Table of streams with totals, tags, last-seen timestamp
+   - Drill into a stream to see daily totals for the current week
+3. **Report view**
+   - Render the same weekly report format as `tt report --week`
+4. **Events view (optional)**
+   - Recent events list for debugging and verification
 
-## Preliminary Ideas
+### Interaction Model
 
-> **Note**: The following are preliminary ideas from early brainstorming. They should be validated against user stories and refined before implementation.
+- Keyboard-driven navigation with a minimal help overlay.
+- No editing flows, no manual timers, no tag changes. All edits remain in the
+  CLI (`tt tag`, etc.).
+- Default scope is current week (Mon-Sun). Optional day selector for the
+  stream drill-down view.
 
-### Dashboard Mockup
+### Data Requirements
 
-```
-┌─ tt dashboard ──────────────────────────────────────────────────────┐
-│                                                                     │
-│  TODAY: 6h 23m tracked                          Human: 4h 12m      │
-│  ───────────────────────────────────────────    Agent: 2h 11m      │
-│                                                                     │
-│  ACTIVE CONTEXTS                                                    │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ ● acme-webapp / Fix auth bug (#1234)          2h 15m  [A]   │   │
-│  │   └─ claude-session-abc (running 12m)         ████░░░░      │   │
-│  │ ○ personal / claude-code PR review            1h 45m        │   │
-│  │ ○ acme-webapp / Dashboard feature (#1235)     45m           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  AGENT SESSIONS                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ claude-code  tmux:dev-server:0  acme-webapp    12m  ●       │   │
-│  │ claude-code  tmux:dev-server:2  personal       idle         │   │
-│  │ codex        tmux:local:1       experiments    3m   ●       │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  [c]ontexts  [a]gents  [r]eport  [s]ettings  [q]uit               │
-└─────────────────────────────────────────────────────────────────────┘
-```
+- Week-to-date time entries with direct/delegated breakdowns.
+- Stream list with totals, tags, and last-seen timestamps.
+- Recent events (bounded window) for the optional events view.
+- Active agent/pane list derived from recent events (same bounded window).
 
-### Key Bindings (Sketch)
+### Performance Constraints
 
-- `c` - Focus contexts list
-- `a` - Focus agents list
-- `r` - Open report view
-- `s` - Settings
-- `q` - Quit
-- `Enter` - Drill into selected item
-- `?` - Help
+- Startup should remain within the CLI budget by limiting queries to the
+  current week and a small recent window (e.g., last 24h) for active lists.
+- Avoid loading long history or unbounded event scans.
 
-### TUI is Post-MVP
+## Edge Cases and Failure Modes
 
-The TUI dashboard is not needed for MVP. Basic reporting via CLI is sufficient initially.
+- **No events yet**: Show empty-state message and zero totals.
+- **Only delegated time**: Direct totals show zero; combined totals remain
+  accurate.
+- **Missing tags**: Display "untagged" or blank tag column consistently.
+- **Timezone differences**: Week boundaries must be explicit and consistent
+  with CLI (Mon-Sun, local timezone).
+- **Large stream count**: Only show top N streams; allow scrolling in Streams
+  view.
+
+## Non-Goals
+
+- No historical browsing beyond the current week.
+- No charts or graphs.
+- No editing, tagging, or corrections within the TUI.
+- No configuration of filters, date ranges, or layouts.
+
+## Acceptance Criteria
+
+- TUI starts with a dashboard that shows today and week totals plus top streams.
+- Streams view lists streams with totals, tags, and last-seen time; supports
+  drill-down to daily totals for current week.
+- Report view displays the same weekly report format as `tt report --week`.
+- Navigation is keyboard-only with a help overlay and quit control.
+- Data queries are bounded (current week + recent window) to meet startup
+  performance constraints.
