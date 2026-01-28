@@ -58,64 +58,73 @@ This ensures the same logical event always produces the same ID. Import is idemp
 
 ### Attention Allocation Algorithm
 
-**Critical TODO**: Define how direct time is allocated when multiple agents run in parallel.
+**Problem statement**
 
-Key insight: User can only interact with one thing at a time, so direct attention follows focus:
-- `window_focus` determines if user is in terminal vs browser
-- `tmux_pane_focus` determines which pane within terminal
-- `tmux_scroll` indicates attention even without typing
-- `user_message` is definitive proof of attention
+We need a deterministic, event-sourced algorithm to allocate time when multiple agents run in parallel. The user can only give direct attention to one context at a time, but delegated work (agents running) can overlap. The system must attribute:
+- **Direct time**: user attention to exactly one stream at any instant.
+- **Delegated time**: agent work time to one or more streams, regardless of user focus.
 
-The algorithm should:
-1. Track current focus state from focus events
-2. Attribute direct time to the stream associated with the focused context
-3. Attribute delegated time to all streams with active agents regardless of focus
+**Research findings (informal)**
+- ActivityWatch uses AFK detection to suppress idle time.
+- WakaTime uses heartbeat-style events to treat recent activity as continuous work.
+- Toggl and ManicTime emphasize idle handling and retroactive AFK correction.
 
-_This needs detailed specification before implementation._
+**Proposed approach (interval-based state model)**
 
----
+Build a merged, ordered timeline of events. Between each pair of event timestamps, treat state as constant and allocate time to streams based on the current state.
 
-## Preliminary Ideas
+State tracked over time:
+- `afk_state`: true/false.
+- `window_focus`: app + title.
+- `tmux_pane_focus`: pane id + stream id (if known).
+- `browser_tab`: url/title + stream id (if known).
+- `last_attention_at`: timestamp of last attention signal.
+- `agent_sessions`: per stream, active if between `agent_session:started` and `agent_session:ended`.
+- `last_agent_activity_at`: per stream, timestamp of last `agent_tool_use` or `agent_message`.
 
-> **Note**: The following are preliminary ideas from early brainstorming. They should be validated during architecture design.
+**Attention signals (refresh `last_attention_at`)**
+- `user_message`
+- `tmux_scroll`
+- `tmux_pane_focus`
+- `window_focus`
+- `browser_tab`
+- local editor typing/heartbeat events (when available)
 
-### Time Attribution Algorithm Sketch
+**Direct time rules**
+1. Direct time accrues only when `afk_state == false`.
+2. Direct time accrues only if `now - last_attention_at <= ATTENTION_WINDOW`.
+3. Direct time is attributed to exactly one stream, determined by focus hierarchy:
+   - If `window_focus` is terminal: use `tmux_pane_focus` stream (if known).
+   - Else if `window_focus` is browser: use `browser_tab` stream (if known).
+   - Else: use `window_focus` stream (app/title-based mapping).
+4. If focus is unknown or no stream can be resolved, direct time is recorded as `Unattributed` (null stream).
 
-For any time window [t₀, t₁], calculate attribution as:
+**Delegated time rules**
+1. Delegated time accrues to any stream with an active agent session.
+2. If an explicit `agent_session:ended` is missing, keep the session active while
+   `now - last_agent_activity_at <= AGENT_ACTIVITY_WINDOW`.
+3. Delegated time is **not** suppressed by `afk_state` (agents can work while user is AFK).
+4. Delegated time can overlap across multiple streams.
 
-```
-attribution(context, t₀, t₁) = Σ(event_weight × recency_decay) / total_weight
-```
+**AFK handling**
+- Respect AFK state for direct time (no direct time while AFK).
+- Allow retroactive AFK correction: when an AFK event arrives after a threshold,
+  reclassify the preceding interval as AFK and zero direct time for that interval.
 
-Where:
-- **event_weight**: Different events have different weights
-  - `pane_focus`: 1.0 (strong signal)
-  - `keypress`: 0.5 (activity confirmation)
-  - `agent_tool_use`: 0.3 (agent working on context)
-  - `agent_message`: 0.2 (agent responding)
+**Parameters (MVP constants)**
+- `ATTENTION_WINDOW = 120s`
+- `AGENT_ACTIVITY_WINDOW = 300s`
 
-- **recency_decay**: Events closer to the time point matter more
-  - `decay = exp(-λ × time_since_event)`
-  - λ chosen so 50% decay at ~2 minutes
+**Edge cases and failure modes**
+- Missing focus events: direct time becomes `Unattributed` until a focus event arrives.
+- Terminal not focused: tmux pane focus is ignored; browser/window focus drives attribution.
+- Multiple active agents: delegated time overlaps; direct time remains single-stream.
+- Delayed AFK transition: retroactively adjust prior interval to avoid counting idle time.
+- Sparse activity signals: attention window prevents direct time from dropping to zero between events.
 
-### Example Calculation
-
-```
-Time: 10:02:30
-Events in last 5 minutes:
-  10:00:00 - pane_focus(ctx_A)      weight=1.0, decay=0.3  → 0.30
-  10:01:00 - agent_tool_use(ctx_A)  weight=0.3, decay=0.5  → 0.15
-  10:01:30 - pane_focus(ctx_B)      weight=1.0, decay=0.6  → 0.60
-  10:02:00 - keypress(ctx_B)        weight=0.5, decay=0.8  → 0.40
-  10:02:15 - agent_message(ctx_A)   weight=0.2, decay=0.9  → 0.18
-
-Context A: 0.30 + 0.15 + 0.18 = 0.63
-Context B: 0.60 + 0.40 = 1.00
-Total: 1.63
-
-Attribution at 10:02:30:
-  Context A: 0.63/1.63 = 38.6%
-  Context B: 1.00/1.63 = 61.4%
-```
-
-**Note**: This fractional attribution model may be over-engineered for MVP. Consider simpler approach: direct time goes to focused stream, delegated time to all active streams.
+**Acceptance criteria**
+- Deterministic: given the same ordered event stream, allocations are identical.
+- No direct time during AFK intervals.
+- Direct time is never split between streams at the same instant.
+- Delegated time continues while agents are active, even if user is AFK.
+- Attribution is recomputable from raw events without external state.
