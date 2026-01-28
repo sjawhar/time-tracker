@@ -53,4 +53,4 @@ Linear task list for Time Tracker MVP.
 
 - [x] `ux-tui.md` — TUI dashboard design
 - [x] `architecture/integrations.md` — Rules engine, webhooks, API server
-- [ ] `implementation/phases.md` — Long-term roadmap
+ - [x] `implementation/phases.md` — Long-term roadmap
