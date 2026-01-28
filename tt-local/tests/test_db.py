@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from tt_local.db import EventStore, RawEvent
+from tt_local.db import EventStore, ImportedEvent, RawEvent
 
 
 def make_event(
@@ -152,3 +152,72 @@ class TestForeignKeyConstraint:
         event = make_event()
         with pytest.raises(Exception):  # sqlite3.IntegrityError
             store.insert_event(event, stream_id="nonexistent-stream-id")
+
+
+class TestImportedEvent:
+    """Tests for importing events from remote export."""
+
+    def test_insert_imported_event(self):
+        """Insert and retrieve an imported event."""
+        store = EventStore.open_in_memory()
+        event = ImportedEvent(
+            id="abc123",
+            timestamp="2025-01-25T10:00:00Z",
+            type="tmux_pane_focus",
+            source="remote.tmux",
+            data={"pane_id": "%1"},
+            cwd="/home/sami/project",
+        )
+
+        inserted = store.insert_imported_event(event)
+        assert inserted is True
+
+        events = store.get_events()
+        assert len(events) == 1
+        retrieved = events[0]
+        assert retrieved["id"] == "abc123"
+        assert retrieved["type"] == "tmux_pane_focus"
+        assert retrieved["source"] == "remote.tmux"
+        assert retrieved["cwd"] == "/home/sami/project"
+        assert retrieved["assignment_source"] == "imported"
+
+    def test_insert_imported_event_without_cwd(self):
+        """Import event without cwd field."""
+        store = EventStore.open_in_memory()
+        event = ImportedEvent(
+            id="def456",
+            timestamp="2025-01-25T10:00:00Z",
+            type="agent_task_start",
+            source="remote.agent",
+            data={"session_id": "sess-123"},
+        )
+
+        inserted = store.insert_imported_event(event)
+        assert inserted is True
+
+        events = store.get_events()
+        assert len(events) == 1
+        assert events[0]["cwd"] is None
+
+    def test_insert_imported_event_duplicate(self):
+        """Duplicate imported events are silently skipped."""
+        store = EventStore.open_in_memory()
+        event = ImportedEvent(
+            id="abc123",
+            timestamp="2025-01-25T10:00:00Z",
+            type="tmux_pane_focus",
+            source="remote.tmux",
+            data={"pane_id": "%1"},
+        )
+
+        # First insert succeeds
+        inserted1 = store.insert_imported_event(event)
+        assert inserted1 is True
+
+        # Second insert returns False (duplicate)
+        inserted2 = store.insert_imported_event(event)
+        assert inserted2 is False
+
+        # Still only one event
+        events = store.get_events()
+        assert len(events) == 1

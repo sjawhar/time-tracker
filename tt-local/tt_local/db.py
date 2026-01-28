@@ -43,6 +43,21 @@ class RawEvent(BaseModel):
         return hashlib.sha256(content.encode()).hexdigest()[:32]
 
 
+class ImportedEvent(BaseModel):
+    """Event from remote export with pre-computed ID.
+
+    The remote `tt export` command outputs events with IDs already computed.
+    We trust these IDs since it's our own code running on our machine.
+    """
+
+    id: str
+    timestamp: str
+    type: str
+    source: str
+    data: dict[str, Any]
+    cwd: str | None = None
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS streams (
     id TEXT PRIMARY KEY,
@@ -160,6 +175,34 @@ class EventStore:
         )
         self._conn.commit()
         return event_id
+
+    def insert_imported_event(self, event: ImportedEvent) -> bool:
+        """Insert an event from remote export with pre-computed ID.
+
+        Returns True if the event was inserted, False if it already existed.
+        Uses INSERT OR IGNORE for idempotent inserts.
+        """
+        cursor = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO events
+            (id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.id,
+                event.timestamp,
+                event.type,
+                event.source,
+                1,  # schema_version default
+                json.dumps(event.data),
+                event.cwd,
+                None,  # session_id not provided by remote export
+                None,  # stream_id
+                "imported",  # assignment_source
+            ),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     def get_events(
         self,
