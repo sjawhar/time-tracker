@@ -11,6 +11,7 @@ use crate::commands::ingest::IngestArgs;
 use crate::commands::report::ReportArgs;
 use crate::commands::suggest_tags::SuggestTagsArgs;
 use crate::commands::sync::SyncArgs;
+use crate::commands::tag::TagArgs;
 
 /// AI-native time tracker.
 ///
@@ -50,4 +51,6 @@ pub enum Commands {
     Report(ReportArgs),
     /// Suggest tags for a stream.
     SuggestTags(SuggestTagsArgs),
+    /// Add a manual tag to a stream.
+    Tag(TagArgs),
 }
