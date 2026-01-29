@@ -34,7 +34,7 @@ Linear task list for Time Tracker MVP.
 ## Specs (unlocks MVP)
 
 - [x] Finalize CLI commands — Update `ux-cli.md` with actual commands
-- [ ] Finalize report format — Update `ux-reports.md` with MVP report output
+- [x] Finalize report format — Update `ux-reports.md` with MVP report output
 - [ ] Define attention allocation algorithm — Complete "Critical TODO" in `architecture/overview.md`
 - [ ] ADR: Remote analysis architecture — How local learns about remote pane context
 - [ ] ADR: ActivityWatch integration — Document decision and rationale
