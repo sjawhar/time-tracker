@@ -140,6 +140,41 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Add a tag to a stream.
+    ///
+    /// Tags are additive—multiple tags per stream are supported.
+    /// Use 'tt streams' to see available stream IDs.
+    Tag {
+        /// Stream ID or name (e.g., 'abc123' or 'time-tracker').
+        stream: String,
+
+        /// Tag to add.
+        tag: String,
+    },
+
+    /// Suggest a tag for a stream based on event metadata.
+    ///
+    /// Analyzes working directories from events to suggest a project tag.
+    /// When metadata is ambiguous, uses LLM analysis (requires `ANTHROPIC_API_KEY`).
+    Suggest {
+        /// Stream ID or name.
+        stream: String,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all streams with time totals and tags.
+    ///
+    /// Shows streams from the last 7 days, sorted by total time.
+    /// Use 'tt tag <id> <tag>' to organize streams into projects.
+    Streams {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Event types that can be ingested.

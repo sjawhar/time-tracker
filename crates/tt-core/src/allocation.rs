@@ -5,8 +5,8 @@
 //!
 //! # Algorithm Summary
 //!
-//! 1. Build focus timeline from focus events (tmux_pane_focus, afk_change, etc.)
-//! 2. Build agent activity timeline from agent_session and agent_tool_use events
+//! 1. Build focus timeline from focus events (`tmux_pane_focus`, `afk_change`, etc.)
+//! 2. Build agent activity timeline from `agent_session` and `agent_tool_use` events
 //! 3. Iterate through event intervals, attributing time based on state
 
 use std::collections::HashMap;
@@ -66,7 +66,7 @@ pub trait AllocatableEvent {
     /// Returns the event's timestamp.
     fn timestamp(&self) -> DateTime<Utc>;
 
-    /// Returns the event's type (e.g., "tmux_pane_focus", "agent_session").
+    /// Returns the event's type (e.g., "`tmux_pane_focus`", "`agent_session`").
     fn event_type(&self) -> &str;
 
     /// Returns the stream ID if assigned.
@@ -125,13 +125,13 @@ impl Interval {
 ///
 /// Events must be sorted by timestamp ascending.
 /// Events with `stream_id = None` are excluded from direct time attribution
-/// (but may still contribute to agent tracking if they have session_id).
+/// (but may still contribute to agent tracking if they have `session_id`).
 ///
 /// # Arguments
 ///
 /// * `events` - Events to process (must implement `AllocatableEvent`)
 /// * `config` - Allocation configuration
-/// * `period_end` - Where to close open intervals. If None, uses last event + attention_window
+/// * `period_end` - Where to close open intervals. If None, uses last event + `attention_window`
 ///
 /// # Returns
 ///

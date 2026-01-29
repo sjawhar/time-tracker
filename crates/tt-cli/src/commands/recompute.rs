@@ -76,7 +76,7 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
         .update_stream_times(&times_to_update)
         .context("failed to update stream times")?;
 
-    println!("Updated {} stream(s).", updated);
+    println!("Updated {updated} stream(s).");
 
     // Print summary
     for time in &times_to_update {
@@ -89,7 +89,7 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
     }
 
     let total_mins = result.total_tracked_ms / 60_000;
-    println!("\nTotal tracked: {}m", total_mins);
+    println!("\nTotal tracked: {total_mins}m");
 
     Ok(())
 }

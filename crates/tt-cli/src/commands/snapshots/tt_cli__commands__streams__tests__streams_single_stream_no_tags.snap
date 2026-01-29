@@ -1,0 +1,11 @@
+---
+source: crates/tt-cli/src/commands/streams.rs
+expression: output
+---
+STREAMS (last 7 days)
+
+ID       Name                      Direct  Delegated  Tags
+───────  ──────────────────────  ────────  ─────────  ──────────────────
+abc123   tmux/dev/session-1        2h 15m     4h 30m  
+
+Tip: Use 'tt tag <id> <tag>' to group sessions into projects.

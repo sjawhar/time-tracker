@@ -6,11 +6,13 @@
 //! - Time entries: consolidated entries for reporting
 //! - Inference: clustering events into streams
 //! - Allocation: computing direct/delegated time for streams
+//! - Suggestion: tag suggestion from event metadata
 
 mod allocation;
 mod event;
 pub mod inference;
 mod stream;
+mod suggest;
 mod types;
 
 pub use allocation::{
@@ -22,4 +24,5 @@ pub use inference::{
     infer_streams,
 };
 pub use stream::Stream;
+pub use suggest::{Suggestion, is_metadata_ambiguous, suggest_from_metadata};
 pub use types::{EventId, StreamId, ValidationError};

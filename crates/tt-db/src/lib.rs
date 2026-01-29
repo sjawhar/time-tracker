@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// A coherent unit of work, grouping related events.
 ///
@@ -222,6 +222,7 @@ impl Database {
     /// Initializes the database schema.
     ///
     /// Checks schema version and creates tables if needed.
+    /// Supports migrations from older schema versions.
     fn init(&self) -> Result<(), DbError> {
         // Enable foreign key constraints
         self.conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -235,15 +236,20 @@ impl Database {
             .ok();
 
         match existing_version {
-            Some(v) if v != SCHEMA_VERSION => {
+            Some(v) if v == SCHEMA_VERSION => {
+                // Schema already initialized and version matches
+                return Ok(());
+            }
+            Some(v) if v == 3 => {
+                // Migrate from v3 to v4
+                self.migrate_v3_to_v4()?;
+                return Ok(());
+            }
+            Some(v) => {
                 return Err(DbError::SchemaVersionMismatch {
                     found: v,
                     expected: SCHEMA_VERSION,
                 });
-            }
-            Some(_) => {
-                // Schema already initialized and version matches
-                return Ok(());
             }
             None => {
                 // No schema_info table, initialize fresh
@@ -290,6 +296,14 @@ impl Database {
                 needs_recompute INTEGER DEFAULT 0
             );
 
+            -- Stream tags table: flexible metadata for streams
+            CREATE TABLE IF NOT EXISTS stream_tags (
+                stream_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (stream_id, tag),
+                FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
+            );
+
             -- Indexes for common queries
             CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
@@ -297,6 +311,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_cwd ON events(cwd);
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
             ",
         )?;
 
@@ -306,6 +321,30 @@ impl Database {
             params![SCHEMA_VERSION],
         )?;
 
+        Ok(())
+    }
+
+    /// Migrate from schema v3 to v4.
+    ///
+    /// Adds the `stream_tags` table for flexible stream categorization.
+    fn migrate_v3_to_v4(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            -- Stream tags table: flexible metadata for streams
+            CREATE TABLE IF NOT EXISTS stream_tags (
+                stream_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (stream_id, tag),
+                FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
+            );
+
+            -- Index for finding streams by tag
+            CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
+
+            -- Update schema version
+            UPDATE schema_info SET version = 4;
+            ",
+        )?;
         Ok(())
     }
 
@@ -838,6 +877,120 @@ impl Database {
             streams.push(Self::row_to_stream(row)?);
         }
         Ok(streams)
+    }
+
+    // ========== Tag Methods ==========
+
+    /// Adds a tag to a stream.
+    ///
+    /// Idempotent: adding a tag that already exists is a no-op.
+    pub fn add_tag(&self, stream_id: &str, tag: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO stream_tags (stream_id, tag) VALUES (?1, ?2)",
+            params![stream_id, tag],
+        )?;
+        Ok(())
+    }
+
+    /// Gets all tags for a stream.
+    ///
+    /// Returns tags sorted alphabetically.
+    pub fn get_tags(&self, stream_id: &str) -> Result<Vec<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tag FROM stream_tags WHERE stream_id = ?1 ORDER BY tag ASC")?;
+
+        let rows = stmt.query_map(params![stream_id], |row| row.get(0))?;
+
+        let mut tags = Vec::new();
+        for tag_result in rows {
+            tags.push(tag_result?);
+        }
+        Ok(tags)
+    }
+
+    /// Removes a tag from a stream.
+    pub fn delete_tag(&self, stream_id: &str, tag: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM stream_tags WHERE stream_id = ?1 AND tag = ?2",
+            params![stream_id, tag],
+        )?;
+        Ok(())
+    }
+
+    /// Gets all tags grouped by stream ID.
+    ///
+    /// Returns a vector of (`stream_id`, tags) pairs.
+    /// Only streams with at least one tag are included.
+    pub fn get_all_tags(&self) -> Result<Vec<(String, Vec<String>)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT stream_id, tag FROM stream_tags ORDER BY stream_id ASC, tag ASC")?;
+
+        let rows = stmt.query_map([], |row| {
+            let stream_id: String = row.get(0)?;
+            let tag: String = row.get(1)?;
+            Ok((stream_id, tag))
+        })?;
+
+        let mut result: Vec<(String, Vec<String>)> = Vec::new();
+        for row_result in rows {
+            let (stream_id, tag) = row_result?;
+
+            // Add to existing stream entry or create new one
+            if let Some((_, tags)) = result.iter_mut().find(|(id, _)| id == &stream_id) {
+                tags.push(tag);
+            } else {
+                result.push((stream_id, vec![tag]));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Gets all streams with their tags.
+    ///
+    /// Returns a vector of (Stream, tags) pairs.
+    /// Streams without tags are included with an empty tag vector.
+    pub fn get_streams_with_tags(&self) -> Result<Vec<(Stream, Vec<String>)>, DbError> {
+        let streams = self.get_streams()?;
+        let all_tags = self.get_all_tags()?;
+
+        let result = streams
+            .into_iter()
+            .map(|stream| {
+                let tags = all_tags
+                    .iter()
+                    .find(|(id, _)| id == &stream.id)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
+                (stream, tags)
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Resolves a stream by ID or name.
+    ///
+    /// First checks if the query matches a stream ID, then checks names.
+    /// Returns None if no matching stream is found.
+    pub fn resolve_stream(&self, query: &str) -> Result<Option<Stream>, DbError> {
+        // First try by ID
+        if let Some(stream) = self.get_stream(query)? {
+            return Ok(Some(stream));
+        }
+
+        // Then try by name
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
+             FROM streams WHERE name = ?1",
+        )?;
+
+        let mut rows = stmt.query(params![query])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_stream(row)?)),
+            None => Ok(None),
+        }
     }
 
     /// Helper to convert a row to a Stream.
@@ -1465,5 +1618,231 @@ mod tests {
         let assigned = db.get_events_by_stream("s1").unwrap();
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned[0].id, "e2");
+    }
+
+    // ========== Tag Tests ==========
+
+    #[test]
+    fn test_add_tag_to_stream() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        db.add_tag("s1", "acme-webapp").unwrap();
+
+        let tags = db.get_tags("s1").unwrap();
+        assert_eq!(tags, vec!["acme-webapp"]);
+    }
+
+    #[test]
+    fn test_add_duplicate_tag_is_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        db.add_tag("s1", "acme-webapp").unwrap();
+        db.add_tag("s1", "acme-webapp").unwrap(); // Duplicate - should be ignored
+
+        let tags = db.get_tags("s1").unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0], "acme-webapp");
+    }
+
+    #[test]
+    fn test_get_tags_returns_sorted() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        db.add_tag("s1", "zebra").unwrap();
+        db.add_tag("s1", "alpha").unwrap();
+        db.add_tag("s1", "beta").unwrap();
+
+        let tags = db.get_tags("s1").unwrap();
+        assert_eq!(tags, vec!["alpha", "beta", "zebra"]);
+    }
+
+    #[test]
+    fn test_get_tags_for_stream_without_tags() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        let tags = db.get_tags("s1").unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_delete_tag() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        db.add_tag("s1", "acme-webapp").unwrap();
+        db.add_tag("s1", "urgent").unwrap();
+
+        db.delete_tag("s1", "acme-webapp").unwrap();
+
+        let tags = db.get_tags("s1").unwrap();
+        assert_eq!(tags, vec!["urgent"]);
+    }
+
+    #[test]
+    fn test_delete_stream_cascades_to_tags() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        db.add_tag("s1", "acme-webapp").unwrap();
+
+        // Delete the stream via orphan cleanup (after clearing its events)
+        db.delete_orphaned_streams().unwrap();
+
+        // Tags should be gone too (via cascade)
+        let tags = db.get_tags("s1").unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_tags() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        db.insert_stream(&make_stream("s2", Some("project-y")))
+            .unwrap();
+
+        db.add_tag("s1", "acme-webapp").unwrap();
+        db.add_tag("s1", "urgent").unwrap();
+        db.add_tag("s2", "internal").unwrap();
+
+        let all_tags = db.get_all_tags().unwrap();
+
+        // Should return (stream_id, tags) pairs
+        assert_eq!(all_tags.len(), 2);
+
+        let s1_tags = all_tags.iter().find(|(id, _)| id == "s1").unwrap();
+        assert_eq!(s1_tags.1, vec!["acme-webapp", "urgent"]);
+
+        let s2_tags = all_tags.iter().find(|(id, _)| id == "s2").unwrap();
+        assert_eq!(s2_tags.1, vec!["internal"]);
+    }
+
+    #[test]
+    fn test_get_streams_with_tags() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        db.insert_stream(&make_stream("s2", Some("project-y")))
+            .unwrap();
+
+        db.add_tag("s1", "acme-webapp").unwrap();
+        db.add_tag("s2", "internal").unwrap();
+
+        let streams = db.get_streams_with_tags().unwrap();
+        assert_eq!(streams.len(), 2);
+
+        let s1 = streams.iter().find(|(s, _)| s.id == "s1").unwrap();
+        assert_eq!(s1.1, vec!["acme-webapp"]);
+
+        let s2 = streams.iter().find(|(s, _)| s.id == "s2").unwrap();
+        assert_eq!(s2.1, vec!["internal"]);
+    }
+
+    #[test]
+    fn test_resolve_stream_by_id() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        let stream = db.resolve_stream("s1").unwrap();
+        assert!(stream.is_some());
+        assert_eq!(stream.unwrap().id, "s1");
+    }
+
+    #[test]
+    fn test_resolve_stream_by_name() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+
+        let stream = db.resolve_stream("project-x").unwrap();
+        assert!(stream.is_some());
+        assert_eq!(stream.unwrap().id, "s1");
+    }
+
+    #[test]
+    fn test_resolve_stream_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        let stream = db.resolve_stream("nonexistent").unwrap();
+        assert!(stream.is_none());
+    }
+
+    #[test]
+    fn test_schema_migration_v3_to_v4() {
+        // Create a temporary database file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create database with v3 schema (without stream_tags table)
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE schema_info (version INTEGER NOT NULL);
+                INSERT INTO schema_info (version) VALUES (3);
+
+                CREATE TABLE events (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    schema_version INTEGER DEFAULT 1,
+                    data TEXT NOT NULL,
+                    cwd TEXT,
+                    session_id TEXT,
+                    stream_id TEXT,
+                    assignment_source TEXT DEFAULT 'inferred'
+                );
+
+                CREATE TABLE streams (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    name TEXT,
+                    time_direct_ms INTEGER DEFAULT 0,
+                    time_delegated_ms INTEGER DEFAULT 0,
+                    first_event_at TEXT,
+                    last_event_at TEXT,
+                    needs_recompute INTEGER DEFAULT 0
+                );
+
+                -- Insert some test data
+                INSERT INTO streams (id, created_at, updated_at, name)
+                VALUES ('test-stream', '2025-01-15T10:00:00Z', '2025-01-15T10:00:00Z', 'test');
+                ",
+            )
+            .unwrap();
+        }
+
+        // Opening with the new code should migrate to v4
+        let db = Database::open(&db_path).unwrap();
+
+        // Verify migration happened - stream_tags table should exist and be usable
+        db.add_tag("test-stream", "migrated-tag").unwrap();
+        let tags = db.get_tags("test-stream").unwrap();
+        assert_eq!(tags, vec!["migrated-tag"]);
+
+        // Verify existing data is preserved
+        let stream = db.get_stream("test-stream").unwrap();
+        assert!(stream.is_some());
+        assert_eq!(stream.unwrap().name, Some("test".to_string()));
+
+        // Verify schema version is now 4
+        let version: i32 = db
+            .conn
+            .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 }

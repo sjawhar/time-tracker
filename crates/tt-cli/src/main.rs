@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{events, export, import, infer, ingest, recompute, report, status, sync};
+use tt_cli::commands::{
+    events, export, import, infer, ingest, recompute, report, status, streams, suggest, sync, tag,
+};
 use tt_cli::{Cli, Commands, Config, IngestEvent};
 
 fn main() -> Result<()> {
@@ -200,6 +202,51 @@ fn main() -> Result<()> {
             let db =
                 tt_db::Database::open(&config.database_path).context("failed to open database")?;
             report::run(&db, report::Period::LastDay, *json)?;
+        }
+        Some(Commands::Tag {
+            stream,
+            tag: tag_name,
+        }) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            tracing::debug!(?config, "loaded configuration");
+
+            if let Some(parent) = config.database_path.parent() {
+                std::fs::create_dir_all(parent).context("failed to create database directory")?;
+            }
+
+            let db =
+                tt_db::Database::open(&config.database_path).context("failed to open database")?;
+            tag::run(&db, stream, tag_name)?;
+        }
+        Some(Commands::Suggest { stream, json }) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            tracing::debug!(?config, "loaded configuration");
+
+            if let Some(parent) = config.database_path.parent() {
+                std::fs::create_dir_all(parent).context("failed to create database directory")?;
+            }
+
+            let db =
+                tt_db::Database::open(&config.database_path).context("failed to open database")?;
+
+            // Run async suggest command
+            let rt = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
+            rt.block_on(suggest::run(&db, stream, *json))?;
+        }
+        Some(Commands::Streams { json }) => {
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            tracing::debug!(?config, "loaded configuration");
+
+            if let Some(parent) = config.database_path.parent() {
+                std::fs::create_dir_all(parent).context("failed to create database directory")?;
+            }
+
+            let db =
+                tt_db::Database::open(&config.database_path).context("failed to open database")?;
+            streams::run(&db, *json)?;
         }
         None => {
             // No subcommand, show help
