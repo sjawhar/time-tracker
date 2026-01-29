@@ -60,6 +60,8 @@ mod tests {
             data: json!({}),
             cwd: None,
             session_id: None,
+            stream_id: None,
+            assignment_source: None,
         }
     }
 

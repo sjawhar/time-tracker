@@ -71,6 +71,18 @@ pub enum Commands {
         #[arg(long)]
         before: Option<String>,
     },
+
+    /// Run stream inference on unassigned events.
+    ///
+    /// Clusters events into streams based on working directory and temporal
+    /// proximity (>30min gap starts a new stream).
+    Infer {
+        /// Clear all inferred assignments and re-run inference.
+        ///
+        /// User assignments are preserved.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Event types that can be ingested.

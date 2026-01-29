@@ -37,7 +37,40 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
+
+/// A coherent unit of work, grouping related events.
+///
+/// Streams are materialized for performance but can be recomputed from events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Stream {
+    /// Unique identifier (UUID).
+    pub id: String,
+
+    /// Human-readable name (auto-generated or user-provided).
+    pub name: Option<String>,
+
+    /// When the stream was created.
+    pub created_at: DateTime<Utc>,
+
+    /// When the stream was last updated.
+    pub updated_at: DateTime<Utc>,
+
+    /// Total human attention time in milliseconds.
+    pub time_direct_ms: i64,
+
+    /// Total agent execution time in milliseconds.
+    pub time_delegated_ms: i64,
+
+    /// Timestamp of the first event in this stream.
+    pub first_event_at: Option<DateTime<Utc>>,
+
+    /// Timestamp of the last event in this stream.
+    pub last_event_at: Option<DateTime<Utc>>,
+
+    /// Flag for lazy recomputation.
+    pub needs_recompute: bool,
+}
 
 /// Database errors.
 #[derive(Debug, Error)]
@@ -96,10 +129,41 @@ pub struct StoredEvent {
     /// Agent session ID, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+
+    /// Stream ID this event is assigned to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+
+    /// How this event was assigned to a stream ('inferred' or 'user').
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_source: Option<String>,
 }
 
 const fn default_schema_version() -> i32 {
     1
+}
+
+// Implement InferableEvent for StoredEvent so it can be used with the inference algorithm
+impl tt_core::InferableEvent for StoredEvent {
+    fn event_id(&self) -> &str {
+        &self.id
+    }
+
+    fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    fn assignment_source(&self) -> Option<&str> {
+        self.assignment_source.as_deref()
+    }
+
+    fn stream_id(&self) -> Option<&str> {
+        self.stream_id.as_deref()
+    }
 }
 
 /// Database connection wrapper.
@@ -136,6 +200,9 @@ impl Database {
     ///
     /// Checks schema version and creates tables if needed.
     fn init(&self) -> Result<(), DbError> {
+        // Enable foreign key constraints
+        self.conn.execute("PRAGMA foreign_keys = ON", [])?;
+
         // Check if schema_info table exists and get version
         let existing_version: Option<i32> = self
             .conn
@@ -182,7 +249,22 @@ impl Database {
 
                 -- Stream assignment (null = 'Uncategorized')
                 stream_id TEXT,
-                assignment_source TEXT DEFAULT 'inferred'
+                assignment_source TEXT DEFAULT 'inferred',
+
+                FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE SET NULL
+            );
+
+            -- Streams table: coherent units of work
+            CREATE TABLE IF NOT EXISTS streams (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                name TEXT,
+                time_direct_ms INTEGER DEFAULT 0,
+                time_delegated_ms INTEGER DEFAULT 0,
+                first_event_at TEXT,
+                last_event_at TEXT,
+                needs_recompute INTEGER DEFAULT 0
             );
 
             -- Indexes for common queries
@@ -191,6 +273,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_id);
             CREATE INDEX IF NOT EXISTS idx_events_cwd ON events(cwd);
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             ",
         )?;
 
@@ -268,7 +351,7 @@ impl Database {
         before: Option<DateTime<Utc>>,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let mut sql = String::from(
-            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id
+            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
              FROM events WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -301,6 +384,8 @@ impl Database {
             let data_str: String = row.get(5)?;
             let cwd: Option<String> = row.get(6)?;
             let session_id: Option<String> = row.get(7)?;
+            let stream_id: Option<String> = row.get(8)?;
+            let assignment_source: Option<String> = row.get(9)?;
 
             Ok((
                 id,
@@ -311,13 +396,25 @@ impl Database {
                 data_str,
                 cwd,
                 session_id,
+                stream_id,
+                assignment_source,
             ))
         })?;
 
         let mut events = Vec::new();
         for row_result in rows {
-            let (id, timestamp_str, event_type, source, schema_version, data_str, cwd, session_id) =
-                row_result?;
+            let (
+                id,
+                timestamp_str,
+                event_type,
+                source,
+                schema_version,
+                data_str,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            ) = row_result?;
 
             // Parse timestamp
             let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
@@ -346,10 +443,349 @@ impl Database {
                 data,
                 cwd,
                 session_id,
+                stream_id,
+                assignment_source,
             });
         }
 
         Ok(events)
+    }
+
+    // ========== Stream Methods ==========
+
+    /// Inserts a stream into the database.
+    ///
+    /// Returns an error if a stream with the same ID already exists.
+    pub fn insert_stream(&self, stream: &Stream) -> Result<(), DbError> {
+        let created_str = stream.created_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let updated_str = stream.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let first_event_str = stream
+            .first_event_at
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true));
+        let last_event_str = stream
+            .last_event_at
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true));
+
+        self.conn.execute(
+            "INSERT INTO streams (id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                stream.id,
+                created_str,
+                updated_str,
+                stream.name,
+                stream.time_direct_ms,
+                stream.time_delegated_ms,
+                first_event_str,
+                last_event_str,
+                i32::from(stream.needs_recompute),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves a stream by ID.
+    ///
+    /// Returns `None` if no stream with the given ID exists.
+    pub fn get_stream(&self, id: &str) -> Result<Option<Stream>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
+             FROM streams WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_stream(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieves all streams.
+    ///
+    /// Returns streams ordered by `updated_at` descending.
+    pub fn get_streams(&self) -> Result<Vec<Stream>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
+             FROM streams ORDER BY updated_at DESC",
+        )?;
+
+        let mut streams = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            streams.push(Self::row_to_stream(row)?);
+        }
+        Ok(streams)
+    }
+
+    /// Assigns an event to a stream.
+    ///
+    /// Updates the event's `stream_id` and `assignment_source` fields.
+    pub fn assign_event_to_stream(
+        &self,
+        event_id: &str,
+        stream_id: &str,
+        source: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE events SET stream_id = ?1, assignment_source = ?2 WHERE id = ?3",
+            params![stream_id, source, event_id],
+        )?;
+        Ok(())
+    }
+
+    /// Assigns multiple events to streams in a single transaction.
+    ///
+    /// Returns the number of events updated.
+    pub fn assign_events_to_stream(
+        &self,
+        assignments: &[(String, String)],
+        source: &str,
+    ) -> Result<u64, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut count = 0u64;
+
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE events SET stream_id = ?1, assignment_source = ?2 WHERE id = ?3",
+            )?;
+
+            for (event_id, stream_id) in assignments {
+                count += stmt.execute(params![stream_id, source, event_id])? as u64;
+            }
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Retrieves events assigned to a specific stream.
+    ///
+    /// Events are returned ordered by timestamp ascending.
+    pub fn get_events_by_stream(&self, stream_id: &str) -> Result<Vec<StoredEvent>, DbError> {
+        let queried_stream_id = stream_id.to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+             FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
+        )?;
+
+        let rows = stmt.query_map(params![stream_id], |row| {
+            let id: String = row.get(0)?;
+            let timestamp_str: String = row.get(1)?;
+            let event_type: String = row.get(2)?;
+            let source: String = row.get(3)?;
+            let schema_version: i32 = row.get(4)?;
+            let data_str: String = row.get(5)?;
+            let cwd: Option<String> = row.get(6)?;
+            let session_id: Option<String> = row.get(7)?;
+            let stream_id: Option<String> = row.get(8)?;
+            let assignment_source: Option<String> = row.get(9)?;
+
+            Ok((
+                id,
+                timestamp_str,
+                event_type,
+                source,
+                schema_version,
+                data_str,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            ))
+        })?;
+
+        let mut events = Vec::new();
+        for row_result in rows {
+            let (
+                id,
+                timestamp_str,
+                event_type,
+                source,
+                schema_version,
+                data_str,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            ) = row_result?;
+
+            let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
+                    continue;
+                }
+            };
+
+            let data: serde_json::Value = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
+                    continue;
+                }
+            };
+
+            events.push(StoredEvent {
+                id,
+                timestamp,
+                event_type,
+                source,
+                schema_version,
+                data,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            });
+        }
+
+        // Suppress unused variable warning
+        let _ = queried_stream_id;
+
+        Ok(events)
+    }
+
+    /// Retrieves events that are not assigned to any stream.
+    ///
+    /// Events are returned ordered by timestamp ascending.
+    pub fn get_events_without_stream(&self) -> Result<Vec<StoredEvent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+             FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let timestamp_str: String = row.get(1)?;
+            let event_type: String = row.get(2)?;
+            let source: String = row.get(3)?;
+            let schema_version: i32 = row.get(4)?;
+            let data_str: String = row.get(5)?;
+            let cwd: Option<String> = row.get(6)?;
+            let session_id: Option<String> = row.get(7)?;
+            let stream_id: Option<String> = row.get(8)?;
+            let assignment_source: Option<String> = row.get(9)?;
+
+            Ok((
+                id,
+                timestamp_str,
+                event_type,
+                source,
+                schema_version,
+                data_str,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            ))
+        })?;
+
+        let mut events = Vec::new();
+        for row_result in rows {
+            let (
+                id,
+                timestamp_str,
+                event_type,
+                source,
+                schema_version,
+                data_str,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            ) = row_result?;
+
+            let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
+                    continue;
+                }
+            };
+
+            let data: serde_json::Value = match serde_json::from_str(&data_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
+                    continue;
+                }
+            };
+
+            events.push(StoredEvent {
+                id,
+                timestamp,
+                event_type,
+                source,
+                schema_version,
+                data,
+                cwd,
+                session_id,
+                stream_id,
+                assignment_source,
+            });
+        }
+
+        Ok(events)
+    }
+
+    /// Clears all inferred stream assignments.
+    ///
+    /// User assignments (`assignment_source = 'user'`) are preserved.
+    /// Returns the number of events cleared.
+    pub fn clear_inferred_assignments(&self) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "UPDATE events SET stream_id = NULL WHERE assignment_source = 'inferred'",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Deletes streams that have no events assigned to them.
+    ///
+    /// Returns the number of streams deleted.
+    pub fn delete_orphaned_streams(&self) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "DELETE FROM streams WHERE id NOT IN (SELECT DISTINCT stream_id FROM events WHERE stream_id IS NOT NULL)",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Helper to convert a row to a Stream.
+    fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        let created_at_str: String = row.get(1)?;
+        let updated_at_str: String = row.get(2)?;
+        let name: Option<String> = row.get(3)?;
+        let time_direct_ms: i64 = row.get(4)?;
+        let time_delegated_ms: i64 = row.get(5)?;
+        let first_event_at_str: Option<String> = row.get(6)?;
+        let last_event_at_str: Option<String> = row.get(7)?;
+        let needs_recompute: i32 = row.get(8)?;
+
+        // Parse timestamps - these should always be valid in our schema
+        let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+        let first_event_at = first_event_at_str
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let last_event_at = last_event_at_str
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        Ok(Stream {
+            id,
+            name,
+            created_at,
+            updated_at,
+            time_direct_ms,
+            time_delegated_ms,
+            first_event_at,
+            last_event_at,
+            needs_recompute: needs_recompute != 0,
+        })
     }
 
     /// Returns the most recent event timestamp for each source.
@@ -413,6 +849,8 @@ mod tests {
             }),
             cwd: Some("/home/sami/project-x".to_string()),
             session_id: None,
+            stream_id: None,
+            assignment_source: None,
         }
     }
 
@@ -441,6 +879,8 @@ mod tests {
             }),
             cwd: Some("/home/sami/project".to_string()),
             session_id: Some("abc123".to_string()),
+            stream_id: None,
+            assignment_source: None,
         };
 
         let inserted = db.insert_event(&event).unwrap();
@@ -581,6 +1021,8 @@ mod tests {
             data: json!({}),
             cwd: None,
             session_id: None,
+            stream_id: None,
+            assignment_source: None,
         };
 
         db.insert_event(&event).unwrap();
@@ -690,6 +1132,8 @@ mod tests {
             data: json!({}),
             cwd: None,
             session_id: None,
+            stream_id: None,
+            assignment_source: None,
         }
     }
 
@@ -772,5 +1216,165 @@ mod tests {
         assert_eq!(statuses[0].source, "remote.agent"); // 12:00
         assert_eq!(statuses[1].source, "local.window"); // 11:00
         assert_eq!(statuses[2].source, "remote.tmux"); // 10:00
+    }
+
+    // ========== Stream Tests ==========
+
+    fn make_stream(id: &str, name: Option<&str>) -> Stream {
+        let now = Utc::now();
+        Stream {
+            id: id.to_string(),
+            name: name.map(String::from),
+            created_at: now,
+            updated_at: now,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: false,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_stream() {
+        let db = Database::open_in_memory().unwrap();
+        let stream = make_stream("stream-1", Some("time-tracker"));
+
+        db.insert_stream(&stream).unwrap();
+
+        let retrieved = db.get_stream("stream-1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "stream-1");
+        assert_eq!(retrieved.name, Some("time-tracker".to_string()));
+    }
+
+    #[test]
+    fn test_get_stream_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        let result = db.get_stream("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_streams_empty() {
+        let db = Database::open_in_memory().unwrap();
+        let streams = db.get_streams().unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn test_get_streams_returns_all() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.insert_stream(&make_stream("s1", Some("project-a")))
+            .unwrap();
+        db.insert_stream(&make_stream("s2", Some("project-b")))
+            .unwrap();
+        db.insert_stream(&make_stream("s3", None)).unwrap();
+
+        let streams = db.get_streams().unwrap();
+        assert_eq!(streams.len(), 3);
+    }
+
+    #[test]
+    fn test_assign_event_to_stream() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Create an event
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        db.insert_event(&make_event("e1", ts)).unwrap();
+
+        // Create a stream
+        db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
+
+        // Assign event to stream
+        db.assign_event_to_stream("e1", "s1", "inferred").unwrap();
+
+        // Verify event is assigned
+        let events = db.get_events_by_stream("s1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "e1");
+    }
+
+    #[test]
+    fn test_get_events_without_stream() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e1", ts1)).unwrap();
+        db.insert_event(&make_event("e2", ts2)).unwrap();
+
+        // Create a stream and assign one event
+        db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
+        db.assign_event_to_stream("e1", "s1", "inferred").unwrap();
+
+        // Get events without stream
+        let events = db.get_events_without_stream().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "e2");
+    }
+
+    #[test]
+    fn test_assign_events_batch() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Create events
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e1", ts1)).unwrap();
+        db.insert_event(&make_event("e2", ts2)).unwrap();
+        db.insert_event(&make_event("e3", ts3)).unwrap();
+
+        // Create a stream
+        db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
+
+        // Batch assign
+        let assignments = vec![
+            ("e1".to_string(), "s1".to_string()),
+            ("e2".to_string(), "s1".to_string()),
+        ];
+        let count = db
+            .assign_events_to_stream(&assignments, "inferred")
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Verify assignments
+        let events = db.get_events_by_stream("s1").unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn test_clear_inferred_assignments() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e1", ts1)).unwrap();
+        db.insert_event(&make_event("e2", ts2)).unwrap();
+
+        db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
+
+        // Assign one as inferred, one as user
+        db.assign_event_to_stream("e1", "s1", "inferred").unwrap();
+        db.assign_event_to_stream("e2", "s1", "user").unwrap();
+
+        // Clear inferred assignments
+        let cleared = db.clear_inferred_assignments().unwrap();
+        assert_eq!(cleared, 1);
+
+        // Verify: e1 should be unassigned, e2 should still be assigned
+        let unassigned = db.get_events_without_stream().unwrap();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].id, "e1");
+
+        let assigned = db.get_events_by_stream("s1").unwrap();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].id, "e2");
     }
 }
