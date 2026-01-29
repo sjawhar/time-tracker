@@ -16,11 +16,11 @@ Linear task list for Time Tracker MVP.
 - [x] Create `tt ingest` command
 - [x] Configure tmux hook in `~/.tmux.conf` (calls `tt ingest` on pane-focus-in)
 - [x] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
-- [ ] Create Claude log manifest for incremental parsing
+- [x] Create Claude log manifest for incremental parsing
 
 ## Prototype Implementation (Local)
 
-- [ ] Implement SQLite event store (schema from `data-model.md`)
+- [x] Implement SQLite event store (schema from `data-model.md`)
 - [ ] Implement `tt import` command (reads events from stdin, inserts to SQLite)
 - [ ] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
 - [ ] Implement `tt events` command (query local SQLite)
