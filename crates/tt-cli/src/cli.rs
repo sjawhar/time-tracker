@@ -34,6 +34,12 @@ pub enum Commands {
         #[command(subcommand)]
         event: IngestEvent,
     },
+
+    /// Export all events for sync to local machine.
+    ///
+    /// Reads events from `~/.time-tracker/events.jsonl` and parses Claude Code
+    /// session logs, outputting combined events as JSONL to stdout.
+    Export,
 }
 
 /// Event types that can be ingested.

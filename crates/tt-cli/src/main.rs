@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::ingest;
+use tt_cli::commands::{export, ingest};
 use tt_cli::{Cli, Commands, Config, IngestEvent};
 
 fn main() -> Result<()> {
@@ -35,6 +35,10 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Some(Commands::Export) => {
+            // Export doesn't need config - just reads files and outputs to stdout
+            export::run()?;
         }
         Some(Commands::Status) => {
             // Load configuration only when needed
