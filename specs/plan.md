@@ -21,8 +21,8 @@ Linear task list for Time Tracker MVP.
 ## Prototype Implementation (Local)
 
 - [x] Implement SQLite event store (schema from `data-model.md`)
-- [ ] Implement `tt import` command (reads events from stdin, inserts to SQLite)
-- [ ] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
+- [x] Implement `tt import` command (reads events from stdin, inserts to SQLite)
+- [x] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
 - [ ] Implement `tt events` command (query local SQLite)
 - [ ] Implement `tt status` command (show last event time per source)
 

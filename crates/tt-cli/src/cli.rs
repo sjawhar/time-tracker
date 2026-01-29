@@ -46,6 +46,17 @@ pub enum Commands {
     /// Events are expected as JSONL (one JSON object per line).
     /// Duplicate events (same ID) are silently ignored.
     Import,
+
+    /// Sync events from a remote host via SSH.
+    ///
+    /// Executes `ssh <remote> tt export` and imports the output into the
+    /// local `SQLite` database. Requires SSH key authentication (no password prompts).
+    Sync {
+        /// Remote host in SSH format (user@host or host).
+        ///
+        /// Uses your SSH config for custom ports/keys. Configure in ~/.ssh/config.
+        remote: String,
+    },
 }
 
 /// Event types that can be ingested.
