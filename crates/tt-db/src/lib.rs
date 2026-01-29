@@ -17,11 +17,12 @@
 //!
 //! ## Timestamp Format
 //!
-//! Timestamps are stored as TEXT in ISO 8601 format (e.g., `2024-01-15T10:30:00Z`).
+//! Timestamps are stored as TEXT in ISO 8601 format with milliseconds (e.g., `2024-01-15T10:30:00.123Z`).
 //! This format ensures:
 //! - Lexicographic ordering matches chronological ordering
 //! - Human-readable values in the database
 //! - Timezone-aware (always UTC)
+//! - Millisecond precision for accurate event ordering and debouncing
 //!
 //! ## Schema Versioning
 //!
@@ -240,7 +241,7 @@ impl Database {
                 // Schema already initialized and version matches
                 return Ok(());
             }
-            Some(v) if v == 3 => {
+            Some(3) => {
                 // Migrate from v3 to v4
                 self.migrate_v3_to_v4()?;
                 return Ok(());
@@ -374,9 +375,9 @@ impl Database {
 
             for event in events {
                 let data_json = serde_json::to_string(&event.data).unwrap_or_default();
-                // Use consistent format: always 'Z' suffix, second precision
+                // Use consistent format: always 'Z' suffix, millisecond precision
                 // This ensures lexicographic ordering matches chronological ordering
-                let timestamp_str = event.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
+                let timestamp_str = event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
 
                 let rows = stmt.execute(params![
                     event.id,
@@ -421,14 +422,14 @@ impl Database {
         if let Some(ref after_ts) = after {
             sql.push_str(" AND timestamp > ?");
             params_vec.push(Box::new(
-                after_ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+                after_ts.to_rfc3339_opts(SecondsFormat::Millis, true),
             ));
         }
 
         if let Some(ref before_ts) = before {
             sql.push_str(" AND timestamp < ?");
             params_vec.push(Box::new(
-                before_ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+                before_ts.to_rfc3339_opts(SecondsFormat::Millis, true),
             ));
         }
 
@@ -519,14 +520,18 @@ impl Database {
     ///
     /// Returns an error if a stream with the same ID already exists.
     pub fn insert_stream(&self, stream: &Stream) -> Result<(), DbError> {
-        let created_str = stream.created_at.to_rfc3339_opts(SecondsFormat::Secs, true);
-        let updated_str = stream.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let created_str = stream
+            .created_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let updated_str = stream
+            .updated_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
         let first_event_str = stream
             .first_event_at
-            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true));
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true));
         let last_event_str = stream
             .last_event_at
-            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true));
+            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true));
 
         self.conn.execute(
             "INSERT INTO streams (id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute)
@@ -624,7 +629,6 @@ impl Database {
     ///
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_by_stream(&self, stream_id: &str) -> Result<Vec<StoredEvent>, DbError> {
-        let queried_stream_id = stream_id.to_string();
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
              FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
@@ -700,9 +704,6 @@ impl Database {
                 assignment_source,
             });
         }
-
-        // Suppress unused variable warning
-        let _ = queried_stream_id;
 
         Ok(events)
     }
@@ -823,7 +824,7 @@ impl Database {
         let mut count = 0u64;
 
         {
-            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             let mut stmt = tx.prepare(
                 "UPDATE streams SET time_direct_ms = ?1, time_delegated_ms = ?2, updated_at = ?3, needs_recompute = 0
                  WHERE id = ?4",

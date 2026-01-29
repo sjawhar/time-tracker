@@ -17,12 +17,18 @@ use crate::commands::import::{ImportResult, import_from_reader};
 /// SSH failures (connection refused, command not found, permission denied) are
 /// returned as errors with the SSH stderr included.
 ///
-/// Note: This blocks indefinitely on SSH. Users should configure SSH timeouts
-/// in their SSH config if needed (e.g., `ConnectTimeout`, `ServerAliveInterval`).
+/// Uses SSH with a 30-second connection timeout to prevent indefinite blocking.
+/// Additional timeouts can be configured via SSH config (`ServerAliveInterval`, etc.).
 pub fn sync_from_remote(db: &Database, remote: &str) -> Result<ImportResult> {
     tracing::info!(remote, "syncing from remote");
 
     let output = Command::new("ssh")
+        .arg("-o")
+        .arg("ConnectTimeout=30")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=2")
         .arg(remote)
         .arg("tt")
         .arg("export")

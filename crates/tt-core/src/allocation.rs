@@ -92,6 +92,22 @@ enum FocusState {
     Unfocused,
 }
 
+/// Current window focus state.
+#[derive(Debug, Clone, Default)]
+struct WindowFocusState {
+    /// Currently focused application name (lowercase).
+    app: Option<String>,
+    /// Stream associated with window focus event.
+    stream_id: Option<String>,
+}
+
+/// Current browser tab focus state.
+#[derive(Debug, Clone, Default)]
+struct BrowserFocusState {
+    /// Stream associated with the currently focused browser tab.
+    stream_id: Option<String>,
+}
+
 /// Tracked agent session state.
 #[derive(Debug, Clone)]
 struct AgentSession {
@@ -136,12 +152,16 @@ impl Interval {
 /// # Returns
 ///
 /// Computed time per stream and total tracked time.
+#[allow(clippy::too_many_lines)]
 pub fn allocate_time<E: AllocatableEvent>(
     events: &[E],
     config: &AllocationConfig,
     period_end: Option<DateTime<Utc>>,
 ) -> AllocationResult {
     let mut focus_state = FocusState::Unfocused;
+    let mut window_focus_state = WindowFocusState::default();
+    let mut browser_focus_state = BrowserFocusState::default();
+    let mut tmux_focus_stream_id: Option<String> = None;
     let mut agent_sessions: HashMap<String, AgentSession> = HashMap::new();
     let mut stream_times: HashMap<String, (i64, i64)> = HashMap::new(); // (direct_ms, delegated_ms)
     let mut activity_intervals: Vec<Interval> = Vec::new();
@@ -184,24 +204,24 @@ pub fn allocate_time<E: AllocatableEvent>(
         // Collect attributions first to avoid borrow issues
         let timeout_attributions: Vec<_> = agent_sessions
             .iter()
-            .filter(|(_, session)| !session.ended && session.last_tool_use_at.is_some())
+            .filter(|(_, session)| !session.ended)
             .filter_map(|(session_id, session)| {
-                let last_tool = session.last_tool_use_at.unwrap();
+                let last_tool = session.last_tool_use_at?;
+                let first_tool = session.first_tool_use_at?;
                 let timeout_at = last_tool + Duration::milliseconds(config.agent_timeout_ms);
                 if event_time > timeout_at {
                     // Session timed out - attribute time from first to last tool use + timeout
                     // Actually per spec: session ends at last_tool_use timestamp
                     // But delegated time runs from first_tool_use to timeout_at
-                    if let Some(first_tool) = session.first_tool_use_at {
-                        return Some((
-                            session_id.clone(),
-                            session.stream_id.clone(),
-                            first_tool,
-                            timeout_at,
-                        ));
-                    }
+                    Some((
+                        session_id.clone(),
+                        session.stream_id.clone(),
+                        first_tool,
+                        timeout_at,
+                    ))
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
@@ -223,23 +243,25 @@ pub fn allocate_time<E: AllocatableEvent>(
         match event_type {
             "tmux_pane_focus" => {
                 if let Some(stream_id) = event.stream_id() {
-                    // Close previous focus interval
-                    if let FocusState::Focused {
-                        stream_id: prev_stream,
-                        focus_start,
-                    } = &focus_state
-                    {
-                        // Attribute time up to this event
-                        add_direct(
-                            prev_stream,
-                            *focus_start,
-                            event_time,
-                            &mut activity_intervals,
-                            &mut stream_times,
+                    // Close previous focus interval using resolved stream
+                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                        let resolved = resolve_focus_stream(
+                            &window_focus_state,
+                            tmux_focus_stream_id.as_deref(),
+                            browser_focus_state.stream_id.as_deref(),
                         );
+                        if let Some(resolved_stream) = &resolved {
+                            add_direct(
+                                resolved_stream,
+                                *focus_start,
+                                event_time,
+                                &mut activity_intervals,
+                                &mut stream_times,
+                            );
+                        }
                     }
 
-                    // Start new focus
+                    tmux_focus_stream_id = Some(stream_id.to_string());
                     focus_state = FocusState::Focused {
                         stream_id: stream_id.to_string(),
                         focus_start: event_time,
@@ -250,19 +272,37 @@ pub fn allocate_time<E: AllocatableEvent>(
             "afk_change" => {
                 let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 if status == "idle" {
-                    // AFK - close focus
-                    if let FocusState::Focused {
-                        stream_id,
-                        focus_start,
-                    } = &focus_state
-                    {
-                        add_direct(
-                            stream_id,
-                            *focus_start,
-                            event_time,
-                            &mut activity_intervals,
-                            &mut stream_times,
-                        );
+                    // Check for retroactive idle duration
+                    let idle_start = data
+                        .get("idle_duration_ms")
+                        .and_then(serde_json::Value::as_i64)
+                        .map_or(event_time, |duration_ms| {
+                            if duration_ms > 0 {
+                                event_time - Duration::milliseconds(duration_ms)
+                            } else {
+                                event_time
+                            }
+                        });
+
+                    // Close focus at idle_start, not event_time
+                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                        let end_time = idle_start.max(*focus_start); // Don't go before focus started
+                        if end_time > *focus_start {
+                            let resolved = resolve_focus_stream(
+                                &window_focus_state,
+                                tmux_focus_stream_id.as_deref(),
+                                browser_focus_state.stream_id.as_deref(),
+                            );
+                            if let Some(resolved_stream) = &resolved {
+                                add_direct(
+                                    resolved_stream,
+                                    *focus_start,
+                                    end_time, // Use calculated idle_start, not event_time
+                                    &mut activity_intervals,
+                                    &mut stream_times,
+                                );
+                            }
+                        }
                     }
                     focus_state = FocusState::Unfocused;
                 }
@@ -271,28 +311,37 @@ pub fn allocate_time<E: AllocatableEvent>(
 
             "tmux_scroll" | "user_message" => {
                 // These confirm focus and reset attention window, but only if
-                // the event is for the currently focused stream
+                // the event is for the currently focused stream (using resolved stream)
                 if let FocusState::Focused {
                     stream_id: focused_stream,
                     focus_start,
                 } = &focus_state
                 {
-                    // Only reset attention window if this event is for the focused stream
+                    // Resolve which stream should actually get the time
+                    let resolved = resolve_focus_stream(
+                        &window_focus_state,
+                        tmux_focus_stream_id.as_deref(),
+                        browser_focus_state.stream_id.as_deref(),
+                    );
+
+                    // Only reset attention window if this event is for the resolved stream
                     let event_stream = event.stream_id();
-                    if event_stream == Some(focused_stream.as_str()) {
-                        if event_time > *focus_start {
-                            add_direct(
-                                focused_stream,
-                                *focus_start,
-                                event_time,
-                                &mut activity_intervals,
-                                &mut stream_times,
-                            );
+                    if let Some(resolved_stream) = &resolved {
+                        if event_stream == Some(resolved_stream.as_str()) {
+                            if event_time > *focus_start {
+                                add_direct(
+                                    resolved_stream,
+                                    *focus_start,
+                                    event_time,
+                                    &mut activity_intervals,
+                                    &mut stream_times,
+                                );
+                            }
+                            focus_state = FocusState::Focused {
+                                stream_id: focused_stream.clone(),
+                                focus_start: event_time,
+                            };
                         }
-                        focus_state = FocusState::Focused {
-                            stream_id: focused_stream.clone(),
-                            focus_start: event_time,
-                        };
                     }
                     // If event is for a different stream, ignore it - doesn't affect focus state
                 }
@@ -353,6 +402,51 @@ pub fn allocate_time<E: AllocatableEvent>(
                 }
             }
 
+            "window_focus" => {
+                let app = data
+                    .get("app")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_ascii_lowercase);
+                window_focus_state.app = app;
+                window_focus_state.stream_id = event.stream_id().map(String::from);
+            }
+
+            "browser_tab" => {
+                browser_focus_state.stream_id = event.stream_id().map(String::from);
+
+                // If we're in a browser app and have focus, update focus state
+                if window_focus_state
+                    .app
+                    .as_ref()
+                    .is_some_and(|app| is_browser_app(app))
+                {
+                    if let Some(stream_id) = event.stream_id() {
+                        // Close previous focus interval
+                        if let FocusState::Focused { focus_start, .. } = &focus_state {
+                            let resolved = resolve_focus_stream(
+                                &window_focus_state,
+                                tmux_focus_stream_id.as_deref(),
+                                browser_focus_state.stream_id.as_deref(),
+                            );
+                            if let Some(resolved_stream) = &resolved {
+                                add_direct(
+                                    resolved_stream,
+                                    *focus_start,
+                                    event_time,
+                                    &mut activity_intervals,
+                                    &mut stream_times,
+                                );
+                            }
+                        }
+
+                        focus_state = FocusState::Focused {
+                            stream_id: stream_id.to_string(),
+                            focus_start: event_time,
+                        };
+                    }
+                }
+            }
+
             _ => {}
         }
 
@@ -363,42 +457,41 @@ pub fn allocate_time<E: AllocatableEvent>(
     let end_time = period_end.or(last_event_time);
 
     if let Some(end) = end_time {
-        // Close focus - cap at attention window
-        if let FocusState::Focused {
-            stream_id,
-            focus_start,
-        } = &focus_state
-        {
-            let window_end = *focus_start + Duration::milliseconds(config.attention_window_ms);
-            let actual_end = if let Some(pe) = period_end {
-                pe.min(window_end)
-            } else {
-                window_end
-            };
-            if actual_end > *focus_start {
-                add_direct(
-                    stream_id,
-                    *focus_start,
-                    actual_end,
-                    &mut activity_intervals,
-                    &mut stream_times,
-                );
+        // Close focus - cap at attention window, using resolved stream
+        if let FocusState::Focused { focus_start, .. } = &focus_state {
+            let resolved = resolve_focus_stream(
+                &window_focus_state,
+                tmux_focus_stream_id.as_deref(),
+                browser_focus_state.stream_id.as_deref(),
+            );
+            if let Some(resolved_stream) = &resolved {
+                let window_end = *focus_start + Duration::milliseconds(config.attention_window_ms);
+                let actual_end = period_end.map_or(window_end, |pe| pe.min(window_end));
+                if actual_end > *focus_start {
+                    add_direct(
+                        resolved_stream,
+                        *focus_start,
+                        actual_end,
+                        &mut activity_intervals,
+                        &mut stream_times,
+                    );
+                }
             }
         }
 
         // Close active agent sessions
         let final_attributions: Vec<_> = agent_sessions
             .values()
-            .filter(|session| !session.ended && session.first_tool_use_at.is_some())
-            .map(|session| {
-                let first_tool = session.first_tool_use_at.unwrap();
+            .filter(|session| !session.ended)
+            .filter_map(|session| {
+                let first_tool = session.first_tool_use_at?;
                 let last_tool = session.last_tool_use_at.unwrap_or(first_tool);
 
                 // Check for timeout
                 let timeout_at = last_tool + Duration::milliseconds(config.agent_timeout_ms);
                 let session_end = if end > timeout_at { timeout_at } else { end };
 
-                (session.stream_id.clone(), first_tool, session_end)
+                Some((session.stream_id.clone(), first_tool, session_end))
             })
             .collect();
 
@@ -439,8 +532,15 @@ fn calculate_total_tracked(intervals: &[Interval]) -> i64 {
         return 0;
     }
 
-    // Sort intervals by start time
-    let mut sorted: Vec<Interval> = intervals.to_vec();
+    // Filter out invalid intervals (where end <= start) and sort by start time
+    let mut sorted: Vec<Interval> = intervals
+        .iter()
+        .filter(|i| i.end > i.start)
+        .copied()
+        .collect();
+    if sorted.is_empty() {
+        return 0;
+    }
     sorted.sort_by_key(|i| i.start);
 
     // Merge overlapping intervals
@@ -458,6 +558,48 @@ fn calculate_total_tracked(intervals: &[Interval]) -> i64 {
     }
 
     merged.iter().map(Interval::duration_ms).sum()
+}
+
+/// Returns true if the app name indicates a terminal application.
+fn is_terminal_app(app: &str) -> bool {
+    let app_lower = app.to_ascii_lowercase();
+    app_lower.contains("terminal")
+        || app_lower.contains("iterm")
+        || app_lower.contains("alacritty")
+        || app_lower.contains("wezterm")
+        || app_lower.contains("kitty")
+        || app_lower.contains("konsole")
+        || app_lower.contains("gnome-terminal")
+}
+
+/// Returns true if the app name indicates a browser application.
+fn is_browser_app(app: &str) -> bool {
+    let app_lower = app.to_ascii_lowercase();
+    app_lower.contains("chrome")
+        || app_lower.contains("firefox")
+        || app_lower.contains("safari")
+        || app_lower.contains("edge")
+        || app_lower.contains("brave")
+        || app_lower.contains("arc")
+}
+
+/// Resolves which stream should receive direct time based on focus hierarchy.
+///
+/// Hierarchy:
+/// - If window is a terminal app -> use tmux focus stream
+/// - If window is a browser app -> use browser tab stream
+/// - Otherwise -> use window focus stream
+fn resolve_focus_stream(
+    window_state: &WindowFocusState,
+    tmux_stream_id: Option<&str>,
+    browser_stream_id: Option<&str>,
+) -> Option<String> {
+    match &window_state.app {
+        Some(app) if is_terminal_app(app) => tmux_stream_id.map(String::from),
+        Some(app) if is_browser_app(app) => browser_stream_id.map(String::from),
+        Some(_) => window_state.stream_id.clone(),
+        None => tmux_stream_id.map(String::from), // Fallback to tmux if no window info
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +682,36 @@ mod tests {
                 data: json!({"length": 100}),
             }
         }
+
+        fn window_focus(ts: DateTime<Utc>, app: &str, stream_id: Option<&str>) -> Self {
+            Self {
+                timestamp: ts,
+                event_type: "window_focus".to_string(),
+                stream_id: stream_id.map(String::from),
+                session_id: None,
+                data: json!({"app": app, "title": "test window"}),
+            }
+        }
+
+        fn browser_tab(ts: DateTime<Utc>, stream_id: &str) -> Self {
+            Self {
+                timestamp: ts,
+                event_type: "browser_tab".to_string(),
+                stream_id: Some(stream_id.to_string()),
+                session_id: None,
+                data: json!({"url": "https://example.com", "title": "Test Page"}),
+            }
+        }
+
+        fn afk_with_duration(ts: DateTime<Utc>, status: &str, idle_duration_ms: i64) -> Self {
+            Self {
+                timestamp: ts,
+                event_type: "afk_change".to_string(),
+                stream_id: None,
+                session_id: None,
+                data: json!({"status": status, "idle_duration_ms": idle_duration_ms}),
+            }
+        }
     }
 
     impl AllocatableEvent for TestEvent {
@@ -565,7 +737,10 @@ mod tests {
     }
 
     fn ts(minutes: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap() + Duration::minutes(minutes)
+        Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0)
+            .single()
+            .expect("valid test timestamp")
+            + Duration::minutes(minutes)
     }
 
     fn get_stream_time<'a>(
@@ -614,7 +789,7 @@ mod tests {
         // Stream A: 0 to 10 = 10 minutes
         assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
         // Stream B: 10 to min(20, 10+1) = 10 to 11 = 1 minute (attention window)
-        assert_eq!(stream_b.time_direct_ms, 1 * 60 * 1000);
+        assert_eq!(stream_b.time_direct_ms, 60 * 1000);
     }
 
     // Test 3: AFK pauses direct time
@@ -696,8 +871,10 @@ mod tests {
             TestEvent::tmux_focus(ts(60), "B"),
         ];
 
-        let mut config = AllocationConfig::default();
-        config.agent_timeout_ms = 30 * 60 * 1000; // 30 minutes
+        let config = AllocationConfig {
+            agent_timeout_ms: 30 * 60 * 1000, // 30 minutes
+            ..Default::default()
+        };
 
         let result = allocate_time(&events, &config, Some(ts(60)));
 
@@ -747,7 +924,7 @@ mod tests {
 
         // Focus: from 0 to min(30, 0+1) = 1 minute (attention window)
         // Delegated: 5 to 30 = 25 minutes
-        assert_eq!(stream_a.time_direct_ms, 1 * 60 * 1000);
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
         assert_eq!(stream_a.time_delegated_ms, 25 * 60 * 1000);
     }
 
@@ -767,7 +944,7 @@ mod tests {
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time caps at attention window: 1 minute
-        assert_eq!(stream_a.time_direct_ms, 1 * 60 * 1000);
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
     }
 
     // Test 11: Scroll resets attention window
@@ -806,7 +983,7 @@ mod tests {
         // Focus is on A the whole time. The scroll in B doesn't change focus state.
         // Scroll events only reset attention window if we're already focused on that stream.
         // Direct time for A: from 0 to min(10, 0+1) = 1 minute
-        assert_eq!(stream_a.time_direct_ms, 1 * 60 * 1000);
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
 
         // Stream B gets no direct time (no focus on B)
         let stream_b = get_stream_time(&result, "B");
@@ -928,5 +1105,87 @@ mod tests {
 
         assert!(result.stream_times.is_empty());
         assert_eq!(result.total_tracked_ms, 0);
+    }
+
+    #[test]
+    fn test_window_focus_sets_active_window() {
+        let events = vec![
+            TestEvent::window_focus(ts(0), "Terminal", Some("A")),
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::tmux_focus(ts(10), "A"), // Activity to close interval
+        ];
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, Some(ts(10)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // Window focus + tmux focus on same stream = 10 minutes
+        assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
+    }
+
+    #[test]
+    fn test_browser_tab_tracks_stream() {
+        let events = vec![
+            TestEvent::browser_tab(ts(0), "B"),
+            TestEvent::browser_tab(ts(10), "B"), // Activity to close interval
+        ];
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, Some(ts(10)));
+
+        // Browser tab alone doesn't grant direct time without window focus
+        // This test verifies the event is parsed without error
+        assert!(
+            result.stream_times.is_empty()
+                || get_stream_time(&result, "B").map_or(0, |s| s.time_direct_ms) == 0
+        );
+    }
+
+    #[test]
+    fn test_focus_hierarchy_terminal_uses_tmux_stream() {
+        let events = vec![
+            TestEvent::window_focus(ts(0), "Terminal", None), // Window focus, no stream
+            TestEvent::tmux_focus(ts(0), "A"),                // Tmux focus on A
+            TestEvent::tmux_scroll(ts(5), "A"),               // Activity
+        ];
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, Some(ts(6)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // Terminal window focus + tmux focus = time goes to tmux stream A
+        assert_eq!(stream_a.time_direct_ms, 6 * 60 * 1000);
+    }
+
+    #[test]
+    fn test_focus_hierarchy_browser_uses_browser_stream() {
+        let events = vec![
+            TestEvent::window_focus(ts(0), "Chrome", None),
+            TestEvent::browser_tab(ts(0), "B"),
+            TestEvent::browser_tab(ts(5), "B"), // Activity
+        ];
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, Some(ts(6)));
+
+        let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
+        // Browser window focus + browser tab = time goes to browser stream B
+        assert_eq!(stream_b.time_direct_ms, 6 * 60 * 1000);
+    }
+
+    #[test]
+    fn test_afk_idle_duration_retroactive() {
+        // AFK event at 5 min reports user was idle for 3 minutes (since 2 min)
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::afk_with_duration(ts(5), "idle", 180_000), // idle_duration_ms = 3 min
+        ];
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, Some(ts(5)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // Direct time: only 0-2 min (idle started at 2 min retroactively)
+        assert_eq!(stream_a.time_direct_ms, 2 * 60 * 1000);
     }
 }

@@ -127,12 +127,8 @@ fn extract_project_from_path(path: &str) -> Option<String> {
 /// Check if path components represent a user home directory.
 fn is_home_directory(components: &[&str]) -> bool {
     match components {
-        // /home/username
-        ["home", _] => true,
-        // /Users/username (macOS)
-        ["Users", _] => true,
-        // /root
-        ["root"] => true,
+        // /home/username, /Users/username (macOS), or /root
+        ["home" | "Users", _] | ["root"] => true,
         _ => false,
     }
 }
@@ -188,8 +184,7 @@ fn find_first_meaningful_component(components: &[&str]) -> Option<String> {
     // Skip home directory prefix
     let skip = if components.len() >= 2 {
         match (components.first(), components.get(1)) {
-            (Some(&"home"), Some(_)) => 2,
-            (Some(&"Users"), Some(_)) => 2,
+            (Some(&"home" | &"Users"), Some(_)) => 2,
             (Some(&"root"), _) => 1,
             _ => 0,
         }

@@ -351,21 +351,21 @@ mod tests {
 
         // First stream: e1, e2
         let stream1_id = &result.streams[0].id;
-        let stream1_events: Vec<_> = result
+        let stream1_count = result
             .assignments
             .iter()
             .filter(|a| &a.stream_id == stream1_id)
-            .collect();
-        assert_eq!(stream1_events.len(), 2);
+            .count();
+        assert_eq!(stream1_count, 2);
 
         // Second stream: e3
         let stream2_id = &result.streams[1].id;
-        let stream2_events: Vec<_> = result
+        let stream2_count = result
             .assignments
             .iter()
             .filter(|a| &a.stream_id == stream2_id)
-            .collect();
-        assert_eq!(stream2_events.len(), 1);
+            .count();
+        assert_eq!(stream2_count, 1);
     }
 
     #[test]

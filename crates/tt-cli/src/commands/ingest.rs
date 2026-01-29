@@ -19,7 +19,6 @@ pub struct PaneFocusData {
     pub session_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_index: Option<u32>,
-    pub cwd: String,
 }
 
 /// An event to be ingested and written to the events file.
@@ -32,6 +31,9 @@ pub struct IngestEvent {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: PaneFocusData,
+    /// Working directory where the event occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 fn default_source() -> String {
@@ -59,8 +61,8 @@ impl IngestEvent {
                 pane_id,
                 session_name,
                 window_index,
-                cwd,
             },
+            cwd: Some(cwd),
         }
     }
 }
@@ -135,7 +137,7 @@ fn check_and_update_debounce(data_dir: &Path, pane_id: &str, now_ms: u64) -> Res
     // Add current entry and write back
     entries.push((pane_id.to_string(), now_ms));
 
-    let new_content: String = entries
+    let new_content = entries
         .iter()
         .map(|(p, t)| format!("{p}:{t}"))
         .collect::<Vec<_>>()
@@ -175,6 +177,14 @@ fn ingest_pane_focus_impl(
     window_index: Option<u32>,
     cwd: &str,
 ) -> Result<bool> {
+    // Validate required fields are not empty
+    if pane_id.is_empty() {
+        anyhow::bail!("pane_id cannot be empty");
+    }
+    if session_name.is_empty() {
+        anyhow::bail!("session_name cannot be empty");
+    }
+
     fs::create_dir_all(data_dir).context("failed to create data directory")?;
 
     // Acquire lock
@@ -184,8 +194,9 @@ fn ingest_pane_focus_impl(
         .context("failed to acquire lock")?;
 
     let now = Utc::now();
-    #[allow(clippy::cast_sign_loss)] // Timestamps are always positive
-    let now_ms = now.timestamp_millis() as u64;
+    // Use try_into to safely convert, falling back to 0 for timestamps before Unix epoch
+    // (which would indicate a misconfigured system clock)
+    let now_ms: u64 = now.timestamp_millis().try_into().unwrap_or(0);
 
     // Check debounce and update state in one pass
     if check_and_update_debounce(data_dir, pane_id, now_ms)? {
@@ -337,7 +348,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data.pane_id, "%1");
         assert_eq!(events[0].data.session_name, "main");
-        assert_eq!(events[0].data.cwd, "/home/test");
+        assert_eq!(events[0].cwd, Some("/home/test".to_string()));
     }
 
     #[test]
@@ -414,5 +425,25 @@ mod tests {
             assert!(parsed["type"].is_string());
             assert!(parsed["data"].is_object());
         }
+    }
+
+    #[test]
+    fn test_empty_pane_id_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        let result = ingest_pane_focus_impl(&data_dir, "", "main", None, "/home/test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pane_id"));
+    }
+
+    #[test]
+    fn test_empty_session_name_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        let result = ingest_pane_focus_impl(&data_dir, "%1", "", None, "/home/test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("session_name"));
     }
 }

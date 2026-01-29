@@ -7,6 +7,7 @@ use tt_cli::commands::{
 };
 use tt_cli::{Cli, Commands, Config, IngestEvent};
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 

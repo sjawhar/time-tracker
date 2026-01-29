@@ -11,7 +11,7 @@ expression: json
   "data": {
     "pane_id": "%3",
     "session_name": "dev",
-    "window_index": 1,
-    "cwd": "/home/user/project"
-  }
+    "window_index": 1
+  },
+  "cwd": "/home/user/project"
 }
