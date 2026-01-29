@@ -3,9 +3,9 @@
 //! This module reads events from both `events.jsonl` (tmux events) and
 //! Claude Code session logs, outputting a combined JSONL stream to stdout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -52,6 +52,58 @@ pub struct AgentToolUseData {
     pub file: Option<String>,
 }
 
+/// Manifest tracking byte offsets for incremental Claude log parsing.
+/// Maps file path to byte offset after last successfully parsed line.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClaudeManifest {
+    /// Byte offset per session file path
+    pub sessions: HashMap<PathBuf, u64>,
+}
+
+impl ClaudeManifest {
+    /// Loads manifest from file path, returning empty manifest if file is missing or corrupted.
+    fn load(path: &Path) -> Self {
+        // Single syscall - try to open directly, handle NotFound
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read manifest, performing full re-parse");
+                return Self::default();
+            }
+        };
+
+        // Stream directly from file without intermediate String allocation
+        match serde_json::from_reader(BufReader::new(file)) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to parse manifest, performing full re-parse");
+                Self::default()
+            }
+        }
+    }
+
+    /// Saves manifest to file using atomic write (temp file + rename).
+    fn save(&self, path: &Path) -> Result<()> {
+        use std::io::BufWriter;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("failed to create manifest directory")?;
+        }
+
+        let temp_path = path.with_extension("json.tmp");
+        let file = File::create(&temp_path).context("failed to create temp manifest")?;
+        let writer = BufWriter::new(file);
+
+        // Stream directly to file, no intermediate String allocation
+        serde_json::to_writer(writer, self).context("failed to write manifest")?;
+
+        fs::rename(&temp_path, path).context("failed to rename temp manifest")?;
+        Ok(())
+    }
+}
+
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
     dirs::home_dir()
@@ -84,9 +136,10 @@ fn run_impl(data_dir: &Path, claude_dir: &Path, output: &mut dyn Write) -> Resul
         export_tmux_events(&events_file, output)?;
     }
 
-    // Export Claude events
+    // Export Claude events with incremental parsing
     if claude_dir.exists() {
-        export_claude_events(claude_dir, output)?;
+        let manifest_path = data_dir.join("claude-manifest.json");
+        export_claude_events(claude_dir, &manifest_path, output)?;
     }
 
     Ok(())
@@ -168,16 +221,43 @@ fn discover_claude_logs(claude_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(logs)
 }
 
-/// Exports events from Claude session logs.
-fn export_claude_events(claude_dir: &Path, output: &mut dyn Write) -> Result<()> {
+/// Exports events from Claude session logs with incremental parsing.
+fn export_claude_events(
+    claude_dir: &Path,
+    manifest_path: &Path,
+    output: &mut dyn Write,
+) -> Result<()> {
     let logs = discover_claude_logs(claude_dir)?;
+    let mut manifest = ClaudeManifest::load(manifest_path);
+
     // Track seen sessions across ALL files to avoid duplicate session start events
     let mut seen_sessions: HashSet<String> = HashSet::new();
+    // Track which files we've processed (to clean up deleted files from manifest)
+    let mut processed_files: HashSet<PathBuf> = HashSet::new();
 
     for log_path in logs {
-        if let Err(e) = export_single_claude_log(&log_path, &mut seen_sessions, output) {
-            tracing::warn!(path = %log_path.display(), error = %e, "failed to parse Claude log");
+        let start_offset = manifest.sessions.get(&log_path).copied().unwrap_or(0);
+        match export_single_claude_log(&log_path, &mut seen_sessions, output, start_offset) {
+            Ok(final_offset) => {
+                manifest.sessions.insert(log_path.clone(), final_offset);
+                processed_files.insert(log_path);
+            }
+            Err(e) => {
+                tracing::warn!(path = %log_path.display(), error = %e, "failed to parse Claude log");
+                // Keep existing manifest entry on error (don't lose progress)
+                processed_files.insert(log_path);
+            }
         }
+    }
+
+    // Remove entries for files that no longer exist
+    manifest
+        .sessions
+        .retain(|path, _| processed_files.contains(path));
+
+    // Save manifest (log warning on failure, don't fail export)
+    if let Err(e) = manifest.save(manifest_path) {
+        tracing::warn!(error = %e, "failed to save manifest, next export may reprocess some events");
     }
 
     Ok(())
@@ -187,44 +267,74 @@ fn export_claude_events(claude_dir: &Path, output: &mut dyn Write) -> Result<()>
 const FILTERED_TYPES: &[&str] = &["progress", "file-history-snapshot", "summary", "system"];
 
 /// Exports events from a single Claude session log file.
+/// Returns the byte offset after the last successfully parsed line.
 fn export_single_claude_log(
     log_path: &Path,
     seen_sessions: &mut HashSet<String>,
     output: &mut dyn Write,
-) -> Result<()> {
+    start_offset: u64,
+) -> Result<u64> {
     let file = File::open(log_path).context("failed to open Claude log")?;
-    let reader = BufReader::new(file);
+    let file_size = file.metadata()?.len();
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                // Handle partial last line gracefully
-                if line_num > 0 {
-                    tracing::debug!(line = line_num + 1, error = %e, "incomplete line at end of file");
-                } else {
-                    tracing::warn!(line = line_num + 1, error = %e, "failed to read line");
+    // If offset is beyond file size, file was truncated - restart from 0
+    let actual_offset = if start_offset > file_size {
+        tracing::info!(
+            path = %log_path.display(),
+            start_offset,
+            file_size,
+            "file smaller than recorded offset, restarting from beginning"
+        );
+        0
+    } else {
+        start_offset
+    };
+
+    let mut reader = BufReader::with_capacity(32 * 1024, file);
+    reader.seek(SeekFrom::Start(actual_offset))?;
+
+    // Track position mathematically - avoids syscalls on every line
+    let mut current_position = actual_offset;
+    let mut last_good_position = actual_offset;
+    let mut line_num = 0;
+    // Reuse String buffer across iterations to avoid repeated allocations
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(bytes_read) => {
+                line_num += 1;
+                current_position += bytes_read as u64;
+
+                // Skip empty lines
+                if line.trim().is_empty() {
+                    last_good_position = current_position;
+                    continue;
                 }
-                continue;
+
+                let entry: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(line = line_num, error = %e, "malformed JSON in Claude log");
+                        // Don't update last_good_position - this line may be incomplete
+                        // If it's a partial line at EOF, we'll re-read it next time
+                        continue;
+                    }
+                };
+
+                process_claude_entry(&entry, seen_sessions, output)?;
+                last_good_position = current_position;
             }
-        };
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
             Err(e) => {
-                tracing::warn!(line = line_num + 1, error = %e, "malformed JSON in Claude log");
-                continue;
+                tracing::debug!(line = line_num, error = %e, "error reading line");
+                break;
             }
-        };
-
-        process_claude_entry(&entry, seen_sessions, output)?;
+        }
     }
 
-    Ok(())
+    Ok(last_good_position)
 }
 
 /// Processes a single Claude log entry and emits events.
@@ -253,8 +363,10 @@ fn process_claude_entry(
     let cwd = entry.get("cwd").and_then(Value::as_str).map(String::from);
 
     // Emit session start event (first time we see this session)
-    if seen_sessions.insert(session_id.to_string()) {
+    // Check contains() first to avoid allocation when session already seen
+    if !seen_sessions.contains(session_id) {
         emit_session_start(session_id, timestamp, cwd.as_deref(), output)?;
+        seen_sessions.insert(session_id.to_string());
     }
 
     // Process based on entry type
@@ -694,26 +806,47 @@ not valid json
 
     #[test]
     fn test_deterministic_ids() {
-        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        // Test that event IDs are deterministic - same input produces same IDs
+        // We need separate temp directories to avoid manifest affecting second run
+        let temp1 = TempDir::new().unwrap();
+        let data_dir1 = temp1.path().join(".time-tracker");
+        let claude_dir1 = temp1.path().join(".claude").join("projects");
+        fs::create_dir_all(&data_dir1).unwrap();
+        fs::create_dir_all(&claude_dir1).unwrap();
 
-        let project_dir = claude_dir.join("test-project");
-        fs::create_dir_all(&project_dir).unwrap();
+        let temp2 = TempDir::new().unwrap();
+        let data_dir2 = temp2.path().join(".time-tracker");
+        let claude_dir2 = temp2.path().join(".claude").join("projects");
+        fs::create_dir_all(&data_dir2).unwrap();
+        fs::create_dir_all(&claude_dir2).unwrap();
 
+        // Same content in both directories
         let claude_entry = r#"{"type":"user","sessionId":"sess123","timestamp":"2025-01-29T12:00:00Z","uuid":"msg-uuid","message":{"content":"hello"}}"#;
+
+        let project_dir1 = claude_dir1.join("test-project");
+        fs::create_dir_all(&project_dir1).unwrap();
         fs::write(
-            project_dir.join("session.jsonl"),
+            project_dir1.join("session.jsonl"),
             format!("{claude_entry}\n"),
         )
         .unwrap();
 
-        // Run twice
+        let project_dir2 = claude_dir2.join("test-project");
+        fs::create_dir_all(&project_dir2).unwrap();
+        fs::write(
+            project_dir2.join("session.jsonl"),
+            format!("{claude_entry}\n"),
+        )
+        .unwrap();
+
+        // Run on both directories
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir1, &claude_dir1, &mut output1).unwrap();
 
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir2, &claude_dir2, &mut output2).unwrap();
 
-        // Output should be identical
+        // Output should be identical (same IDs for same input)
         assert_eq!(output1.into_inner(), output2.into_inner());
     }
 
@@ -846,5 +979,346 @@ not valid json
             assert!(event["source"].is_string());
             assert!(event["type"].is_string());
         }
+    }
+
+    // ============ Manifest/Incremental Parsing Tests ============
+
+    #[test]
+    fn test_manifest_created_on_fresh_export() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        let entry = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello"}}"#;
+        fs::write(&log_path, format!("{entry}\n")).unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+
+        // Manifest should be created
+        let manifest_path = data_dir.join("claude-manifest.json");
+        assert!(manifest_path.exists(), "manifest should be created");
+
+        // Manifest should contain the session file with correct offset
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(
+            manifest.sessions.contains_key(&log_path),
+            "manifest should track the session file"
+        );
+
+        // Offset should be at the end of the file (after the newline)
+        let file_size = fs::metadata(&log_path).unwrap().len();
+        assert_eq!(
+            manifest.sessions[&log_path], file_size,
+            "offset should be at end of file"
+        );
+    }
+
+    #[test]
+    fn test_incremental_export_only_new_lines() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        // Initial content
+        let entry1 = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello"}}"#;
+        fs::write(&log_path, format!("{entry1}\n")).unwrap();
+
+        // First export - full parse
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        let output1_str = String::from_utf8(output1.into_inner()).unwrap();
+        let first_count = output1_str.lines().count();
+
+        // Append new content
+        let entry2 = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:01:00Z","message":{"content":"world"}}"#;
+        let mut file = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        writeln!(file, "{entry2}").unwrap();
+
+        // Second export - should only parse new bytes
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        let output2_str = String::from_utf8(output2.into_inner()).unwrap();
+        let second_count = output2_str.lines().count();
+
+        // First export: session_start + user_message = 2
+        assert_eq!(first_count, 2, "first export should have 2 events");
+
+        // Second export: session_start (re-emitted, same ID) + user_message = 2
+        // Session start is re-emitted because seen_sessions is reset between exports.
+        // The event ID is deterministic so downstream import can dedupe.
+        // The key assertion is that we only parse NEW bytes (not the old user message).
+        assert_eq!(
+            second_count, 2,
+            "second export should have session_start + new user_message"
+        );
+
+        // Verify second export has the "world" message (not the old "hello")
+        let events: Vec<Value> = output2_str
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events[0]["type"], "agent_session");
+        assert_eq!(events[1]["type"], "user_message");
+        // The key test: we should NOT have re-parsed the first user message
+        // which had content "hello" - we should only see events from the new line
+    }
+
+    #[test]
+    fn test_corrupted_manifest_full_reparse() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        let entry = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello"}}"#;
+        fs::write(&log_path, format!("{entry}\n")).unwrap();
+
+        // Write corrupted manifest
+        let manifest_path = data_dir.join("claude-manifest.json");
+        fs::write(&manifest_path, "not valid json {{{").unwrap();
+
+        // Export should succeed with full re-parse
+        let mut output = Cursor::new(Vec::new());
+        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        assert!(
+            result.is_ok(),
+            "export should succeed despite corrupted manifest"
+        );
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        // Should have session_start + user_message = 2 (full re-parse)
+        assert_eq!(output_str.lines().count(), 2);
+    }
+
+    #[test]
+    fn test_file_truncated_restart_from_zero() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        // Initial large content
+        let entry1 = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello world this is a longer message"}}"#;
+        fs::write(&log_path, format!("{entry1}\n")).unwrap();
+
+        // First export
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+
+        // Record the offset
+        let manifest_path = data_dir.join("claude-manifest.json");
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let old_offset = manifest.sessions[&log_path];
+
+        // Replace file with shorter content (simulating truncation)
+        let entry2 = r#"{"type":"user","sessionId":"sess2","timestamp":"2025-01-29T13:00:00Z","message":{"content":"hi"}}"#;
+        fs::write(&log_path, format!("{entry2}\n")).unwrap();
+
+        // Verify new file is smaller
+        let new_size = fs::metadata(&log_path).unwrap().len();
+        assert!(
+            new_size < old_offset,
+            "new file should be smaller than old offset"
+        );
+
+        // Second export should restart from 0
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+
+        let output2_str = String::from_utf8(output2.into_inner()).unwrap();
+        // Should have session_start + user_message = 2 (full re-parse from start)
+        assert_eq!(output2_str.lines().count(), 2);
+
+        // Verify we got sess2 (not trying to read at invalid offset)
+        let events: Vec<Value> = output2_str
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let session_event = &events[0];
+        assert_eq!(session_event["data"]["session_id"], "sess2");
+    }
+
+    #[test]
+    fn test_deleted_file_removed_from_manifest() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        let entry = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello"}}"#;
+        fs::write(&log_path, format!("{entry}\n")).unwrap();
+
+        // First export
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+
+        // Verify manifest has the file
+        let manifest_path = data_dir.join("claude-manifest.json");
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(manifest.sessions.contains_key(&log_path));
+
+        // Delete the file
+        fs::remove_file(&log_path).unwrap();
+
+        // Second export
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+
+        // Manifest should no longer contain the deleted file
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(
+            !manifest.sessions.contains_key(&log_path),
+            "deleted file should be removed from manifest"
+        );
+    }
+
+    #[test]
+    fn test_multiple_files_tracked_independently() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let log1_path = project_dir.join("session1.jsonl");
+        let log2_path = project_dir.join("session2.jsonl");
+
+        let entry1 = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"file1"}}"#;
+        let entry2 = r#"{"type":"user","sessionId":"sess2","timestamp":"2025-01-29T12:00:00Z","message":{"content":"file2"}}"#;
+        fs::write(&log1_path, format!("{entry1}\n")).unwrap();
+        fs::write(&log2_path, format!("{entry2}\n")).unwrap();
+
+        // First export
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        let output1_str = String::from_utf8(output1.into_inner()).unwrap();
+        // 2 sessions x (session_start + user_message) = 4 events
+        assert_eq!(output1_str.lines().count(), 4);
+
+        // Verify manifest has both files
+        let manifest_path = data_dir.join("claude-manifest.json");
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.sessions.len(), 2);
+        assert!(manifest.sessions.contains_key(&log1_path));
+        assert!(manifest.sessions.contains_key(&log2_path));
+
+        // Append to only one file
+        let entry3 = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:01:00Z","message":{"content":"more"}}"#;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&log1_path)
+            .unwrap();
+        writeln!(file, "{entry3}").unwrap();
+
+        // Second export
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+
+        let output2_str = String::from_utf8(output2.into_inner()).unwrap();
+        // session_start (re-emitted for sess1) + user_message = 2 events
+        // No events from file2 (no new content)
+        assert_eq!(output2_str.lines().count(), 2);
+
+        // Verify the events are from sess1
+        let events: Vec<Value> = output2_str
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events[0]["data"]["session_id"], "sess1");
+        assert_eq!(events[1]["data"]["session_id"], "sess1");
+    }
+
+    #[test]
+    fn test_offset_at_eof_no_new_content() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        let entry = r#"{"type":"user","sessionId":"sess1","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hello"}}"#;
+        fs::write(&log_path, format!("{entry}\n")).unwrap();
+
+        // First export
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+
+        // Second export without any changes
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+
+        // Should have no output (no new content)
+        assert!(output2.get_ref().is_empty());
+    }
+
+    #[test]
+    fn test_empty_file_handled_gracefully() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let log_path = project_dir.join("session.jsonl");
+
+        // Create empty file
+        fs::write(&log_path, "").unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        let result = run_impl(&data_dir, &claude_dir, &mut output);
+
+        assert!(result.is_ok());
+        assert!(output.get_ref().is_empty());
+
+        // Manifest should track the file with offset 0
+        let manifest_path = data_dir.join("claude-manifest.json");
+        let manifest: ClaudeManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.sessions[&log_path], 0);
+    }
+
+    #[test]
+    fn test_bufreader_stream_position_semantics() {
+        // Unit test to verify BufReader behavior: after reading lines,
+        // stream_position should give us the position to resume from
+        use std::io::Cursor;
+
+        let content = "line1\nline2\nline3\n";
+        let cursor = Cursor::new(content.as_bytes().to_vec());
+        let mut reader = BufReader::new(cursor);
+
+        // Read first two lines
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "line1\n");
+
+        let pos_after_line1 = reader.stream_position().unwrap();
+        assert_eq!(pos_after_line1, 6); // "line1\n" = 6 bytes
+
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "line2\n");
+
+        let pos_after_line2 = reader.stream_position().unwrap();
+        assert_eq!(pos_after_line2, 12); // 6 + "line2\n" = 12 bytes
+
+        // Now create a new reader and seek to pos_after_line1
+        let cursor2 = Cursor::new(content.as_bytes().to_vec());
+        let mut reader2 = BufReader::new(cursor2);
+        reader2.seek(SeekFrom::Start(pos_after_line1)).unwrap();
+
+        line.clear();
+        reader2.read_line(&mut line).unwrap();
+        assert_eq!(line, "line2\n", "should resume at line2");
     }
 }
