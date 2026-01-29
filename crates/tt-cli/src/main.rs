@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{export, ingest};
+use tt_cli::commands::{export, import, ingest};
 use tt_cli::{Cli, Commands, Config, IngestEvent};
 
 fn main() -> Result<()> {
@@ -39,6 +39,21 @@ fn main() -> Result<()> {
         Some(Commands::Export) => {
             // Export doesn't need config - just reads files and outputs to stdout
             export::run()?;
+        }
+        Some(Commands::Import) => {
+            // Import needs config for database path
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            tracing::debug!(?config, "loaded configuration");
+
+            // Ensure parent directory exists
+            if let Some(parent) = config.database_path.parent() {
+                std::fs::create_dir_all(parent).context("failed to create database directory")?;
+            }
+
+            let db =
+                tt_db::Database::open(&config.database_path).context("failed to open database")?;
+            import::run(&db)?;
         }
         Some(Commands::Status) => {
             // Load configuration only when needed

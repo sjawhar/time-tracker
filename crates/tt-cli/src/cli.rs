@@ -40,6 +40,12 @@ pub enum Commands {
     /// Reads events from `~/.time-tracker/events.jsonl` and parses Claude Code
     /// session logs, outputting combined events as JSONL to stdout.
     Export,
+
+    /// Import events from stdin into local `SQLite` database.
+    ///
+    /// Events are expected as JSONL (one JSON object per line).
+    /// Duplicate events (same ID) are silently ignored.
+    Import,
 }
 
 /// Event types that can be ingested.
