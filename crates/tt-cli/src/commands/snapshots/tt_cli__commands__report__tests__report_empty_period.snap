@@ -1,0 +1,9 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+expression: output
+---
+TIME REPORT: Week of Jan 27, 2025
+
+No events recorded this week.
+
+Hint: Run 'tt status' to check tracking health.

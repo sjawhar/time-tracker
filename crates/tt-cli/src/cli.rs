@@ -93,6 +93,53 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Generate a time report.
+    ///
+    /// Shows time spent across streams, grouped by tags (when available).
+    /// Default period is the current week.
+    Report {
+        /// Current week (Monday to Sunday). This is the default.
+        #[arg(long, group = "period")]
+        week: bool,
+
+        /// Previous week.
+        #[arg(long, group = "period")]
+        last_week: bool,
+
+        /// Today.
+        #[arg(long, group = "period")]
+        day: bool,
+
+        /// Yesterday.
+        #[arg(long, group = "period")]
+        last_day: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Shortcut for `report --week`.
+    Week {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Shortcut for `report --day`.
+    Today {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Shortcut for `report --last-day`.
+    Yesterday {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Event types that can be ingested.
