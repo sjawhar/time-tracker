@@ -20,7 +20,7 @@ See [components.md](components.md) for detailed component breakdown and architec
 | Decision | Summary | ADR |
 |----------|---------|-----|
 | Event transport | Pull-based sync via SSH | [ADR-001](decisions/001-event-transport.md) |
-| Tech stack | Shell stub (remote) + Python (local) | [tech-stack.md](../implementation/tech-stack.md) |
+| Tech stack | Rust everywhere | [tech-stack.md](../implementation/tech-stack.md) |
 | Event IDs | Deterministic content hash | [data-model.md](../design/data-model.md) |
 
 ---

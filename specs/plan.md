@@ -6,20 +6,20 @@ Linear task list for Time Tracker MVP.
 
 - [x] `design/data-model.md` — Event schema, deterministic IDs, UTC timestamps
 - [x] `research/technical-foundations.md` — tmux hooks, agent logs documented
-- [x] `implementation/tech-stack.md` — Shell stub + Python
+- [x] `implementation/tech-stack.md` — Rust everywhere
 - [x] `architecture/components.md` — Simplified architecture (no daemon)
 - [x] `architecture/decisions/001-event-transport.md` — Pull-based sync via SSH
 
 ## Prototype Implementation (Remote)
 
-- [ ] Create `tt ingest` command (shell script or Python, appends to `events.jsonl`)
+- [ ] Set up Rust workspace
+- [ ] Create `tt ingest` command 
 - [ ] Configure tmux hook in `~/.tmux.conf` (calls `tt ingest` on pane-focus-in)
 - [ ] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
 - [ ] Create Claude log manifest for incremental parsing
 
 ## Prototype Implementation (Local)
 
-- [ ] Set up Python project with `uv`
 - [ ] Implement SQLite event store (schema from `data-model.md`)
 - [ ] Implement `tt import` command (reads events from stdin, inserts to SQLite)
 - [ ] Implement `tt sync <remote>` command (SSH + `tt export` + `tt import`)
