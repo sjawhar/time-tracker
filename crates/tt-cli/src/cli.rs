@@ -83,6 +83,16 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Recompute direct/delegated time for streams.
+    ///
+    /// Uses the attention allocation algorithm to calculate time based on
+    /// focus events (tmux pane focus, AFK, scroll) and agent activity.
+    Recompute {
+        /// Recompute all streams, not just those marked as needing recomputation.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Event types that can be ingested.

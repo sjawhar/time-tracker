@@ -166,6 +166,29 @@ impl tt_core::InferableEvent for StoredEvent {
     }
 }
 
+// Implement AllocatableEvent for StoredEvent so it can be used with the time allocation algorithm
+impl tt_core::AllocatableEvent for StoredEvent {
+    fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    fn stream_id(&self) -> Option<&str> {
+        self.stream_id.as_deref()
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    fn data(&self) -> &serde_json::Value {
+        &self.data
+    }
+}
+
 /// Database connection wrapper.
 ///
 /// See the [module documentation](self) for thread safety considerations.
@@ -749,6 +772,72 @@ impl Database {
             [],
         )?;
         Ok(count as u64)
+    }
+
+    /// Updates time fields for multiple streams.
+    ///
+    /// Also clears the `needs_recompute` flag and updates `updated_at`.
+    ///
+    /// Returns the number of streams updated.
+    pub fn update_stream_times(&self, times: &[tt_core::StreamTime]) -> Result<u64, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut count = 0u64;
+
+        {
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let mut stmt = tx.prepare(
+                "UPDATE streams SET time_direct_ms = ?1, time_delegated_ms = ?2, updated_at = ?3, needs_recompute = 0
+                 WHERE id = ?4",
+            )?;
+
+            for time in times {
+                let rows = stmt.execute(params![
+                    time.time_direct_ms,
+                    time.time_delegated_ms,
+                    now,
+                    time.stream_id,
+                ])?;
+                count += rows as u64;
+            }
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Marks streams as needing recomputation.
+    ///
+    /// Returns the number of streams updated.
+    pub fn mark_streams_for_recompute(&self, stream_ids: &[&str]) -> Result<u64, DbError> {
+        if stream_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = stream_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE streams SET needs_recompute = 1 WHERE id IN ({placeholders})");
+
+        let params: Vec<&dyn rusqlite::ToSql> = stream_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+
+        let count = self.conn.execute(&sql, params.as_slice())?;
+        Ok(count as u64)
+    }
+
+    /// Gets streams that need recomputation.
+    pub fn get_streams_needing_recompute(&self) -> Result<Vec<Stream>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
+             FROM streams WHERE needs_recompute = 1",
+        )?;
+
+        let mut streams = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            streams.push(Self::row_to_stream(row)?);
+        }
+        Ok(streams)
     }
 
     /// Helper to convert a row to a Stream.
