@@ -51,6 +51,18 @@ pub enum DbError {
     SchemaVersionMismatch { found: i32, expected: i32 },
 }
 
+/// Status of events from a single source.
+///
+/// Used by the `tt status` command to show the most recent event per source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStatus {
+    /// The event source (e.g., "remote.tmux", "remote.agent").
+    pub source: String,
+
+    /// Timestamp of the most recent event from this source.
+    pub last_timestamp: DateTime<Utc>,
+}
+
 /// An event stored in the database.
 ///
 /// This type represents both events being inserted and events being read.
@@ -338,6 +350,45 @@ impl Database {
         }
 
         Ok(events)
+    }
+
+    /// Returns the most recent event timestamp for each source.
+    ///
+    /// Results are ordered by timestamp descending (most recent first).
+    /// Returns an empty vector if the database has no events.
+    pub fn get_last_event_per_source(&self) -> Result<Vec<SourceStatus>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, MAX(timestamp) as last_timestamp
+             FROM events
+             GROUP BY source
+             ORDER BY last_timestamp DESC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let source: String = row.get(0)?;
+            let timestamp_str: String = row.get(1)?;
+            Ok((source, timestamp_str))
+        })?;
+
+        let mut statuses = Vec::new();
+        for row_result in rows {
+            let (source, timestamp_str) = row_result?;
+
+            let last_timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    tracing::warn!(source = %source, error = %e, "skipping source with malformed timestamp");
+                    continue;
+                }
+            };
+
+            statuses.push(SourceStatus {
+                source,
+                last_timestamp,
+            });
+        }
+
+        Ok(statuses)
     }
 }
 
@@ -627,5 +678,99 @@ mod tests {
             }
             DbError::Sqlite(_) => panic!("expected SchemaVersionMismatch error"),
         }
+    }
+
+    fn make_event_with_source(id: &str, timestamp: DateTime<Utc>, source: &str) -> StoredEvent {
+        StoredEvent {
+            id: id.to_string(),
+            timestamp,
+            event_type: "test_event".to_string(),
+            source: source.to_string(),
+            schema_version: 1,
+            data: json!({}),
+            cwd: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn test_get_last_event_per_source_empty() {
+        let db = Database::open_in_memory().unwrap();
+        let statuses = db.get_last_event_per_source().unwrap();
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn test_get_last_event_per_source_single_source() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+
+        db.insert_event(&make_event_with_source("e1", ts1, "remote.tmux"))
+            .unwrap();
+        db.insert_event(&make_event_with_source("e2", ts2, "remote.tmux"))
+            .unwrap();
+
+        let statuses = db.get_last_event_per_source().unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, "remote.tmux");
+        assert_eq!(statuses[0].last_timestamp, ts2); // Should be the later timestamp
+    }
+
+    #[test]
+    fn test_get_last_event_per_source_multiple_sources() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts_tmux_old = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let ts_tmux_new = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let ts_agent = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+        db.insert_event(&make_event_with_source("e1", ts_tmux_old, "remote.tmux"))
+            .unwrap();
+        db.insert_event(&make_event_with_source("e2", ts_tmux_new, "remote.tmux"))
+            .unwrap();
+        db.insert_event(&make_event_with_source("e3", ts_agent, "remote.agent"))
+            .unwrap();
+
+        let statuses = db.get_last_event_per_source().unwrap();
+
+        assert_eq!(statuses.len(), 2);
+
+        // Find each source in results (order is by last_timestamp DESC)
+        let tmux_status = statuses.iter().find(|s| s.source == "remote.tmux").unwrap();
+        let agent_status = statuses
+            .iter()
+            .find(|s| s.source == "remote.agent")
+            .unwrap();
+
+        assert_eq!(tmux_status.last_timestamp, ts_tmux_new);
+        assert_eq!(agent_status.last_timestamp, ts_agent);
+    }
+
+    #[test]
+    fn test_get_last_event_per_source_ordered_by_timestamp() {
+        let db = Database::open_in_memory().unwrap();
+
+        // remote.agent has the most recent event
+        let ts_tmux = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts_agent = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+        let ts_local = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+
+        db.insert_event(&make_event_with_source("e1", ts_tmux, "remote.tmux"))
+            .unwrap();
+        db.insert_event(&make_event_with_source("e2", ts_agent, "remote.agent"))
+            .unwrap();
+        db.insert_event(&make_event_with_source("e3", ts_local, "local.window"))
+            .unwrap();
+
+        let statuses = db.get_last_event_per_source().unwrap();
+
+        assert_eq!(statuses.len(), 3);
+        // Should be ordered by timestamp DESC (most recent first)
+        assert_eq!(statuses[0].source, "remote.agent"); // 12:00
+        assert_eq!(statuses[1].source, "local.window"); // 11:00
+        assert_eq!(statuses[2].source, "remote.tmux"); // 10:00
     }
 }
