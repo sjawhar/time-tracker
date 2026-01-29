@@ -12,8 +12,8 @@ Linear task list for Time Tracker MVP.
 
 ## Prototype Implementation (Remote)
 
-- [ ] Set up Rust workspace
-- [ ] Create `tt ingest` command 
+- [x] Set up Rust workspace
+- [x] Create `tt ingest` command
 - [ ] Configure tmux hook in `~/.tmux.conf` (calls `tt ingest` on pane-focus-in)
 - [ ] Create `tt export` command (reads `events.jsonl` + parses Claude logs, outputs combined stream)
 - [ ] Create Claude log manifest for incremental parsing
