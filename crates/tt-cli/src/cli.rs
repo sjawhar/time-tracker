@@ -57,6 +57,20 @@ pub enum Commands {
         /// Uses your SSH config for custom ports/keys. Configure in ~/.ssh/config.
         remote: String,
     },
+
+    /// Query events from local database (debugging).
+    ///
+    /// Outputs all events as JSONL (one JSON object per line).
+    /// Use --after/--before to limit range for large databases.
+    Events {
+        /// Only show events after this timestamp (ISO 8601).
+        #[arg(long)]
+        after: Option<String>,
+
+        /// Only show events before this timestamp (ISO 8601).
+        #[arg(long)]
+        before: Option<String>,
+    },
 }
 
 /// Event types that can be ingested.

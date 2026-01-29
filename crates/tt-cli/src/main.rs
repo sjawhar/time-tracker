@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{export, import, ingest, sync};
+use tt_cli::commands::{events, export, import, ingest, sync};
 use tt_cli::{Cli, Commands, Config, IngestEvent};
 
 fn main() -> Result<()> {
@@ -69,6 +69,21 @@ fn main() -> Result<()> {
             let db =
                 tt_db::Database::open(&config.database_path).context("failed to open database")?;
             sync::run(&db, remote)?;
+        }
+        Some(Commands::Events { after, before }) => {
+            // Events command needs config for database path
+            let config =
+                Config::load_from(cli.config.as_deref()).context("failed to load configuration")?;
+            tracing::debug!(?config, "loaded configuration");
+
+            // Ensure parent directory exists
+            if let Some(parent) = config.database_path.parent() {
+                std::fs::create_dir_all(parent).context("failed to create database directory")?;
+            }
+
+            let db =
+                tt_db::Database::open(&config.database_path).context("failed to open database")?;
+            events::run(&db, after.as_deref(), before.as_deref())?;
         }
         Some(Commands::Status) => {
             // Load configuration only when needed
