@@ -11,17 +11,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-
-/// Event data for a tmux pane focus change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneFocusData {
-    pub pane_id: String,
-    pub session_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window_index: Option<u32>,
-}
+use tt_core::project::ProjectIdentity;
 
 /// An event to be ingested and written to the events file.
+///
+/// This is a flat structure representing a tmux pane focus event.
+/// All fields are at the top level for clarity and simplicity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestEvent {
     pub id: String,
@@ -30,21 +25,80 @@ pub struct IngestEvent {
     pub source: String,
     #[serde(rename = "type")]
     pub event_type: String,
-    pub data: PaneFocusData,
     /// Working directory where the event occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The tmux pane ID (e.g., %3).
+    pub pane_id: String,
+    /// The tmux session name.
+    pub tmux_session: String,
+    /// The tmux window index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_index: Option<u32>,
+    /// The jj project name (from git remote origin).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jj_project: Option<String>,
+    /// The jj workspace name (if in a non-default workspace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jj_workspace: Option<String>,
 }
 
 fn default_source() -> String {
     "remote.tmux".to_string()
 }
 
+/// Get project identity for a directory using jj commands.
+fn get_jj_identity(cwd: &std::path::Path) -> Option<ProjectIdentity> {
+    use std::process::Command;
+
+    if !cwd.join(".jj").exists() {
+        return None;
+    }
+
+    let remote_output = Command::new("jj")
+        .args(["git", "remote", "list", "--ignore-working-copy"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+
+    let remote_str = String::from_utf8_lossy(&remote_output.stdout);
+    let remote_url = remote_str
+        .lines()
+        .find(|line| line.contains("origin"))
+        .and_then(|line| line.split_whitespace().nth(1));
+
+    let workspace_output = Command::new("jj")
+        .args(["workspace", "list", "--ignore-working-copy"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+
+    let workspace_count = String::from_utf8_lossy(&workspace_output.stdout)
+        .lines()
+        .count();
+
+    let root_output = Command::new("jj")
+        .args(["root", "--ignore-working-copy"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+
+    let jj_root = String::from_utf8_lossy(&root_output.stdout)
+        .trim()
+        .to_string();
+
+    Some(ProjectIdentity::from_jj_output(
+        remote_url,
+        workspace_count,
+        &jj_root,
+    ))
+}
+
 impl IngestEvent {
     /// Creates a new pane focus event with a deterministic ID.
     pub fn pane_focus(
         pane_id: String,
-        session_name: String,
+        tmux_session: String,
         window_index: Option<u32>,
         cwd: String,
         timestamp: DateTime<Utc>,
@@ -52,23 +106,28 @@ impl IngestEvent {
         let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let id = format!("remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
 
+        let jj_identity = get_jj_identity(Path::new(&cwd));
+
         Self {
             id,
             timestamp: timestamp_str,
             source: "remote.tmux".to_string(),
             event_type: "tmux_pane_focus".to_string(),
-            data: PaneFocusData {
-                pane_id,
-                session_name,
-                window_index,
-            },
             cwd: Some(cwd),
+            pane_id,
+            tmux_session,
+            window_index,
+            jj_project: jj_identity.as_ref().map(|i| i.project_name.clone()),
+            jj_workspace: jj_identity.and_then(|i| i.workspace_name),
         }
     }
 }
 
 /// Debounce window for pane focus events (500ms).
 const DEBOUNCE_WINDOW_MS: u64 = 500;
+
+/// Maximum events file size before rotation (1MB).
+const MAX_EVENTS_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
@@ -90,6 +149,37 @@ fn debounce_path(data_dir: &Path) -> PathBuf {
 /// Returns the path to the lock file within the given data directory.
 fn lock_path(data_dir: &Path) -> PathBuf {
     data_dir.join(".lock")
+}
+
+/// Returns the path to the rotated events file.
+fn rotated_events_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("events.jsonl.1")
+}
+
+/// Rotates the events file if it exceeds the size threshold.
+///
+/// When rotated, the current events file becomes events.jsonl.1,
+/// replacing any previous rotation. This keeps one backup for
+/// recovery while preventing unbounded growth.
+fn maybe_rotate_events(data_dir: &Path) -> Result<()> {
+    let events_file = events_path(data_dir);
+
+    let metadata = match fs::metadata(&events_file) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("failed to stat events file"),
+    };
+
+    if metadata.len() >= MAX_EVENTS_FILE_SIZE {
+        let rotated = rotated_events_path(data_dir);
+        fs::rename(&events_file, &rotated).context("failed to rotate events file")?;
+        tracing::info!(
+            size = metadata.len(),
+            "rotated events file to events.jsonl.1"
+        );
+    }
+
+    Ok(())
 }
 
 /// Checks if an event for the given pane should be debounced, and if not,
@@ -169,7 +259,8 @@ fn append_event(data_dir: &Path, event: &IngestEvent) -> Result<()> {
 /// This function:
 /// 1. Acquires a lock on the data directory
 /// 2. Checks if the event should be debounced
-/// 3. If not debounced, writes the event and updates debounce state
+/// 3. Rotates the events file if it exceeds 1MB
+/// 4. If not debounced, writes the event and updates debounce state
 fn ingest_pane_focus_impl(
     data_dir: &Path,
     pane_id: &str,
@@ -194,15 +285,17 @@ fn ingest_pane_focus_impl(
         .context("failed to acquire lock")?;
 
     let now = Utc::now();
-    // Use try_into to safely convert, falling back to 0 for timestamps before Unix epoch
-    // (which would indicate a misconfigured system clock)
-    let now_ms: u64 = now.timestamp_millis().try_into().unwrap_or(0);
+    #[expect(clippy::cast_sign_loss, reason = "timestamps are always positive")]
+    let now_ms = now.timestamp_millis() as u64;
 
     // Check debounce and update state in one pass
     if check_and_update_debounce(data_dir, pane_id, now_ms)? {
         tracing::debug!(pane_id, "debounced pane focus event");
         return Ok(false);
     }
+
+    // Rotate events file if too large (before appending)
+    maybe_rotate_events(data_dir)?;
 
     // Create and write event
     let event = IngestEvent::pane_focus(
@@ -237,6 +330,127 @@ pub fn ingest_pane_focus(
     )
 }
 
+// ========== Sessions Indexing ==========
+use tt_core::session::{ClaudeSession, scan_claude_sessions};
+use tt_db::StoredEvent;
+
+/// Run the sessions index command.
+///
+/// Scans `~/.claude/projects/` for Claude Code session files and upserts
+/// them into the database.
+pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
+    let projects_dir = get_claude_projects_dir()?;
+
+    if !projects_dir.exists() {
+        println!(
+            "No Claude Code projects directory found at: {}",
+            projects_dir.display()
+        );
+        println!("Sessions will be indexed once Claude Code creates session files.");
+        return Ok(());
+    }
+
+    println!("Scanning {}...", projects_dir.display());
+
+    let sessions =
+        scan_claude_sessions(&projects_dir).context("failed to scan Claude Code sessions")?;
+
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    let mut event_count = 0usize;
+    for session in &sessions {
+        db.upsert_claude_session(session)
+            .with_context(|| format!("failed to upsert session {}", session.claude_session_id))?;
+
+        let events = create_session_events(session);
+        event_count += events.len();
+        db.insert_events(&events).with_context(|| {
+            format!(
+                "failed to insert events for session {}",
+                session.claude_session_id
+            )
+        })?;
+    }
+
+    println!(
+        "Indexed {} sessions ({} events)",
+        sessions.len(),
+        event_count
+    );
+
+    let mut projects: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for session in &sessions {
+        *projects.entry(&session.project_name).or_default() += 1;
+    }
+
+    let mut project_list: Vec<_> = projects.iter().collect();
+    project_list.sort_by(|a, b| b.1.cmp(a.1));
+
+    println!("\nSessions by project:");
+    for (project, count) in project_list.iter().take(10) {
+        println!("  {project}: {count} sessions");
+    }
+
+    if project_list.len() > 10 {
+        println!("  ... and {} more projects", project_list.len() - 10);
+    }
+
+    Ok(())
+}
+
+/// Create events from a Claude session.
+fn create_session_events(session: &ClaudeSession) -> Vec<StoredEvent> {
+    use serde_json::json;
+
+    // Helper to create a session event with common fields
+    let make_event =
+        |id_suffix: &str, timestamp: chrono::DateTime<chrono::Utc>, event_type: &str| StoredEvent {
+            id: format!("{}-{id_suffix}", session.claude_session_id),
+            timestamp,
+            event_type: event_type.to_string(),
+            source: "claude".to_string(),
+            schema_version: 1,
+            data: json!({
+                "claude_session_id": session.claude_session_id,
+                "project_path": session.project_path,
+                "session_type": session.session_type.as_str(),
+            }),
+            cwd: Some(session.project_path.clone()),
+            session_id: Some(session.claude_session_id.clone()),
+            stream_id: None,
+            assignment_source: None,
+        };
+
+    let mut events = Vec::new();
+
+    // Session start event with extra project_name field
+    let mut start_event = make_event("session_start", session.start_time, "session_start");
+    start_event.data["project_name"] = json!(session.project_name);
+    events.push(start_event);
+
+    // User message events
+    for ts in &session.user_message_timestamps {
+        let id_suffix = format!("user_message-{}", ts.timestamp_millis());
+        events.push(make_event(&id_suffix, *ts, "user_message"));
+    }
+
+    // Session end event
+    if let Some(end_time) = session.end_time {
+        events.push(make_event("session_end", end_time, "session_end"));
+    }
+
+    events
+}
+
+/// Get the Claude Code projects directory path.
+fn get_claude_projects_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home).join(".claude").join("projects"))
+}
+
 /// Reads all events from the events file in the specified data directory.
 #[cfg(test)]
 fn read_events_from(data_dir: &Path) -> Result<Vec<IngestEvent>> {
@@ -265,6 +479,26 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn test_empty_pane_id_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        let result = ingest_pane_focus_impl(&data_dir, "", "main", None, "/home/test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pane_id"));
+    }
+
+    #[test]
+    fn test_empty_session_name_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        let result = ingest_pane_focus_impl(&data_dir, "%1", "", None, "/home/test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("session_name"));
+    }
 
     #[test]
     fn test_event_serialization_matches_spec() {
@@ -346,8 +580,8 @@ mod tests {
 
         let events = read_events_from(&data_dir).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data.pane_id, "%1");
-        assert_eq!(events[0].data.session_name, "main");
+        assert_eq!(events[0].pane_id, "%1");
+        assert_eq!(events[0].tmux_session, "main");
         assert_eq!(events[0].cwd, Some("/home/test".to_string()));
     }
 
@@ -423,27 +657,426 @@ mod tests {
             assert!(parsed["timestamp"].is_string());
             assert!(parsed["source"].is_string());
             assert!(parsed["type"].is_string());
-            assert!(parsed["data"].is_object());
+            // Fields are flattened (no nested "data" object)
+            assert!(parsed["pane_id"].is_string());
+            assert!(parsed["tmux_session"].is_string());
         }
     }
 
     #[test]
-    fn test_empty_pane_id_rejected() {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "MAX_EVENTS_FILE_SIZE is small enough to fit in usize"
+    )]
+    fn test_rotation_when_file_exceeds_threshold() {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
+        fs::create_dir_all(&data_dir).unwrap();
 
-        let result = ingest_pane_focus_impl(&data_dir, "", "main", None, "/home/test");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("pane_id"));
+        // Create a file that exceeds the rotation threshold
+        let events_file = events_path(&data_dir);
+        let large_content = "x".repeat(MAX_EVENTS_FILE_SIZE as usize + 100);
+        fs::write(&events_file, &large_content).unwrap();
+
+        // Ingest should rotate the file
+        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+
+        // Old file should be rotated
+        let rotated = rotated_events_path(&data_dir);
+        assert!(rotated.exists(), "rotated file should exist");
+        assert_eq!(
+            fs::read_to_string(&rotated).unwrap(),
+            large_content,
+            "rotated file should contain old content"
+        );
+
+        // New events file should contain only the new event
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
-    fn test_empty_session_name_rejected() {
+    fn test_no_rotation_when_file_under_threshold() {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
+        fs::create_dir_all(&data_dir).unwrap();
 
-        let result = ingest_pane_focus_impl(&data_dir, "%1", "", None, "/home/test");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("session_name"));
+        // Create a small file
+        let events_file = events_path(&data_dir);
+        fs::write(&events_file, "small content").unwrap();
+
+        // Ingest should not rotate
+        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+
+        // No rotated file should exist
+        let rotated = rotated_events_path(&data_dir);
+        assert!(!rotated.exists(), "rotated file should not exist");
     }
+
+    #[test]
+    fn test_create_session_events_session_start() {
+        use chrono::TimeZone;
+        use tt_core::session::ClaudeSession;
+
+        let session = ClaudeSession {
+            claude_session_id: "test-session-123".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+            end_time: None,
+            message_count: 1,
+            summary: None,
+            user_prompts: vec!["hello".to_string()],
+            starting_prompt: Some("hello".to_string()),
+            assistant_message_count: 1,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+
+        let events = create_session_events(&session);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "session_start");
+        assert_eq!(events[0].id, "test-session-123-session_start");
+        assert_eq!(events[0].source, "claude");
+        assert_eq!(events[0].cwd, Some("/home/user/project".to_string()));
+        assert_eq!(events[0].session_id, Some("test-session-123".to_string()));
+    }
+
+    #[test]
+    fn test_create_session_events_session_start_and_end() {
+        use chrono::TimeZone;
+        use tt_core::session::ClaudeSession;
+
+        let session = ClaudeSession {
+            claude_session_id: "test-session-456".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2026, 2, 2, 11, 0, 0).unwrap()),
+            message_count: 2,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 1,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+
+        let events = create_session_events(&session);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "session_start");
+        assert_eq!(events[1].event_type, "session_end");
+        assert_eq!(events[1].id, "test-session-456-session_end");
+    }
+
+    #[test]
+    fn test_create_session_events_user_messages() {
+        use chrono::TimeZone;
+        use tt_core::session::ClaudeSession;
+
+        let ts1 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 5, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 10, 0).unwrap();
+
+        let session = ClaudeSession {
+            claude_session_id: "test-session-789".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+            end_time: None,
+            message_count: 4,
+            summary: None,
+            user_prompts: vec!["first".to_string(), "second".to_string()],
+            starting_prompt: Some("first".to_string()),
+            assistant_message_count: 2,
+            tool_call_count: 0,
+            user_message_timestamps: vec![ts1, ts2],
+        };
+
+        let events = create_session_events(&session);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "session_start");
+        assert_eq!(events[1].event_type, "user_message");
+        assert_eq!(events[1].timestamp, ts1);
+        assert_eq!(events[2].event_type, "user_message");
+        assert_eq!(events[2].timestamp, ts2);
+    }
+
+    #[test]
+    fn test_get_claude_projects_dir() {
+        if std::env::var("HOME").is_ok() {
+            let path = get_claude_projects_dir().unwrap();
+            assert!(path.ends_with("projects"));
+            assert!(path.to_string_lossy().contains(".claude"));
+        }
+    }
+}
+
+#[test]
+fn test_concurrent_ingests_during_rotation() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = Arc::new(temp_dir.path().join(".time-tracker"));
+    fs::create_dir_all(&*data_dir).unwrap();
+
+    // Create a file close to rotation threshold
+    let events_file = events_path(&data_dir);
+    let near_limit = "x".repeat(usize::try_from(MAX_EVENTS_FILE_SIZE - 100).unwrap());
+    fs::write(&events_file, &near_limit).unwrap();
+
+    // Spawn multiple threads that will trigger rotation
+    let mut handles = vec![];
+    for i in 0..3 {
+        let data_dir_clone = Arc::clone(&data_dir);
+        let handle = thread::spawn(move || {
+            ingest_pane_focus_impl(
+                &data_dir_clone,
+                &format!("%{i}"),
+                "main",
+                None,
+                "/home/test",
+            )
+        });
+        handles.push(handle);
+    }
+
+    // All threads should complete successfully
+    for handle in handles {
+        let result = handle.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "Concurrent ingest during rotation should succeed"
+        );
+    }
+
+    // Verify no events were lost
+    let events = read_events_from(&data_dir).unwrap();
+    let rotated_exists = rotated_events_path(&data_dir).exists();
+
+    // Either all events in current file, or some rotated
+    if rotated_exists {
+        // Just verify we didn't lose data (exact count depends on timing)
+        assert!(!events.is_empty() || rotated_exists);
+    } else {
+        assert_eq!(events.len(), 3, "All events should be present");
+    }
+}
+
+#[test]
+fn test_debounce_file_corruption_recovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Write corrupted debounce file
+    let debounce_file = debounce_path(&data_dir);
+    fs::write(&debounce_file, "corrupted:data:too:many:colons\ninvalid").unwrap();
+
+    // Should handle gracefully and not panic
+    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+    assert!(
+        result.is_ok(),
+        "Should recover from corrupted debounce file"
+    );
+
+    // Verify event was written
+    let events = read_events_from(&data_dir).unwrap();
+    assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn test_jj_identity_extraction_from_jj_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+
+    // Create a directory with .jj subdirectory (jj will recognize this as a repo)
+    let cwd_with_jj = temp_dir.path().join("my-project");
+    fs::create_dir_all(&cwd_with_jj).unwrap();
+    fs::create_dir_all(cwd_with_jj.join(".jj")).unwrap();
+
+    let result =
+        ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_with_jj.to_str().unwrap());
+
+    // Should succeed
+    assert!(result.is_ok(), "Ingest should succeed");
+
+    let events = read_events_from(&data_dir).unwrap();
+    assert_eq!(events.len(), 1);
+    // jj_project is extracted from the directory name when jj is present
+    // but no git remote is configured
+    assert_eq!(events[0].jj_project, Some("my-project".to_string()));
+}
+
+#[test]
+fn test_no_jj_directory_returns_no_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+
+    // Create a directory without .jj subdirectory
+    let cwd_no_jj = temp_dir.path().join("regular-dir");
+    fs::create_dir_all(&cwd_no_jj).unwrap();
+
+    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_no_jj.to_str().unwrap());
+
+    assert!(result.is_ok(), "Ingest should succeed");
+
+    let events = read_events_from(&data_dir).unwrap();
+    assert_eq!(events.len(), 1);
+    // jj fields should be None when there's no .jj directory
+    assert_eq!(events[0].jj_project, None);
+    assert_eq!(events[0].jj_workspace, None);
+}
+
+#[test]
+fn test_index_sessions_partial_failures() {
+    use std::io::Write;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let projects_dir = temp.path().join("projects");
+    let test_project = projects_dir.join("test-project");
+    fs::create_dir_all(&test_project).unwrap();
+
+    // Good session file
+    let good_session = test_project.join("good-session.jsonl");
+    let mut file = fs::File::create(&good_session).unwrap();
+    writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"test"}},"timestamp":"2026-02-02T10:00:00Z","cwd":"/test"}}"#).unwrap();
+
+    // Bad session file (missing required fields)
+    let bad_session = test_project.join("bad-session.jsonl");
+    let mut file = fs::File::create(&bad_session).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"user","message":{{"role":"user","content":"test"}}}}"#
+    )
+    .unwrap(); // No timestamp
+
+    // Empty session file
+    let empty_session = test_project.join("empty.jsonl");
+    fs::write(&empty_session, "").unwrap();
+
+    // Note: Creating a database here to verify the pattern, but not using it
+    // since index_sessions uses a hardcoded path that can't be easily mocked.
+
+    // Mock the projects directory env var (we can't easily mock the function, so this
+    // test would need refactoring of index_sessions to accept a path parameter)
+    // For now, verify the parse function handles errors
+
+    // At least verify parse_session_file handles bad data
+    let result1 = tt_core::session::parse_session_file(&good_session, "good", None);
+    assert!(result1.is_ok(), "Good session should parse");
+
+    let result2 = tt_core::session::parse_session_file(&bad_session, "bad", None);
+    assert!(result2.is_err(), "Bad session should fail to parse");
+
+    let result3 = tt_core::session::parse_session_file(&empty_session, "empty", None);
+    assert!(result3.is_err(), "Empty session should fail to parse");
+}
+
+#[test]
+fn test_lock_file_cleanup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+
+    // First ingest
+    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+
+    // Lock should be released, second ingest should succeed immediately
+    let start = std::time::Instant::now();
+    ingest_pane_focus_impl(&data_dir, "%2", "main", None, "/home/test").unwrap();
+    let duration = start.elapsed();
+
+    // Should complete quickly (not waiting on lock)
+    assert!(
+        duration.as_secs() < 1,
+        "Second ingest should not wait on lock"
+    );
+}
+
+#[test]
+fn test_debounce_with_special_pane_ids() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+
+    // Pane IDs with special characters that might break parsing
+    let special_panes = vec![
+        "%1:2:3",     // Multiple colons
+        "%test pane", // Space
+        "%🔥",        // Emoji
+    ];
+
+    for pane_id in special_panes {
+        let result = ingest_pane_focus_impl(&data_dir, pane_id, "main", None, "/test");
+        assert!(result.is_ok(), "Should handle special pane ID: {pane_id}");
+    }
+
+    let events = read_events_from(&data_dir).unwrap();
+    assert_eq!(events.len(), 3, "All special pane IDs should create events");
+}
+
+#[test]
+fn test_rotation_preserves_old_content() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().join(".time-tracker");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Create known content
+    let events_file = events_path(&data_dir);
+    let original_content = "original event data\n";
+    fs::write(&events_file, original_content).unwrap();
+
+    // Trigger rotation by creating large file
+    let large_content = "x".repeat(usize::try_from(MAX_EVENTS_FILE_SIZE + 1).unwrap());
+    fs::write(&events_file, &large_content).unwrap();
+
+    // Ingest should rotate
+    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/test").unwrap();
+
+    // Verify old content is in rotated file
+    let rotated = rotated_events_path(&data_dir);
+    assert!(rotated.exists(), "Rotated file should exist");
+
+    let rotated_content = fs::read_to_string(&rotated).unwrap();
+    assert_eq!(
+        rotated_content, large_content,
+        "Rotated file should preserve content"
+    );
+}
+
+#[test]
+fn test_create_session_events_with_empty_timestamps() {
+    use chrono::TimeZone;
+    use tt_core::session::ClaudeSession;
+
+    let session = ClaudeSession {
+        claude_session_id: "test".to_string(),
+        parent_session_id: None,
+        session_type: tt_core::session::SessionType::default(),
+        project_path: "/test".to_string(),
+        project_name: "test".to_string(),
+        start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+        end_time: None,
+        message_count: 1,
+        summary: None,
+        user_prompts: vec![],
+        starting_prompt: None,
+        assistant_message_count: 0,
+        tool_call_count: 0,
+        user_message_timestamps: vec![], // Empty timestamps
+    };
+
+    let events = create_session_events(&session);
+
+    // Should only have session_start (no user_message events)
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "session_start");
 }

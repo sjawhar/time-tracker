@@ -17,12 +17,11 @@
 //!
 //! ## Timestamp Format
 //!
-//! Timestamps are stored as TEXT in ISO 8601 format with milliseconds (e.g., `2024-01-15T10:30:00.123Z`).
+//! Timestamps are stored as TEXT in ISO 8601 format (e.g., `2024-01-15T10:30:00Z`).
 //! This format ensures:
 //! - Lexicographic ordering matches chronological ordering
 //! - Human-readable values in the database
 //! - Timezone-aware (always UTC)
-//! - Millisecond precision for accurate event ordering and debouncing
 //!
 //! ## Schema Versioning
 //!
@@ -38,7 +37,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
+
+/// Format a datetime as RFC3339 with second precision and 'Z' suffix.
+///
+/// This ensures lexicographic ordering matches chronological ordering.
+fn format_timestamp(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Format an optional datetime as RFC3339 with second precision.
+fn format_timestamp_opt(dt: Option<DateTime<Utc>>) -> Option<String> {
+    dt.map(format_timestamp)
+}
 
 /// A coherent unit of work, grouping related events.
 ///
@@ -121,6 +132,9 @@ pub struct StoredEvent {
     pub schema_version: i32,
 
     /// Type-specific JSON payload.
+    /// When deserializing, unknown fields are collected here via `#[serde(flatten)]`.
+    /// This allows both nested `data` format and flat format to work.
+    #[serde(default, flatten)]
     pub data: serde_json::Value,
 
     /// Working directory, if applicable.
@@ -164,6 +178,10 @@ impl tt_core::InferableEvent for StoredEvent {
 
     fn stream_id(&self) -> Option<&str> {
         self.stream_id.as_deref()
+    }
+
+    fn jj_project(&self) -> Option<&str> {
+        self.data.get("jj_project").and_then(|v| v.as_str())
     }
 }
 
@@ -224,6 +242,7 @@ impl Database {
     ///
     /// Checks schema version and creates tables if needed.
     /// Supports migrations from older schema versions.
+    #[expect(clippy::too_many_lines, reason = "schema init requires inline SQL")]
     fn init(&self) -> Result<(), DbError> {
         // Enable foreign key constraints
         self.conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -239,11 +258,18 @@ impl Database {
         match existing_version {
             Some(v) if v == SCHEMA_VERSION => {
                 // Schema already initialized and version matches
+                // Ensure claude_sessions table exists (may have been added mid-v5)
+                self.ensure_claude_sessions_table()?;
                 return Ok(());
             }
             Some(3) => {
-                // Migrate from v3 to v4
+                // Migrate from v3 to v4 (which chains to v5)
                 self.migrate_v3_to_v4()?;
+                return Ok(());
+            }
+            Some(4) => {
+                // Migrate from v4 to v5
+                self.migrate_v4_to_v5()?;
                 return Ok(());
             }
             Some(v) => {
@@ -313,6 +339,26 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
+
+            -- Claude sessions table: indexed Claude Code sessions
+            CREATE TABLE IF NOT EXISTS claude_sessions (
+                claude_session_id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                session_type TEXT NOT NULL DEFAULT 'user',
+                project_path TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                message_count INTEGER NOT NULL,
+                summary TEXT,
+                user_prompts TEXT DEFAULT '[]',
+                starting_prompt TEXT,
+                assistant_message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
             ",
         )?;
 
@@ -327,7 +373,8 @@ impl Database {
 
     /// Migrate from schema v3 to v4.
     ///
-    /// Adds the `stream_tags` table for flexible stream categorization.
+    /// Adds the `stream_tags` table for flexible stream categorization
+    /// and the `claude_sessions` table for Claude Code session indexing.
     fn migrate_v3_to_v4(&self) -> Result<(), DbError> {
         self.conn.execute_batch(
             "
@@ -342,10 +389,96 @@ impl Database {
             -- Index for finding streams by tag
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
 
+            -- Claude sessions table: indexed Claude Code sessions
+            -- Note: session_type column will be added by v4->v5 migration
+            CREATE TABLE IF NOT EXISTS claude_sessions (
+                claude_session_id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                project_path TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                message_count INTEGER NOT NULL,
+                summary TEXT,
+                user_prompts TEXT DEFAULT '[]',
+                starting_prompt TEXT,
+                assistant_message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
+
             -- Update schema version
             UPDATE schema_info SET version = 4;
             ",
         )?;
+        // Continue migration to v5
+        self.migrate_v4_to_v5()?;
+        Ok(())
+    }
+
+    /// Migrate from schema v4 to v5.
+    ///
+    /// Adds the `session_type` column to the `claude_sessions` table.
+    fn migrate_v4_to_v5(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            -- Add session_type column to claude_sessions
+            ALTER TABLE claude_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'user';
+
+            -- Update schema version
+            UPDATE schema_info SET version = 5;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// Ensures the `claude_sessions` table exists (for mid-version additions).
+    fn ensure_claude_sessions_table(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS claude_sessions (
+                claude_session_id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                session_type TEXT NOT NULL DEFAULT 'user',
+                project_path TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                message_count INTEGER NOT NULL,
+                summary TEXT,
+                user_prompts TEXT DEFAULT '[]',
+                starting_prompt TEXT,
+                assistant_message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
+            ",
+        )?;
+        // Add columns if they don't exist (for existing tables)
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_sessions ADD COLUMN user_prompts TEXT DEFAULT '[]'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_sessions ADD COLUMN starting_prompt TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_sessions ADD COLUMN assistant_message_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_sessions ADD COLUMN tool_call_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'user'",
+            [],
+        );
         Ok(())
     }
 
@@ -375,9 +508,7 @@ impl Database {
 
             for event in events {
                 let data_json = serde_json::to_string(&event.data).unwrap_or_default();
-                // Use consistent format: always 'Z' suffix, millisecond precision
-                // This ensures lexicographic ordering matches chronological ordering
-                let timestamp_str = event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
+                let timestamp_str = format_timestamp(event.timestamp);
 
                 let rows = stmt.execute(params![
                     event.id,
@@ -421,16 +552,12 @@ impl Database {
 
         if let Some(ref after_ts) = after {
             sql.push_str(" AND timestamp > ?");
-            params_vec.push(Box::new(
-                after_ts.to_rfc3339_opts(SecondsFormat::Millis, true),
-            ));
+            params_vec.push(Box::new(format_timestamp(*after_ts)));
         }
 
         if let Some(ref before_ts) = before {
             sql.push_str(" AND timestamp < ?");
-            params_vec.push(Box::new(
-                before_ts.to_rfc3339_opts(SecondsFormat::Millis, true),
-            ));
+            params_vec.push(Box::new(format_timestamp(*before_ts)));
         }
 
         sql.push_str(" ORDER BY timestamp ASC");
@@ -438,77 +565,45 @@ impl Database {
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(AsRef::as_ref).collect();
         let mut stmt = self.conn.prepare(&sql)?;
 
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            let id: String = row.get(0)?;
-            let timestamp_str: String = row.get(1)?;
-            let event_type: String = row.get(2)?;
-            let source: String = row.get(3)?;
-            let schema_version: i32 = row.get(4)?;
-            let data_str: String = row.get(5)?;
-            let cwd: Option<String> = row.get(6)?;
-            let session_id: Option<String> = row.get(7)?;
-            let stream_id: Option<String> = row.get(8)?;
-            let assignment_source: Option<String> = row.get(9)?;
+        let mut events = Vec::new();
+        let mut rows = stmt.query(params_refs.as_slice())?;
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                events.push(event);
+            }
+        }
 
-            Ok((
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ))
-        })?;
+        Ok(events)
+    }
+
+    /// Retrieves events within an inclusive time range.
+    ///
+    /// Events are returned ordered by timestamp ascending.
+    /// Events with malformed JSON in the `data` column are skipped with a warning.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - Start of the time range (inclusive).
+    /// * `end` - End of the time range (inclusive).
+    pub fn get_events_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<StoredEvent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+             FROM events
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC",
+        )?;
 
         let mut events = Vec::new();
-        for row_result in rows {
-            let (
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ) = row_result?;
+        let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
 
-            // Parse timestamp
-            let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
-                    continue;
-                }
-            };
-
-            // Parse data JSON
-            let data: serde_json::Value = match serde_json::from_str(&data_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
-                    continue;
-                }
-            };
-
-            events.push(StoredEvent {
-                id,
-                timestamp,
-                event_type,
-                source,
-                schema_version,
-                data,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            });
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -520,31 +615,18 @@ impl Database {
     ///
     /// Returns an error if a stream with the same ID already exists.
     pub fn insert_stream(&self, stream: &Stream) -> Result<(), DbError> {
-        let created_str = stream
-            .created_at
-            .to_rfc3339_opts(SecondsFormat::Millis, true);
-        let updated_str = stream
-            .updated_at
-            .to_rfc3339_opts(SecondsFormat::Millis, true);
-        let first_event_str = stream
-            .first_event_at
-            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true));
-        let last_event_str = stream
-            .last_event_at
-            .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Millis, true));
-
         self.conn.execute(
             "INSERT INTO streams (id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 stream.id,
-                created_str,
-                updated_str,
+                format_timestamp(stream.created_at),
+                format_timestamp(stream.updated_at),
                 stream.name,
                 stream.time_direct_ms,
                 stream.time_delegated_ms,
-                first_event_str,
-                last_event_str,
+                format_timestamp_opt(stream.first_event_at),
+                format_timestamp_opt(stream.last_event_at),
                 i32::from(stream.needs_recompute),
             ],
         )?;
@@ -634,75 +716,12 @@ impl Database {
              FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
         )?;
 
-        let rows = stmt.query_map(params![stream_id], |row| {
-            let id: String = row.get(0)?;
-            let timestamp_str: String = row.get(1)?;
-            let event_type: String = row.get(2)?;
-            let source: String = row.get(3)?;
-            let schema_version: i32 = row.get(4)?;
-            let data_str: String = row.get(5)?;
-            let cwd: Option<String> = row.get(6)?;
-            let session_id: Option<String> = row.get(7)?;
-            let stream_id: Option<String> = row.get(8)?;
-            let assignment_source: Option<String> = row.get(9)?;
-
-            Ok((
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ))
-        })?;
-
         let mut events = Vec::new();
-        for row_result in rows {
-            let (
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ) = row_result?;
-
-            let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
-                    continue;
-                }
-            };
-
-            let data: serde_json::Value = match serde_json::from_str(&data_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
-                    continue;
-                }
-            };
-
-            events.push(StoredEvent {
-                id,
-                timestamp,
-                event_type,
-                source,
-                schema_version,
-                data,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            });
+        let mut rows = stmt.query(params![stream_id])?;
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -717,75 +736,12 @@ impl Database {
              FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC",
         )?;
 
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let timestamp_str: String = row.get(1)?;
-            let event_type: String = row.get(2)?;
-            let source: String = row.get(3)?;
-            let schema_version: i32 = row.get(4)?;
-            let data_str: String = row.get(5)?;
-            let cwd: Option<String> = row.get(6)?;
-            let session_id: Option<String> = row.get(7)?;
-            let stream_id: Option<String> = row.get(8)?;
-            let assignment_source: Option<String> = row.get(9)?;
-
-            Ok((
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ))
-        })?;
-
         let mut events = Vec::new();
-        for row_result in rows {
-            let (
-                id,
-                timestamp_str,
-                event_type,
-                source,
-                schema_version,
-                data_str,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            ) = row_result?;
-
-            let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
-                    continue;
-                }
-            };
-
-            let data: serde_json::Value = match serde_json::from_str(&data_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
-                    continue;
-                }
-            };
-
-            events.push(StoredEvent {
-                id,
-                timestamp,
-                event_type,
-                source,
-                schema_version,
-                data,
-                cwd,
-                session_id,
-                stream_id,
-                assignment_source,
-            });
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                events.push(event);
+            }
         }
 
         Ok(events)
@@ -824,7 +780,7 @@ impl Database {
         let mut count = 0u64;
 
         {
-            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let now = format_timestamp(Utc::now());
             let mut stmt = tx.prepare(
                 "UPDATE streams SET time_direct_ms = ?1, time_delegated_ms = ?2, updated_at = ?3, needs_recompute = 0
                  WHERE id = ?4",
@@ -938,12 +894,14 @@ impl Database {
         for row_result in rows {
             let (stream_id, tag) = row_result?;
 
-            // Add to existing stream entry or create new one
-            if let Some((_, tags)) = result.iter_mut().find(|(id, _)| id == &stream_id) {
-                tags.push(tag);
-            } else {
-                result.push((stream_id, vec![tag]));
+            // Since rows are ordered by stream_id, we only need to check the last entry
+            if let Some((last_id, tags)) = result.last_mut() {
+                if last_id == &stream_id {
+                    tags.push(tag);
+                    continue;
+                }
             }
+            result.push((stream_id, vec![tag]));
         }
         Ok(result)
     }
@@ -956,14 +914,13 @@ impl Database {
         let streams = self.get_streams()?;
         let all_tags = self.get_all_tags()?;
 
+        // Convert to HashMap for O(1) lookup instead of O(n) linear search
+        let tags_map: std::collections::HashMap<_, _> = all_tags.into_iter().collect();
+
         let result = streams
             .into_iter()
             .map(|stream| {
-                let tags = all_tags
-                    .iter()
-                    .find(|(id, _)| id == &stream.id)
-                    .map(|(_, t)| t.clone())
-                    .unwrap_or_default();
+                let tags = tags_map.get(&stream.id).cloned().unwrap_or_default();
                 (stream, tags)
             })
             .collect();
@@ -994,6 +951,54 @@ impl Database {
         }
     }
 
+    /// Helper to convert a row to a `StoredEvent`.
+    ///
+    /// Expects the row to have columns in this order:
+    /// `id`, `timestamp`, `type`, `source`, `schema_version`, `data`, `cwd`, `session_id`, `stream_id`, `assignment_source`
+    ///
+    /// Returns `None` if the row has malformed timestamp or JSON data (with a warning logged).
+    fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Option<StoredEvent>, rusqlite::Error> {
+        let id: String = row.get(0)?;
+        let timestamp_str: String = row.get(1)?;
+        let event_type: String = row.get(2)?;
+        let source: String = row.get(3)?;
+        let schema_version: i32 = row.get(4)?;
+        let data_str: String = row.get(5)?;
+        let cwd: Option<String> = row.get(6)?;
+        let session_id: Option<String> = row.get(7)?;
+        let stream_id: Option<String> = row.get(8)?;
+        let assignment_source: Option<String> = row.get(9)?;
+
+        let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(e) => {
+                tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
+                return Ok(None);
+            }
+        };
+
+        let data: serde_json::Value = match serde_json::from_str(&data_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(StoredEvent {
+            id,
+            timestamp,
+            event_type,
+            source,
+            schema_version,
+            data,
+            cwd,
+            session_id,
+            stream_id,
+            assignment_source,
+        }))
+    }
+
     /// Helper to convert a row to a Stream.
     fn row_to_stream(row: &rusqlite::Row<'_>) -> Result<Stream, rusqlite::Error> {
         let id: String = row.get(0)?;
@@ -1008,9 +1013,21 @@ impl Database {
 
         // Parse timestamps - these should always be valid in our schema
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            .map_or_else(
+                |e| {
+                    tracing::warn!(stream_id = %id, error = %e, "stream has malformed created_at, using current time");
+                    Utc::now()
+                },
+                |dt| dt.with_timezone(&Utc),
+            );
         let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            .map_or_else(
+                |e| {
+                    tracing::warn!(stream_id = %id, error = %e, "stream has malformed updated_at, using current time");
+                    Utc::now()
+                },
+                |dt| dt.with_timezone(&Utc),
+            );
         let first_event_at = first_event_at_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
@@ -1029,6 +1046,159 @@ impl Database {
             last_event_at,
             needs_recompute: needs_recompute != 0,
         })
+    }
+
+    // ========== Claude Session Methods ==========
+
+    /// Insert or update a Claude Code session entry.
+    ///
+    /// Uses `INSERT ... ON CONFLICT DO UPDATE` for idempotent upserts.
+    /// If a session with the same ID already exists, all fields are updated.
+    pub fn upsert_claude_session(
+        &self,
+        entry: &tt_core::session::ClaudeSession,
+    ) -> Result<(), DbError> {
+        let user_prompts_json = serde_json::to_string(&entry.user_prompts).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO claude_sessions (claude_session_id, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(claude_session_id) DO UPDATE SET
+                parent_session_id = excluded.parent_session_id,
+                project_path = excluded.project_path,
+                project_name = excluded.project_name,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                message_count = excluded.message_count,
+                summary = excluded.summary,
+                user_prompts = excluded.user_prompts,
+                starting_prompt = excluded.starting_prompt,
+                assistant_message_count = excluded.assistant_message_count,
+                tool_call_count = excluded.tool_call_count,
+                session_type = excluded.session_type",
+            params![
+                entry.claude_session_id,
+                entry.parent_session_id,
+                entry.project_path,
+                entry.project_name,
+                format_timestamp(entry.start_time),
+                format_timestamp_opt(entry.end_time),
+                entry.message_count,
+                entry.summary,
+                user_prompts_json,
+                entry.starting_prompt,
+                entry.assistant_message_count,
+                entry.tool_call_count,
+                entry.session_type.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get Claude Code sessions that overlap with a time range.
+    ///
+    /// A session overlaps if:
+    /// - Its `start_time` is at or before the range end, AND
+    /// - Its `end_time` is at or after the range start (or is `NULL` for ongoing sessions)
+    ///
+    /// Sessions are returned ordered by `start_time` ascending.
+    /// Sessions with malformed timestamps in the database are skipped with a warning.
+    pub fn claude_sessions_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<tt_core::session::ClaudeSession>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT claude_session_id, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type
+             FROM claude_sessions
+             WHERE start_time <= ?2 AND (end_time IS NULL OR end_time >= ?1)
+             ORDER BY start_time"
+        )?;
+
+        let mut sessions = Vec::new();
+        let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
+
+        while let Some(row) = rows.next()? {
+            let claude_session_id: String = row.get(0)?;
+            let start_time_str: String = row.get(4)?;
+            let end_time_str: Option<String> = row.get(5)?;
+            let user_prompts_str: Option<String> = row.get(8)?;
+
+            let start_time = match DateTime::parse_from_rfc3339(&start_time_str) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    tracing::warn!(claude_session_id, error = %e, "skipping session with malformed start_time");
+                    continue;
+                }
+            };
+
+            let end_time = match end_time_str {
+                Some(s) => match DateTime::parse_from_rfc3339(&s) {
+                    Ok(dt) => Some(dt.with_timezone(&Utc)),
+                    Err(e) => {
+                        tracing::warn!(claude_session_id, error = %e, "skipping session with malformed end_time");
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            let user_prompts: Vec<String> = user_prompts_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            sessions.push(tt_core::session::ClaudeSession {
+                claude_session_id,
+                parent_session_id: row.get(1)?,
+                session_type: row.get::<_, String>(12)?.parse().unwrap_or_default(),
+                project_path: row.get(2)?,
+                project_name: row.get(3)?,
+                start_time,
+                end_time,
+                message_count: row.get(6)?,
+                summary: row.get(7)?,
+                user_prompts,
+                starting_prompt: row.get(9)?,
+                assistant_message_count: row.get(10)?,
+                tool_call_count: row.get(11)?,
+                // Not stored in database - events are created during indexing
+                user_message_timestamps: Vec::new(),
+            });
+        }
+
+        Ok(sessions)
+    }
+
+    /// Retrieves streams that overlap with a time range.
+    ///
+    /// A stream overlaps if:
+    /// - Its `first_event_at` is at or before the range end, AND
+    /// - Its `last_event_at` is at or after the range start
+    ///
+    /// Streams are returned ordered by `first_event_at` ascending.
+    /// Streams without timestamps (`first_event_at` or `last_event_at` is NULL) are excluded.
+    pub fn streams_in_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<Stream>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
+             FROM streams
+             WHERE first_event_at IS NOT NULL
+               AND last_event_at IS NOT NULL
+               AND first_event_at <= ?2
+               AND last_event_at >= ?1
+             ORDER BY first_event_at ASC",
+        )?;
+
+        let mut streams = Vec::new();
+        let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
+
+        while let Some(row) = rows.next()? {
+            streams.push(Self::row_to_stream(row)?);
+        }
+
+        Ok(streams)
     }
 
     /// Returns the most recent event timestamp for each source.
@@ -1248,6 +1418,65 @@ mod tests {
         assert_eq!(events[0].id, "e1");
         assert_eq!(events[1].id, "e2");
         assert_eq!(events[2].id, "e3");
+    }
+
+    #[test]
+    fn test_get_events_in_range_inclusive() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e1", ts1)).unwrap();
+        db.insert_event(&make_event("e2", ts2)).unwrap();
+        db.insert_event(&make_event("e3", ts3)).unwrap();
+
+        // Query with inclusive range matching exactly ts1 and ts2
+        let events = db.get_events_in_range(ts1, ts2).unwrap();
+
+        // Should include both boundary events (inclusive)
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "e1");
+        assert_eq!(events[1].id, "e2");
+    }
+
+    #[test]
+    fn test_get_events_in_range_ordered() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Insert out of order
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e2", ts2)).unwrap();
+        db.insert_event(&make_event("e1", ts1)).unwrap();
+        db.insert_event(&make_event("e3", ts3)).unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 13, 0, 0).unwrap();
+        let events = db.get_events_in_range(start, end).unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].id, "e1");
+        assert_eq!(events[1].id, "e2");
+        assert_eq!(events[2].id, "e3");
+    }
+
+    #[test]
+    fn test_get_events_in_range_empty() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        db.insert_event(&make_event("e1", ts)).unwrap();
+
+        // Query a range that doesn't include any events
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+        let events = db.get_events_in_range(start, end).unwrap();
+
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1780,6 +2009,50 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_session_storage() {
+        use chrono::TimeZone;
+        use tt_core::session::ClaudeSession;
+
+        let db = Database::open_in_memory().unwrap();
+
+        let entry = ClaudeSession {
+            claude_session_id: "test-session".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap(),
+            end_time: Some(chrono::Utc.with_ymd_and_hms(2026, 1, 29, 11, 0, 0).unwrap()),
+            message_count: 10,
+            summary: Some("Test session".to_string()),
+            user_prompts: vec!["implement feature".to_string(), "add tests".to_string()],
+            starting_prompt: Some("implement feature".to_string()),
+            assistant_message_count: 5,
+            tool_call_count: 12,
+            user_message_timestamps: Vec::new(),
+        };
+
+        db.upsert_claude_session(&entry).unwrap();
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
+        let sessions = db.claude_sessions_in_range(start, end).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_name, "project");
+        assert_eq!(
+            sessions[0].user_prompts,
+            vec!["implement feature", "add tests"]
+        );
+        assert_eq!(
+            sessions[0].starting_prompt.as_deref(),
+            Some("implement feature")
+        );
+        assert_eq!(sessions[0].assistant_message_count, 5);
+        assert_eq!(sessions[0].tool_call_count, 12);
+    }
+
+    #[test]
     fn test_schema_migration_v3_to_v4() {
         // Create a temporary database file
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1839,11 +2112,305 @@ mod tests {
         assert!(stream.is_some());
         assert_eq!(stream.unwrap().name, Some("test".to_string()));
 
-        // Verify schema version is now 4
+        // Verify schema version is now 5 (v3->v4->v5 migration chain)
         let version: i32 = db
             .conn
             .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+
+        // Verify claude_sessions table was created and is usable
+        let entry = tt_core::session::ClaudeSession {
+            claude_session_id: "migrated-session".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2026, 1, 29, 11, 0, 0).unwrap()),
+            message_count: 5,
+            summary: Some("Migrated session test".to_string()),
+            user_prompts: vec!["test prompt".to_string()],
+            starting_prompt: Some("test prompt".to_string()),
+            assistant_message_count: 3,
+            tool_call_count: 7,
+            user_message_timestamps: Vec::new(),
+        };
+        db.upsert_claude_session(&entry).unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
+        let sessions = db.claude_sessions_in_range(start, end).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].claude_session_id, "migrated-session");
+        assert_eq!(sessions[0].user_prompts, vec!["test prompt"]);
+    }
+
+    // ========== streams_in_range Tests ==========
+
+    fn make_stream_with_times(
+        id: &str,
+        name: Option<&str>,
+        first_event_at: Option<DateTime<Utc>>,
+        last_event_at: Option<DateTime<Utc>>,
+    ) -> Stream {
+        let now = Utc::now();
+        Stream {
+            id: id.to_string(),
+            name: name.map(String::from),
+            created_at: now,
+            updated_at: now,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at,
+            last_event_at,
+            needs_recompute: false,
+        }
+    }
+
+    #[test]
+    fn test_streams_in_range_empty() {
+        let db = Database::open_in_memory().unwrap();
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn test_streams_in_range_overlapping() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream that overlaps with the query range
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("overlapping"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].id, "s1");
+    }
+
+    #[test]
+    fn test_streams_in_range_fully_contained() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream fully contained within query range
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("contained"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].id, "s1");
+    }
+
+    #[test]
+    fn test_streams_in_range_contains_query() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream that contains the query range
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 14, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("container"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].id, "s1");
+    }
+
+    #[test]
+    fn test_streams_in_range_before_query() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream that ends before query range starts
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 6, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("before"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn test_streams_in_range_after_query() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream that starts after query range ends
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 13, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 14, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("after"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn test_streams_in_range_excludes_null_timestamps() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream with null first_event_at
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("null-first"),
+            None,
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        // Stream with null last_event_at
+        db.insert_stream(&make_stream_with_times(
+            "s2",
+            Some("null-last"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+            None,
+        ))
+        .unwrap();
+
+        // Stream with both timestamps
+        let stream_first = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let stream_last = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        db.insert_stream(&make_stream_with_times(
+            "s3",
+            Some("valid"),
+            Some(stream_first),
+            Some(stream_last),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].id, "s3");
+    }
+
+    #[test]
+    fn test_streams_in_range_multiple_streams() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream 1: 8:00-10:00 (overlaps with start)
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("early"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        // Stream 2: 10:00-11:00 (fully contained)
+        db.insert_stream(&make_stream_with_times(
+            "s2",
+            Some("middle"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        // Stream 3: 11:00-13:00 (overlaps with end)
+        db.insert_stream(&make_stream_with_times(
+            "s3",
+            Some("late"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 13, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        // Stream 4: 14:00-15:00 (completely outside)
+        db.insert_stream(&make_stream_with_times(
+            "s4",
+            Some("outside"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 14, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 15, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        assert_eq!(streams.len(), 3);
+
+        // Should be ordered by first_event_at
+        assert_eq!(streams[0].id, "s1");
+        assert_eq!(streams[1].id, "s2");
+        assert_eq!(streams[2].id, "s3");
+    }
+
+    #[test]
+    fn test_streams_in_range_boundary_conditions() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Stream that ends exactly at query start
+        db.insert_stream(&make_stream_with_times(
+            "s1",
+            Some("boundary-end"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 8, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        // Stream that starts exactly at query end
+        db.insert_stream(&make_stream_with_times(
+            "s2",
+            Some("boundary-start"),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap()),
+            Some(Utc.with_ymd_and_hms(2025, 1, 15, 13, 0, 0).unwrap()),
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
+
+        let streams = db.streams_in_range(start, end).unwrap();
+        // Both should be included (inclusive boundaries)
+        assert_eq!(streams.len(), 2);
     }
 }
