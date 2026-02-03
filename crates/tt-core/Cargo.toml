@@ -13,9 +13,12 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+rayon.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

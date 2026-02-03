@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::types::StreamId;
+use crate::types::{Confidence, StreamId};
 
 /// Configuration for stream inference.
 #[derive(Debug, Clone)]
@@ -45,6 +45,12 @@ pub trait InferableEvent {
 
     /// Returns the stream ID if already assigned.
     fn stream_id(&self) -> Option<&str>;
+
+    /// Returns the jj project name, if available.
+    ///
+    /// This is preferred over the directory basename for stream naming
+    /// since it provides a more meaningful project identifier.
+    fn jj_project(&self) -> Option<&str>;
 }
 
 /// A stream assignment produced by inference.
@@ -57,14 +63,22 @@ pub struct StreamAssignment {
     pub stream_id: StreamId,
 }
 
-/// A new stream produced by inference.
-#[derive(Debug, Clone)]
+/// A stream produced by inference.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InferredStream {
     /// Unique identifier (UUID).
     pub id: StreamId,
 
-    /// Human-readable name (derived from directory basename).
+    /// Human-readable name.
     pub name: String,
+
+    /// Session IDs that belong to this stream (for LLM inference).
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+
+    /// Confidence score for human review. Default is maximum (1.0) for directory-based inference.
+    #[serde(default)]
+    pub confidence: Confidence,
 
     /// Timestamp of the first event in this stream.
     pub first_event_at: DateTime<Utc>,
@@ -131,7 +145,29 @@ pub fn infer_streams<E: InferableEvent>(events: &[E], config: &InferenceConfig) 
     // Track name collisions for disambiguation
     let mut name_counts: HashMap<String, u32> = HashMap::new();
 
-    for (cwd_key, mut group_events) in groups {
+    // Helper closure to emit a stream and its assignments
+    let emit_stream = |cwd_key: &str,
+                       events: &[&E],
+                       name_counts: &mut HashMap<String, u32>,
+                       streams: &mut Vec<InferredStream>,
+                       assignments: &mut Vec<StreamAssignment>| {
+        let stream = create_stream(cwd_key, events, name_counts);
+        let stream_id = stream.id.clone();
+        streams.push(stream);
+
+        for e in events {
+            assignments.push(StreamAssignment {
+                event_id: e.event_id().to_string(),
+                stream_id: stream_id.clone(),
+            });
+        }
+    };
+
+    // Sort groups by key for deterministic output (HashMap iteration order is non-deterministic)
+    let mut sorted_groups: Vec<_> = groups.into_iter().collect();
+    sorted_groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    for (cwd_key, mut group_events) in sorted_groups {
         // Sort by timestamp
         group_events.sort_by_key(|e| e.timestamp());
 
@@ -150,19 +186,13 @@ pub fn infer_streams<E: InferableEvent>(events: &[E], config: &InferenceConfig) 
             });
 
             if should_start_new_stream && !current_stream_events.is_empty() {
-                // Emit current stream
-                let stream = create_stream(&cwd_key, &current_stream_events, &mut name_counts);
-                let stream_id = stream.id.clone();
-                streams.push(stream);
-
-                // Create assignments
-                for e in &current_stream_events {
-                    assignments.push(StreamAssignment {
-                        event_id: e.event_id().to_string(),
-                        stream_id: stream_id.clone(),
-                    });
-                }
-
+                emit_stream(
+                    &cwd_key,
+                    &current_stream_events,
+                    &mut name_counts,
+                    &mut streams,
+                    &mut assignments,
+                );
                 current_stream_events.clear();
             }
 
@@ -172,16 +202,13 @@ pub fn infer_streams<E: InferableEvent>(events: &[E], config: &InferenceConfig) 
 
         // Emit final stream
         if !current_stream_events.is_empty() {
-            let stream = create_stream(&cwd_key, &current_stream_events, &mut name_counts);
-            let stream_id = stream.id.clone();
-            streams.push(stream);
-
-            for e in &current_stream_events {
-                assignments.push(StreamAssignment {
-                    event_id: e.event_id().to_string(),
-                    stream_id: stream_id.clone(),
-                });
-            }
+            emit_stream(
+                &cwd_key,
+                &current_stream_events,
+                &mut name_counts,
+                &mut streams,
+                &mut assignments,
+            );
         }
     }
 
@@ -199,25 +226,33 @@ fn normalize_path(path: Option<&str>) -> String {
     path.map_or_else(String::new, |p| p.trim_end_matches('/').to_string())
 }
 
-/// Generate a stream name from a cwd path.
+/// Generate a stream name from events.
 ///
-/// - Uses directory basename (e.g., `/home/user/project` → "project")
+/// - Prefers `jj_project` from the first event if available
+/// - Falls back to directory basename (e.g., `/home/user/project` → "project")
 /// - For null-cwd, returns "Uncategorized"
 /// - Handles collisions by tracking counts
-fn generate_stream_name(
+fn generate_stream_name<E: InferableEvent>(
+    events: &[&E],
     cwd_key: &str,
     name_counts: &mut std::collections::HashMap<String, u32>,
 ) -> String {
-    let base_name = if cwd_key.is_empty() {
-        "Uncategorized".to_string()
-    } else {
-        // Extract basename
-        std::path::Path::new(cwd_key)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string()
-    };
+    // Try jj_project from first event
+    let base_name = events.first().and_then(|e| e.jj_project()).map_or_else(
+        || {
+            // Fallback to directory basename
+            if cwd_key.is_empty() {
+                "Uncategorized".to_string()
+            } else {
+                std::path::Path::new(cwd_key)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            }
+        },
+        String::from,
+    );
 
     let count = name_counts.entry(base_name.clone()).or_insert(0);
     *count += 1;
@@ -230,20 +265,29 @@ fn generate_stream_name(
 }
 
 /// Create a stream from a group of events.
+///
+/// # Panics
+///
+/// Panics if `events` is empty.
 fn create_stream<E: InferableEvent>(
     cwd_key: &str,
     events: &[&E],
     name_counts: &mut std::collections::HashMap<String, u32>,
 ) -> InferredStream {
-    let name = generate_stream_name(cwd_key, name_counts);
-    let id = StreamId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+    assert!(!events.is_empty(), "create_stream called with empty events");
+    let name = generate_stream_name(events, cwd_key, name_counts);
+    let id =
+        StreamId::new(uuid::Uuid::new_v4().to_string()).expect("UUID v4 string is never empty");
 
+    // SAFETY: events is guaranteed non-empty by the assert above
     let first_event_at = events.iter().map(|e| e.timestamp()).min().unwrap();
     let last_event_at = events.iter().map(|e| e.timestamp()).max().unwrap();
 
     InferredStream {
         id,
         name,
+        session_ids: Vec::new(),
+        confidence: Confidence::MAX,
         first_event_at,
         last_event_at,
     }
@@ -260,6 +304,7 @@ mod tests {
         cwd: Option<String>,
         assignment_source: Option<String>,
         stream_id: Option<String>,
+        jj_project: Option<String>,
     }
 
     impl TestEvent {
@@ -270,6 +315,7 @@ mod tests {
                 cwd: cwd.map(String::from),
                 assignment_source: None,
                 stream_id: None,
+                jj_project: None,
             }
         }
 
@@ -282,6 +328,11 @@ mod tests {
         fn with_inferred_assignment(mut self, stream_id: &str) -> Self {
             self.assignment_source = Some("inferred".to_string());
             self.stream_id = Some(stream_id.to_string());
+            self
+        }
+
+        fn with_jj_project(mut self, project: &str) -> Self {
+            self.jj_project = Some(project.to_string());
             self
         }
     }
@@ -305,6 +356,10 @@ mod tests {
 
         fn stream_id(&self) -> Option<&str> {
             self.stream_id.as_deref()
+        }
+
+        fn jj_project(&self) -> Option<&str> {
+            self.jj_project.as_deref()
         }
     }
 
@@ -530,5 +585,93 @@ mod tests {
         assert_eq!(result.streams.len(), 1);
         assert_eq!(result.streams[0].first_event_at, ts(0));
         assert_eq!(result.streams[0].last_event_at, ts(10));
+    }
+
+    #[test]
+    fn test_jj_project_preferred_over_directory() {
+        // Events in /home/user/time-tracker/default with jj_project="time-tracker"
+        // Should use "time-tracker" as stream name, not "default"
+        let events = vec![
+            TestEvent::new("e1", ts(0), Some("/home/user/time-tracker/default"))
+                .with_jj_project("time-tracker"),
+            TestEvent::new("e2", ts(5), Some("/home/user/time-tracker/default"))
+                .with_jj_project("time-tracker"),
+        ];
+
+        let config = InferenceConfig::default();
+        let result = infer_streams(&events, &config);
+
+        assert_eq!(result.streams.len(), 1);
+        assert_eq!(result.streams[0].name, "time-tracker");
+    }
+
+    #[test]
+    fn test_fallback_to_directory_without_jj_project() {
+        // Events without jj_project should fall back to directory basename
+        let events = vec![
+            TestEvent::new("e1", ts(0), Some("/home/user/my-project")),
+            TestEvent::new("e2", ts(5), Some("/home/user/my-project")),
+        ];
+
+        let config = InferenceConfig::default();
+        let result = infer_streams(&events, &config);
+
+        assert_eq!(result.streams.len(), 1);
+        assert_eq!(result.streams[0].name, "my-project");
+    }
+
+    #[test]
+    fn test_jj_project_same_name_different_directories() {
+        // Two different workspaces of the same project should have same jj_project
+        // but different cwd paths - they should be in different streams (by cwd)
+        // but both named "time-tracker"
+        let events = vec![
+            TestEvent::new("e1", ts(0), Some("/home/user/time-tracker/default"))
+                .with_jj_project("time-tracker"),
+            TestEvent::new("e2", ts(5), Some("/home/user/time-tracker/feature"))
+                .with_jj_project("time-tracker"),
+        ];
+
+        let config = InferenceConfig::default();
+        let result = infer_streams(&events, &config);
+
+        // Two streams (different cwd paths)
+        assert_eq!(result.streams.len(), 2);
+
+        // Both named "time-tracker" but with collision disambiguation
+        let names: Vec<_> = result.streams.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"time-tracker"));
+        assert!(names.contains(&"time-tracker (2)"));
+    }
+
+    #[test]
+    fn test_mixed_jj_project_and_no_jj_project() {
+        // Some events have jj_project, some don't
+        let events = vec![
+            TestEvent::new("e1", ts(0), Some("/home/user/project-a"))
+                .with_jj_project("my-jj-project"),
+            TestEvent::new("e2", ts(5), Some("/home/user/project-b")),
+        ];
+
+        let config = InferenceConfig::default();
+        let result = infer_streams(&events, &config);
+
+        assert_eq!(result.streams.len(), 2);
+
+        let stream_a = result.streams.iter().find(|s| {
+            result
+                .assignments
+                .iter()
+                .any(|a| a.event_id == "e1" && a.stream_id == s.id)
+        });
+        let stream_b = result.streams.iter().find(|s| {
+            result
+                .assignments
+                .iter()
+                .any(|a| a.event_id == "e2" && a.stream_id == s.id)
+        });
+
+        assert_eq!(stream_a.unwrap().name, "my-jj-project");
+        assert_eq!(stream_b.unwrap().name, "project-b");
     }
 }
