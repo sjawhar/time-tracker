@@ -4,11 +4,25 @@
 //! - Events: raw activity signals from various sources
 //! - Streams: named collections of events
 //! - Time entries: consolidated entries for reporting
+//! - Inference: clustering events into streams
+//! - Allocation: computing direct/delegated time for streams
+//! - Suggestion: tag suggestion from event metadata
 
+mod allocation;
 mod event;
+pub mod inference;
 mod stream;
+mod suggest;
 mod types;
 
+pub use allocation::{
+    AllocatableEvent, AllocationConfig, AllocationResult, StreamTime, allocate_time,
+};
 pub use event::{Event, EventKind};
+pub use inference::{
+    InferableEvent, InferenceConfig, InferenceResult, InferredStream, StreamAssignment,
+    infer_streams,
+};
 pub use stream::Stream;
+pub use suggest::{Suggestion, is_metadata_ambiguous, suggest_from_metadata};
 pub use types::{EventId, StreamId, ValidationError};

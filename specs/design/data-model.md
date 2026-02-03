@@ -318,4 +318,4 @@ CREATE INDEX idx_stream_tags_tag ON stream_tags(tag);
 
 2. **VCS events**: Are git/jj commit events valuable for stream boundary inference, or noise? Needs validation.
 
-3. **Attention allocation algorithm**: How is direct time allocated when multiple agents run in parallel? See architecture docs for detailed specification (TODO).
+3. **Attention allocation algorithm**: Resolved. See [architecture/overview.md](../architecture/overview.md#attention-allocation-algorithm) for detailed specification.
