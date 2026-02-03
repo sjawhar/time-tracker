@@ -1,0 +1,28 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+expression: output
+---
+TIME REPORT: Week of Jan 27, 2025
+
+BY TAG
+──────
+(no tagged streams)
+
+(untagged)                                 8h 53m  ██████████
+  Direct:    5h 40m
+  Delegated: 3h 13m
+  Sessions:
+    stream  tmux/dev/session-0        (1h 30m)
+    stream  tmux/dev/session-1        (1h 23m)
+    stream  tmux/dev/session-2        (1h 16m)
+    stream  tmux/dev/session-3        (1h 10m)
+    stream  tmux/dev/session-4        (1h 3m)
+    ... and 3 more
+
+  Tip: Run 'tt streams --untagged' to see all
+
+SUMMARY
+───────
+Total tracked:  8h 53m
+Direct time:    5h 40m (64%)
+Delegated time: 3h 13m (36%)

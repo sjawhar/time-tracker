@@ -1,0 +1,9 @@
+---
+source: crates/tt-cli/src/commands/status.rs
+expression: output
+---
+Database: /path/to/events.db
+
+Sources:
+  remote.agent:  2025-01-29T11:45:00Z
+  remote.tmux:  2025-01-29T10:30:00Z
