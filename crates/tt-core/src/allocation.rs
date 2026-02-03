@@ -75,6 +75,9 @@ pub trait AllocatableEvent {
     /// Returns the agent session ID if applicable.
     fn session_id(&self) -> Option<&str>;
 
+    /// Returns the action for `agent_session` events (e.g., "started", "ended").
+    fn action(&self) -> Option<&str>;
+
     /// Returns the event's data payload.
     fn data(&self) -> &serde_json::Value;
 }
@@ -343,7 +346,7 @@ pub fn allocate_time<E: AllocatableEvent>(
             }
 
             "agent_session" => {
-                let action = data.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let action = event.action().unwrap_or("");
                 let session_id = event.session_id().unwrap_or("");
 
                 match action {
@@ -609,6 +612,7 @@ mod tests {
         event_type: String,
         stream_id: Option<String>,
         session_id: Option<String>,
+        action: Option<String>,
         data: serde_json::Value,
     }
 
@@ -619,6 +623,7 @@ mod tests {
                 event_type: "tmux_pane_focus".to_string(),
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
+                action: None,
                 data: json!({"pane_id": "%1", "cwd": "/test"}),
             }
         }
@@ -629,6 +634,7 @@ mod tests {
                 event_type: "afk_change".to_string(),
                 stream_id: None,
                 session_id: None,
+                action: None,
                 data: json!({"status": status}),
             }
         }
@@ -639,6 +645,7 @@ mod tests {
                 event_type: "tmux_scroll".to_string(),
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
+                action: None,
                 data: json!({"direction": "up"}),
             }
         }
@@ -654,7 +661,8 @@ mod tests {
                 event_type: "agent_session".to_string(),
                 stream_id: stream_id.map(String::from),
                 session_id: Some(session_id.to_string()),
-                data: json!({"action": action, "agent": "claude-code"}),
+                action: Some(action.to_string()),
+                data: json!({"agent": "claude-code"}),
             }
         }
 
@@ -664,6 +672,7 @@ mod tests {
                 event_type: "agent_tool_use".to_string(),
                 stream_id: Some(stream_id.to_string()),
                 session_id: Some(session_id.to_string()),
+                action: None,
                 data: json!({"tool": "Edit"}),
             }
         }
@@ -674,6 +683,7 @@ mod tests {
                 event_type: "user_message".to_string(),
                 stream_id: Some(stream_id.to_string()),
                 session_id: Some(session_id.to_string()),
+                action: None,
                 data: json!({"length": 100}),
             }
         }
@@ -684,6 +694,7 @@ mod tests {
                 event_type: "window_focus".to_string(),
                 stream_id: stream_id.map(String::from),
                 session_id: None,
+                action: None,
                 data: json!({"app": app, "title": "test window"}),
             }
         }
@@ -694,6 +705,7 @@ mod tests {
                 event_type: "browser_tab".to_string(),
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
+                action: None,
                 data: json!({"url": "https://example.com", "title": "Test Page"}),
             }
         }
@@ -704,6 +716,7 @@ mod tests {
                 event_type: "afk_change".to_string(),
                 stream_id: None,
                 session_id: None,
+                action: None,
                 data: json!({"status": status, "idle_duration_ms": idle_duration_ms}),
             }
         }
@@ -724,6 +737,10 @@ mod tests {
 
         fn session_id(&self) -> Option<&str> {
             self.session_id.as_deref()
+        }
+
+        fn action(&self) -> Option<&str> {
+            self.action.as_deref()
         }
 
         fn data(&self) -> &serde_json::Value {
@@ -993,6 +1010,7 @@ mod tests {
             event_type: "tmux_pane_focus".to_string(),
             stream_id: None, // Not assigned to any stream
             session_id: None,
+            action: None,
             data: json!({"pane_id": "%1"}),
         }];
 

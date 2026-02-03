@@ -778,8 +778,8 @@ fn test_import_ignores_stream_id() {
     let output = child.wait_with_output().unwrap();
 
     // Should succeed - stream_id is simply ignored during import
-    assert!(output.status.success(), "Import should succeed");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "Import should succeed: {stderr}");
     assert!(
         stderr.contains("1 new"),
         "Event should be imported (stream_id is ignored): {stderr}"
@@ -1018,4 +1018,96 @@ fn test_dst_transition_timestamp_handling() {
             );
         }
     }
+}
+
+/// Test that `git_project` and `git_workspace` fields are preserved through import → context export.
+///
+/// This is a regression test for the case where we added fields to `StoredEvent` but forgot
+/// to add them to `EventExport` in the context command.
+#[test]
+fn test_context_exports_git_project_fields() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().unwrap();
+    let db_file = temp.path().join("tt.db");
+
+    let config_file = temp.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!(r#"database_path = "{}""#, db_file.display()),
+    )
+    .unwrap();
+
+    // Event with git_project and git_workspace fields
+    let event_with_git_fields = r#"{"id":"event-with-git","timestamp":"2025-01-29T12:00:00Z","source":"remote.tmux","type":"tmux_pane_focus","cwd":"/home/user/my-project/default","git_project":"my-project","git_workspace":"default","pane_id":"%1","tmux_session":"dev","data":{}}
+"#;
+
+    // Import the event
+    let mut child = Command::new(tt_binary())
+        .arg("--config")
+        .arg(&config_file)
+        .arg("import")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(event_with_git_fields.as_bytes()).unwrap();
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "Import should succeed: {stderr}");
+
+    // Export via context command
+    let context_output = Command::new(tt_binary())
+        .arg("--config")
+        .arg(&config_file)
+        .arg("context")
+        .arg("--events")
+        .arg("--start")
+        .arg("2025-01-29T00:00:00Z")
+        .arg("--end")
+        .arg("2025-01-30T00:00:00Z")
+        .output()
+        .unwrap();
+
+    assert!(
+        context_output.status.success(),
+        "Context command should succeed: {}",
+        String::from_utf8_lossy(&context_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&context_output.stdout);
+    let context: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Context output should be valid JSON");
+
+    // Verify events array exists and has our event
+    let events = context["events"]
+        .as_array()
+        .expect("events should be an array");
+    assert_eq!(events.len(), 1, "Should have exactly one event");
+
+    let event = &events[0];
+
+    // Verify git_project and git_workspace are present in the export
+    assert_eq!(
+        event["git_project"].as_str(),
+        Some("my-project"),
+        "git_project should be exported in context"
+    );
+    assert_eq!(
+        event["git_workspace"].as_str(),
+        Some("default"),
+        "git_workspace should be exported in context"
+    );
+
+    // Also verify other fields are present
+    assert_eq!(event["cwd"].as_str(), Some("/home/user/my-project/default"));
+    assert_eq!(event["pane_id"].as_str(), Some("%1"));
+    assert_eq!(event["tmux_session"].as_str(), Some("dev"));
 }

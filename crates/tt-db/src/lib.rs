@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -131,11 +131,37 @@ pub struct StoredEvent {
     #[serde(default = "default_schema_version")]
     pub schema_version: i32,
 
-    /// Type-specific JSON payload.
-    /// When deserializing, unknown fields are collected here via `#[serde(flatten)]`.
-    /// This allows both nested `data` format and flat format to work.
-    #[serde(default, flatten)]
-    pub data: serde_json::Value,
+    /// Tmux pane ID (for `tmux_pane_focus` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+
+    /// Tmux session name (for `tmux_pane_focus` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_session: Option<String>,
+
+    /// Tmux window index (for `tmux_pane_focus` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_index: Option<u32>,
+
+    /// Git project name (from remote origin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_project: Option<String>,
+
+    /// Git workspace name (if in a non-default workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_workspace: Option<String>,
+
+    /// AFK status (for `afk_change` events): "idle" or "active".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Idle duration in milliseconds (for `afk_change` events with retroactive idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_duration_ms: Option<i64>,
+
+    /// Agent action (for `agent_session` events): "started", "ended", "`tool_use`".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 
     /// Working directory, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,10 +178,79 @@ pub struct StoredEvent {
     /// How this event was assigned to a stream ('inferred' or 'user').
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_source: Option<String>,
+
+    /// Raw JSON data for the event payload.
+    /// This is populated from the database `data` column and used by `AllocatableEvent::data()`.
+    /// Not part of JSON serialization - explicit fields above are used instead.
+    #[serde(skip)]
+    pub data: serde_json::Value,
 }
 
 const fn default_schema_version() -> i32 {
     1
+}
+
+impl StoredEvent {
+    /// Builds a JSON object from the explicit data fields.
+    ///
+    /// This is used when inserting events into the database.
+    /// Fields are only included if they have values.
+    #[must_use]
+    pub fn build_data_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+
+        if let Some(ref v) = self.pane_id {
+            map.insert("pane_id".to_string(), serde_json::Value::String(v.clone()));
+        }
+        if let Some(ref v) = self.tmux_session {
+            map.insert(
+                "session_name".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
+        if let Some(v) = self.window_index {
+            map.insert(
+                "window_index".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(ref v) = self.git_project {
+            map.insert(
+                "git_project".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
+        if let Some(ref v) = self.git_workspace {
+            map.insert(
+                "git_workspace".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
+        if let Some(ref v) = self.status {
+            map.insert("status".to_string(), serde_json::Value::String(v.clone()));
+        }
+        if let Some(v) = self.idle_duration_ms {
+            map.insert(
+                "idle_duration_ms".to_string(),
+                serde_json::Value::Number(v.into()),
+            );
+        }
+        if let Some(ref v) = self.action {
+            map.insert("action".to_string(), serde_json::Value::String(v.clone()));
+        }
+        // Include cwd and session_id in data for backward compatibility with existing events
+        if let Some(ref v) = self.cwd {
+            map.insert("cwd".to_string(), serde_json::Value::String(v.clone()));
+        }
+        if let Some(ref v) = self.session_id {
+            map.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
+
+        serde_json::Value::Object(map)
+    }
 }
 
 // Implement InferableEvent for StoredEvent so it can be used with the inference algorithm
@@ -180,8 +275,8 @@ impl tt_core::InferableEvent for StoredEvent {
         self.stream_id.as_deref()
     }
 
-    fn jj_project(&self) -> Option<&str> {
-        self.data.get("jj_project").and_then(|v| v.as_str())
+    fn git_project(&self) -> Option<&str> {
+        self.git_project.as_deref()
     }
 }
 
@@ -201,6 +296,10 @@ impl tt_core::AllocatableEvent for StoredEvent {
 
     fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    fn action(&self) -> Option<&str> {
+        self.action.as_deref()
     }
 
     fn data(&self) -> &serde_json::Value {
@@ -241,8 +340,8 @@ impl Database {
     /// Initializes the database schema.
     ///
     /// Checks schema version and creates tables if needed.
-    /// Supports migrations from older schema versions.
-    #[expect(clippy::too_many_lines, reason = "schema init requires inline SQL")]
+    /// Old schema versions are not supported - the database must be recreated.
+    #[expect(clippy::too_many_lines)]
     fn init(&self) -> Result<(), DbError> {
         // Enable foreign key constraints
         self.conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -258,21 +357,10 @@ impl Database {
         match existing_version {
             Some(v) if v == SCHEMA_VERSION => {
                 // Schema already initialized and version matches
-                // Ensure claude_sessions table exists (may have been added mid-v5)
-                self.ensure_claude_sessions_table()?;
-                return Ok(());
-            }
-            Some(3) => {
-                // Migrate from v3 to v4 (which chains to v5)
-                self.migrate_v3_to_v4()?;
-                return Ok(());
-            }
-            Some(4) => {
-                // Migrate from v4 to v5
-                self.migrate_v4_to_v5()?;
                 return Ok(());
             }
             Some(v) => {
+                // No migrations supported - schema v6 is a breaking change
                 return Err(DbError::SchemaVersionMismatch {
                     found: v,
                     expected: SCHEMA_VERSION,
@@ -297,13 +385,16 @@ impl Database {
                 type TEXT NOT NULL,
                 source TEXT NOT NULL,
                 schema_version INTEGER DEFAULT 1,
-                data TEXT NOT NULL,
-
-                -- Extracted for indexing (duplicated from data)
                 cwd TEXT,
+                git_project TEXT,
+                git_workspace TEXT,
+                pane_id TEXT,
+                tmux_session TEXT,
+                window_index INTEGER,
+                status TEXT,
+                idle_duration_ms INTEGER,
+                action TEXT,
                 session_id TEXT,
-
-                -- Stream assignment (null = 'Uncategorized')
                 stream_id TEXT,
                 assignment_source TEXT DEFAULT 'inferred',
 
@@ -337,6 +428,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_id);
             CREATE INDEX IF NOT EXISTS idx_events_cwd ON events(cwd);
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_events_git_project ON events(git_project);
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
 
@@ -371,117 +463,6 @@ impl Database {
         Ok(())
     }
 
-    /// Migrate from schema v3 to v4.
-    ///
-    /// Adds the `stream_tags` table for flexible stream categorization
-    /// and the `claude_sessions` table for Claude Code session indexing.
-    fn migrate_v3_to_v4(&self) -> Result<(), DbError> {
-        self.conn.execute_batch(
-            "
-            -- Stream tags table: flexible metadata for streams
-            CREATE TABLE IF NOT EXISTS stream_tags (
-                stream_id TEXT NOT NULL,
-                tag TEXT NOT NULL,
-                PRIMARY KEY (stream_id, tag),
-                FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE CASCADE
-            );
-
-            -- Index for finding streams by tag
-            CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
-
-            -- Claude sessions table: indexed Claude Code sessions
-            -- Note: session_type column will be added by v4->v5 migration
-            CREATE TABLE IF NOT EXISTS claude_sessions (
-                claude_session_id TEXT PRIMARY KEY,
-                parent_session_id TEXT,
-                project_path TEXT NOT NULL,
-                project_name TEXT NOT NULL,
-                start_time TEXT NOT NULL,
-                end_time TEXT,
-                message_count INTEGER NOT NULL,
-                summary TEXT,
-                user_prompts TEXT DEFAULT '[]',
-                starting_prompt TEXT,
-                assistant_message_count INTEGER DEFAULT 0,
-                tool_call_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
-
-            -- Update schema version
-            UPDATE schema_info SET version = 4;
-            ",
-        )?;
-        // Continue migration to v5
-        self.migrate_v4_to_v5()?;
-        Ok(())
-    }
-
-    /// Migrate from schema v4 to v5.
-    ///
-    /// Adds the `session_type` column to the `claude_sessions` table.
-    fn migrate_v4_to_v5(&self) -> Result<(), DbError> {
-        self.conn.execute_batch(
-            "
-            -- Add session_type column to claude_sessions
-            ALTER TABLE claude_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'user';
-
-            -- Update schema version
-            UPDATE schema_info SET version = 5;
-            ",
-        )?;
-        Ok(())
-    }
-
-    /// Ensures the `claude_sessions` table exists (for mid-version additions).
-    fn ensure_claude_sessions_table(&self) -> Result<(), DbError> {
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS claude_sessions (
-                claude_session_id TEXT PRIMARY KEY,
-                parent_session_id TEXT,
-                session_type TEXT NOT NULL DEFAULT 'user',
-                project_path TEXT NOT NULL,
-                project_name TEXT NOT NULL,
-                start_time TEXT NOT NULL,
-                end_time TEXT,
-                message_count INTEGER NOT NULL,
-                summary TEXT,
-                user_prompts TEXT DEFAULT '[]',
-                starting_prompt TEXT,
-                assistant_message_count INTEGER DEFAULT 0,
-                tool_call_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
-            ",
-        )?;
-        // Add columns if they don't exist (for existing tables)
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_sessions ADD COLUMN user_prompts TEXT DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_sessions ADD COLUMN starting_prompt TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_sessions ADD COLUMN assistant_message_count INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_sessions ADD COLUMN tool_call_count INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'user'",
-            [],
-        );
-        Ok(())
-    }
-
     /// Inserts a single event into the database.
     ///
     /// Uses `INSERT OR IGNORE` for idempotent upserts. If an event with the
@@ -502,12 +483,11 @@ impl Database {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO events (id, timestamp, type, source, schema_version, data, cwd, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR IGNORE INTO events (id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )?;
 
             for event in events {
-                let data_json = serde_json::to_string(&event.data).unwrap_or_default();
                 let timestamp_str = format_timestamp(event.timestamp);
 
                 let rows = stmt.execute(params![
@@ -516,9 +496,18 @@ impl Database {
                     event.event_type,
                     event.source,
                     event.schema_version,
-                    data_json,
                     event.cwd,
+                    event.git_project,
+                    event.git_workspace,
+                    event.pane_id,
+                    event.tmux_session,
+                    event.window_index,
+                    event.status,
+                    event.idle_duration_ms,
+                    event.action,
                     event.session_id,
+                    event.stream_id,
+                    event.assignment_source,
                 ])?;
 
                 count += rows;
@@ -538,14 +527,14 @@ impl Database {
     /// * `after` - If provided, only events after this timestamp are returned.
     /// * `before` - If provided, only events before this timestamp are returned.
     ///
-    /// Events with malformed JSON in the `data` column are skipped with a warning.
+    /// Events with malformed timestamps are skipped with a warning.
     pub fn get_events(
         &self,
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let mut sql = String::from(
-            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -579,7 +568,7 @@ impl Database {
     /// Retrieves events within an inclusive time range.
     ///
     /// Events are returned ordered by timestamp ascending.
-    /// Events with malformed JSON in the `data` column are skipped with a warning.
+    /// Events with malformed timestamps are skipped with a warning.
     ///
     /// # Arguments
     ///
@@ -591,7 +580,7 @@ impl Database {
         end: DateTime<Utc>,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events
              WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp ASC",
@@ -712,7 +701,7 @@ impl Database {
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_by_stream(&self, stream_id: &str) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
         )?;
 
@@ -732,7 +721,7 @@ impl Database {
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_without_stream(&self) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, data, cwd, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC",
         )?;
 
@@ -858,12 +847,7 @@ impl Database {
             .prepare("SELECT tag FROM stream_tags WHERE stream_id = ?1 ORDER BY tag ASC")?;
 
         let rows = stmt.query_map(params![stream_id], |row| row.get(0))?;
-
-        let mut tags = Vec::new();
-        for tag_result in rows {
-            tags.push(tag_result?);
-        }
-        Ok(tags)
+        rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
     }
 
     /// Removes a tag from a stream.
@@ -954,20 +938,28 @@ impl Database {
     /// Helper to convert a row to a `StoredEvent`.
     ///
     /// Expects the row to have columns in this order:
-    /// `id`, `timestamp`, `type`, `source`, `schema_version`, `data`, `cwd`, `session_id`, `stream_id`, `assignment_source`
+    /// `id`, `timestamp`, `type`, `source`, `schema_version`, `cwd`, `git_project`, `git_workspace`,
+    /// `pane_id`, `tmux_session`, `window_index`, `session_id`, `stream_id`, `assignment_source`
     ///
-    /// Returns `None` if the row has malformed timestamp or JSON data (with a warning logged).
+    /// Returns `None` if the row has malformed timestamp (with a warning logged).
     fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Option<StoredEvent>, rusqlite::Error> {
         let id: String = row.get(0)?;
         let timestamp_str: String = row.get(1)?;
         let event_type: String = row.get(2)?;
         let source: String = row.get(3)?;
         let schema_version: i32 = row.get(4)?;
-        let data_str: String = row.get(5)?;
-        let cwd: Option<String> = row.get(6)?;
-        let session_id: Option<String> = row.get(7)?;
-        let stream_id: Option<String> = row.get(8)?;
-        let assignment_source: Option<String> = row.get(9)?;
+        let cwd: Option<String> = row.get(5)?;
+        let git_project: Option<String> = row.get(6)?;
+        let git_workspace: Option<String> = row.get(7)?;
+        let pane_id: Option<String> = row.get(8)?;
+        let tmux_session: Option<String> = row.get(9)?;
+        let window_index: Option<u32> = row.get(10)?;
+        let status: Option<String> = row.get(11)?;
+        let idle_duration_ms: Option<i64> = row.get(12)?;
+        let action: Option<String> = row.get(13)?;
+        let session_id: Option<String> = row.get(14)?;
+        let stream_id: Option<String> = row.get(15)?;
+        let assignment_source: Option<String> = row.get(16)?;
 
         let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
             Ok(dt) => dt.with_timezone(&Utc),
@@ -977,26 +969,29 @@ impl Database {
             }
         };
 
-        let data: serde_json::Value = match serde_json::from_str(&data_str) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(event_id = %id, error = %e, "skipping event with malformed JSON data");
-                return Ok(None);
-            }
-        };
-
-        Ok(Some(StoredEvent {
+        let mut event = StoredEvent {
             id,
             timestamp,
             event_type,
             source,
             schema_version,
-            data,
+            pane_id,
+            tmux_session,
+            window_index,
+            git_project,
+            git_workspace,
+            status,
+            idle_duration_ms,
+            action,
             cwd,
             session_id,
             stream_id,
             assignment_source,
-        }))
+            data: serde_json::Value::Null,
+        };
+        // Populate data field from explicit fields for AllocatableEvent::data()
+        event.data = event.build_data_json();
+        Ok(Some(event))
     }
 
     /// Helper to convert a row to a Stream.
@@ -1254,16 +1249,19 @@ mod tests {
             event_type: "tmux_pane_focus".to_string(),
             source: "remote.tmux".to_string(),
             schema_version: 1,
-            data: json!({
-                "pane_id": "%3",
-                "session_name": "dev",
-                "window_index": 1,
-                "cwd": "/home/sami/project-x"
-            }),
+            pane_id: Some("%3".to_string()),
+            tmux_session: Some("dev".to_string()),
+            window_index: Some(1),
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some("/home/sami/project-x".to_string()),
             session_id: None,
             stream_id: None,
             assignment_source: None,
+            data: json!({}),
         }
     }
 
@@ -1281,19 +1279,22 @@ mod tests {
         let event = StoredEvent {
             id: "test-event-123".to_string(),
             timestamp: ts,
-            event_type: "agent_session".to_string(),
-            source: "remote.agent".to_string(),
+            event_type: "tmux_pane_focus".to_string(),
+            source: "remote.tmux".to_string(),
             schema_version: 1,
-            data: json!({
-                "action": "started",
-                "agent": "claude-code",
-                "session_id": "abc123",
-                "cwd": "/home/sami/project"
-            }),
+            pane_id: Some("%42".to_string()),
+            tmux_session: Some("main".to_string()),
+            window_index: Some(2),
+            git_project: Some("my-project".to_string()),
+            git_workspace: Some("feature".to_string()),
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some("/home/sami/project".to_string()),
             session_id: Some("abc123".to_string()),
             stream_id: None,
             assignment_source: None,
+            data: serde_json::Value::Null,
         };
 
         let inserted = db.insert_event(&event).unwrap();
@@ -1305,10 +1306,14 @@ mod tests {
         let retrieved = &events[0];
         assert_eq!(retrieved.id, "test-event-123");
         assert_eq!(retrieved.timestamp, ts);
-        assert_eq!(retrieved.event_type, "agent_session");
-        assert_eq!(retrieved.source, "remote.agent");
+        assert_eq!(retrieved.event_type, "tmux_pane_focus");
+        assert_eq!(retrieved.source, "remote.tmux");
         assert_eq!(retrieved.schema_version, 1);
-        assert_eq!(retrieved.data["action"], "started");
+        assert_eq!(retrieved.pane_id, Some("%42".to_string()));
+        assert_eq!(retrieved.tmux_session, Some("main".to_string()));
+        assert_eq!(retrieved.window_index, Some(2));
+        assert_eq!(retrieved.git_project, Some("my-project".to_string()));
+        assert_eq!(retrieved.git_workspace, Some("feature".to_string()));
         assert_eq!(retrieved.cwd, Some("/home/sami/project".to_string()));
         assert_eq!(retrieved.session_id, Some("abc123".to_string()));
     }
@@ -1490,11 +1495,19 @@ mod tests {
             event_type: "heartbeat".to_string(),
             source: "remote.tmux".to_string(),
             schema_version: 1,
-            data: json!({}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: None,
             session_id: None,
             stream_id: None,
             assignment_source: None,
+            data: json!({}),
         };
 
         db.insert_event(&event).unwrap();
@@ -1542,18 +1555,18 @@ mod tests {
     }
 
     #[test]
-    fn test_get_events_skips_malformed_json() {
+    fn test_get_events_skips_malformed_timestamp() {
         let db = Database::open_in_memory().unwrap();
 
         // Insert a valid event
         let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         db.insert_event(&make_event("valid", ts)).unwrap();
 
-        // Insert malformed JSON directly
+        // Insert malformed timestamp directly
         db.conn
             .execute(
-                "INSERT INTO events (id, timestamp, type, source, schema_version, data)
-                 VALUES ('malformed', '2025-01-15T11:00:00Z', 'test', 'test', 1, 'not valid json {')",
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES ('malformed', 'not a valid timestamp', 'test', 'test', 1)",
                 [],
             )
             .unwrap();
@@ -1601,11 +1614,19 @@ mod tests {
             event_type: "test_event".to_string(),
             source: source.to_string(),
             schema_version: 1,
-            data: json!({}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: None,
             session_id: None,
             stream_id: None,
             assignment_source: None,
+            data: json!({}),
         }
     }
 
@@ -2052,99 +2073,8 @@ mod tests {
         assert_eq!(sessions[0].tool_call_count, 12);
     }
 
-    #[test]
-    fn test_schema_migration_v3_to_v4() {
-        // Create a temporary database file
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-
-        // Create database with v3 schema (without stream_tags table)
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "
-                CREATE TABLE schema_info (version INTEGER NOT NULL);
-                INSERT INTO schema_info (version) VALUES (3);
-
-                CREATE TABLE events (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    schema_version INTEGER DEFAULT 1,
-                    data TEXT NOT NULL,
-                    cwd TEXT,
-                    session_id TEXT,
-                    stream_id TEXT,
-                    assignment_source TEXT DEFAULT 'inferred'
-                );
-
-                CREATE TABLE streams (
-                    id TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    name TEXT,
-                    time_direct_ms INTEGER DEFAULT 0,
-                    time_delegated_ms INTEGER DEFAULT 0,
-                    first_event_at TEXT,
-                    last_event_at TEXT,
-                    needs_recompute INTEGER DEFAULT 0
-                );
-
-                -- Insert some test data
-                INSERT INTO streams (id, created_at, updated_at, name)
-                VALUES ('test-stream', '2025-01-15T10:00:00Z', '2025-01-15T10:00:00Z', 'test');
-                ",
-            )
-            .unwrap();
-        }
-
-        // Opening with the new code should migrate to v4
-        let db = Database::open(&db_path).unwrap();
-
-        // Verify migration happened - stream_tags table should exist and be usable
-        db.add_tag("test-stream", "migrated-tag").unwrap();
-        let tags = db.get_tags("test-stream").unwrap();
-        assert_eq!(tags, vec!["migrated-tag"]);
-
-        // Verify existing data is preserved
-        let stream = db.get_stream("test-stream").unwrap();
-        assert!(stream.is_some());
-        assert_eq!(stream.unwrap().name, Some("test".to_string()));
-
-        // Verify schema version is now 5 (v3->v4->v5 migration chain)
-        let version: i32 = db
-            .conn
-            .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 5);
-
-        // Verify claude_sessions table was created and is usable
-        let entry = tt_core::session::ClaudeSession {
-            claude_session_id: "migrated-session".to_string(),
-            parent_session_id: None,
-            session_type: tt_core::session::SessionType::default(),
-            project_path: "/home/user/project".to_string(),
-            project_name: "project".to_string(),
-            start_time: Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap(),
-            end_time: Some(Utc.with_ymd_and_hms(2026, 1, 29, 11, 0, 0).unwrap()),
-            message_count: 5,
-            summary: Some("Migrated session test".to_string()),
-            user_prompts: vec!["test prompt".to_string()],
-            starting_prompt: Some("test prompt".to_string()),
-            assistant_message_count: 3,
-            tool_call_count: 7,
-            user_message_timestamps: Vec::new(),
-        };
-        db.upsert_claude_session(&entry).unwrap();
-
-        let start = Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
-        let sessions = db.claude_sessions_in_range(start, end).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].claude_session_id, "migrated-session");
-        assert_eq!(sessions[0].user_prompts, vec!["test prompt"]);
-    }
+    // NOTE: Migration tests removed. Schema v6 is a breaking change - old databases
+    // must be deleted and re-imported from events.jsonl.
 
     // ========== streams_in_range Tests ==========
 

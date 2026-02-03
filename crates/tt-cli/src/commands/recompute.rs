@@ -53,16 +53,15 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
     // Filter results to only streams we want to update
     let times_to_update: Vec<_> = if force {
         // Update all streams that have time computed
-        result.stream_times.clone()
+        result.stream_times
     } else {
         // Only update streams that were marked for recomputation
         let stream_ids_to_update: std::collections::HashSet<_> =
             streams.iter().map(|s| s.id.as_str()).collect();
         result
             .stream_times
-            .iter()
+            .into_iter()
             .filter(|t| stream_ids_to_update.contains(t.stream_id.as_str()))
-            .cloned()
             .collect()
     };
 
@@ -113,11 +112,19 @@ mod tests {
             event_type: "tmux_pane_focus".to_string(),
             source: "remote.tmux".to_string(),
             schema_version: 1,
-            data: json!({"pane_id": "%1", "cwd": cwd}),
+            pane_id: Some("%1".to_string()),
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some(cwd.to_string()),
             session_id: None,
             stream_id: Some(stream_id.to_string()),
             assignment_source: Some("inferred".to_string()),
+            data: json!({}),
         }
     }
 
@@ -134,11 +141,19 @@ mod tests {
             event_type: "agent_session".to_string(),
             source: "remote.agent".to_string(),
             schema_version: 1,
-            data: json!({"action": action, "agent": "claude-code"}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: Some(action.to_string()),
             cwd: Some("/project".to_string()),
             session_id: Some(session_id.to_string()),
             stream_id: Some(stream_id.to_string()),
             assignment_source: Some("inferred".to_string()),
+            data: json!({}),
         }
     }
 
@@ -154,11 +169,19 @@ mod tests {
             event_type: "agent_tool_use".to_string(),
             source: "remote.agent".to_string(),
             schema_version: 1,
-            data: json!({"tool": "Edit"}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some("/project".to_string()),
             session_id: Some(session_id.to_string()),
             stream_id: Some(stream_id.to_string()),
             assignment_source: Some("inferred".to_string()),
+            data: json!({}),
         }
     }
 

@@ -57,11 +57,19 @@ mod tests {
             event_type: "test_event".to_string(),
             source: source.to_string(),
             schema_version: 1,
-            data: json!({}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: None,
             session_id: None,
             stream_id: None,
             assignment_source: None,
+            data: json!({}),
         }
     }
 

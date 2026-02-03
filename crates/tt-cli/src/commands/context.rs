@@ -47,6 +47,10 @@ pub struct EventExport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
@@ -113,10 +117,27 @@ fn export_events(
         .get_events_in_range(start, end)?
         .into_iter()
         .map(|e| EventExport {
-            claude_session_id: extract_str(&e.data, "claude_session_id"),
-            tmux_session: extract_str(&e.data, "tmux_session")
+            claude_session_id: e
+                .session_id
+                .clone()
+                .or_else(|| extract_str(&e.data, "claude_session_id")),
+            tmux_session: e
+                .tmux_session
+                .clone()
+                .or_else(|| extract_str(&e.data, "tmux_session"))
                 .or_else(|| extract_str(&e.data, "session_name")),
-            pane_id: extract_str(&e.data, "pane_id"),
+            pane_id: e
+                .pane_id
+                .clone()
+                .or_else(|| extract_str(&e.data, "pane_id")),
+            git_project: e
+                .git_project
+                .clone()
+                .or_else(|| extract_str(&e.data, "git_project")),
+            git_workspace: e
+                .git_workspace
+                .clone()
+                .or_else(|| extract_str(&e.data, "git_workspace")),
             id: e.id,
             timestamp: e.timestamp,
             event_type: e.event_type,
@@ -335,6 +356,35 @@ pub fn run(
 mod tests {
     use super::*;
 
+    /// Helper to create a basic `StoredEvent` for tests.
+    fn make_test_event(
+        id: &str,
+        timestamp: chrono::DateTime<Utc>,
+        event_type: &str,
+        source: &str,
+    ) -> tt_db::StoredEvent {
+        tt_db::StoredEvent {
+            id: id.to_string(),
+            timestamp,
+            event_type: event_type.to_string(),
+            source: source.to_string(),
+            schema_version: 1,
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
+            cwd: None,
+            session_id: None,
+            stream_id: None,
+            assignment_source: None,
+            data: serde_json::json!({}),
+        }
+    }
+
     #[test]
     fn test_context_output_serializes_without_optional_fields() {
         let output = ContextOutput {
@@ -381,6 +431,8 @@ mod tests {
                 event_type: "tmux_pane_focus".to_string(),
                 source: "remote.tmux".to_string(),
                 cwd: Some("/home/user/project".to_string()),
+                git_project: Some("project".to_string()),
+                git_workspace: Some("default".to_string()),
                 claude_session_id: None,
                 tmux_session: Some("main".to_string()),
                 pane_id: Some("%0".to_string()),
@@ -407,6 +459,8 @@ mod tests {
             event_type: "test".to_string(),
             source: "test".to_string(),
             cwd: None,
+            git_project: None,
+            git_workspace: None,
             claude_session_id: None,
             tmux_session: None,
             pane_id: None,
@@ -666,29 +720,21 @@ mod tests {
 
     #[test]
     fn test_export_events_extracts_fields_from_stored_event() {
-        use serde_json::json;
-
         let db = tt_db::Database::open_in_memory().unwrap();
 
-        // Create a test event with data containing session info
-        let event = tt_db::StoredEvent {
-            id: "test-event-123".to_string(),
-            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+        // Create a test event with explicit fields
+        let mut event = make_test_event(
+            "test-event-123",
+            chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: json!({
-                "claude_session_id": "session-abc",
-                "tmux_session": "main",
-                "pane_id": "%0"
-            }),
-            cwd: Some("/home/user/project".to_string()),
-            session_id: None,
-            stream_id: None, // Will be assigned separately
-            assignment_source: None,
-        };
+            "tmux_pane_focus",
+            "remote.tmux",
+        );
+        event.session_id = Some("session-abc".to_string());
+        event.tmux_session = Some("main".to_string());
+        event.pane_id = Some("%0".to_string());
+        event.cwd = Some("/home/user/project".to_string());
 
         db.insert_event(&event).unwrap();
 
@@ -738,27 +784,18 @@ mod tests {
 
     #[test]
     fn test_export_events_extracts_session_name_as_tmux_session() {
-        use serde_json::json;
-
         let db = tt_db::Database::open_in_memory().unwrap();
 
-        // Create a test event using "session_name" instead of "tmux_session"
-        let event = tt_db::StoredEvent {
-            id: "test-event-456".to_string(),
-            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+        // Create a test event with tmux_session field
+        let mut event = make_test_event(
+            "test-event-456",
+            chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: json!({
-                "session_name": "dev"
-            }),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+            "tmux_pane_focus",
+            "remote.tmux",
+        );
+        event.tmux_session = Some("dev".to_string());
 
         db.insert_event(&event).unwrap();
 
@@ -949,7 +986,6 @@ mod tests {
     #[test]
     fn test_export_gaps_finds_gaps_exceeding_threshold() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -957,30 +993,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 10, 0).unwrap(); // 10 min later
 
-        let event1 = StoredEvent {
-            id: "e1".to_string(),
-            timestamp: ts1,
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
-        let event2 = StoredEvent {
-            id: "e2".to_string(),
-            timestamp: ts2,
-            event_type: "user_message".to_string(),
-            source: "remote.agent".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
+        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -999,7 +1013,6 @@ mod tests {
     #[test]
     fn test_export_gaps_ignores_gaps_below_threshold() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -1007,30 +1020,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 3, 0).unwrap(); // 3 min later
 
-        let event1 = StoredEvent {
-            id: "e1".to_string(),
-            timestamp: ts1,
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
-        let event2 = StoredEvent {
-            id: "e2".to_string(),
-            timestamp: ts2,
-            event_type: "user_message".to_string(),
-            source: "remote.agent".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
+        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1046,7 +1037,6 @@ mod tests {
     #[test]
     fn test_export_gaps_empty_or_single_event_returns_empty() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -1059,18 +1049,7 @@ mod tests {
 
         // Single user event - no gaps (need at least 2 to form a gap)
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
-        let event1 = StoredEvent {
-            id: "e1".to_string(),
-            timestamp: ts1,
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
         db.insert_event(&event1).unwrap();
 
         let gaps = export_gaps(&db, start, end, 5).unwrap();
@@ -1080,7 +1059,6 @@ mod tests {
     #[test]
     fn test_export_gaps_ignores_non_user_events() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -1089,42 +1067,9 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 5, 0).unwrap(); // non-user event
         let ts3 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 20, 0).unwrap(); // 20 min after first
 
-        let event1 = StoredEvent {
-            id: "e1".to_string(),
-            timestamp: ts1,
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
-        let event2 = StoredEvent {
-            id: "e2".to_string(),
-            timestamp: ts2,
-            event_type: "agent_tool_use".to_string(), // NOT a user event
-            source: "remote.agent".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
-        let event3 = StoredEvent {
-            id: "e3".to_string(),
-            timestamp: ts3,
-            event_type: "window_focus".to_string(),
-            source: "remote.window".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
+        let event2 = make_test_event("e2", ts2, "agent_tool_use", "remote.agent"); // NOT a user event
+        let event3 = make_test_event("e3", ts3, "window_focus", "remote.window");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1143,25 +1088,19 @@ mod tests {
 
     #[test]
     fn test_export_events_without_stream_assignment() {
-        use serde_json::json;
-
         let db = tt_db::Database::open_in_memory().unwrap();
 
         // Create event without stream_id
-        let event = tt_db::StoredEvent {
-            id: "unassigned-event".to_string(),
-            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+        let mut event = make_test_event(
+            "unassigned-event",
+            chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: json!({"pane_id": "%1"}),
-            cwd: Some("/home/user/project".to_string()),
-            session_id: None,
-            stream_id: None, // No stream assignment
-            assignment_source: None,
-        };
+            "tmux_pane_focus",
+            "remote.tmux",
+        );
+        event.pane_id = Some("%1".to_string());
+        event.cwd = Some("/home/user/project".to_string());
 
         db.insert_event(&event).unwrap();
 
@@ -1181,7 +1120,6 @@ mod tests {
     #[test]
     fn test_export_gaps_exact_threshold() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -1189,30 +1127,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 5, 0).unwrap(); // Exactly 5 min
 
-        let event1 = StoredEvent {
-            id: "e1".to_string(),
-            timestamp: ts1,
-            event_type: "tmux_pane_focus".to_string(),
-            source: "remote.tmux".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
-        let event2 = StoredEvent {
-            id: "e2".to_string(),
-            timestamp: ts2,
-            event_type: "user_message".to_string(),
-            source: "remote.agent".to_string(),
-            schema_version: 1,
-            data: serde_json::json!({}),
-            cwd: None,
-            session_id: None,
-            stream_id: None,
-            assignment_source: None,
-        };
+        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
+        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1260,7 +1176,6 @@ mod tests {
     #[test]
     fn test_export_gaps_multiple_gaps() {
         use chrono::TimeZone;
-        use tt_db::StoredEvent;
 
         let db = tt_db::Database::open_in_memory().unwrap();
 
@@ -1273,18 +1188,7 @@ mod tests {
         ];
 
         for (i, ts) in times.iter().enumerate() {
-            let event = StoredEvent {
-                id: format!("e{i}"),
-                timestamp: *ts,
-                event_type: "tmux_pane_focus".to_string(),
-                source: "remote.tmux".to_string(),
-                schema_version: 1,
-                data: serde_json::json!({}),
-                cwd: None,
-                session_id: None,
-                stream_id: None,
-                assignment_source: None,
-            };
+            let event = make_test_event(&format!("e{i}"), *ts, "tmux_pane_focus", "remote.tmux");
             db.insert_event(&event).unwrap();
         }
 

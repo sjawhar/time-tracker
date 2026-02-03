@@ -35,60 +35,68 @@ pub struct IngestEvent {
     /// The tmux window index.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_index: Option<u32>,
-    /// The jj project name (from git remote origin).
+    /// The git project name (from git remote origin).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jj_project: Option<String>,
-    /// The jj workspace name (if in a non-default workspace).
+    pub git_project: Option<String>,
+    /// The git workspace name (if in a non-default workspace).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jj_workspace: Option<String>,
+    pub git_workspace: Option<String>,
 }
 
 fn default_source() -> String {
     "remote.tmux".to_string()
 }
 
-/// Get project identity for a directory using jj commands.
-fn get_jj_identity(cwd: &std::path::Path) -> Option<ProjectIdentity> {
+/// Get project identity for a directory using jj/git commands.
+/// Falls back to using the directory name if jj commands fail.
+fn get_git_identity(cwd: &std::path::Path) -> Option<ProjectIdentity> {
     use std::process::Command;
 
     if !cwd.join(".jj").exists() {
         return None;
     }
 
+    // Try to get info from jj commands, but fall back to directory name if they fail
     let remote_output = Command::new("jj")
         .args(["git", "remote", "list", "--ignore-working-copy"])
         .current_dir(cwd)
         .output()
-        .ok()?;
+        .ok();
 
-    let remote_str = String::from_utf8_lossy(&remote_output.stdout);
-    let remote_url = remote_str
-        .lines()
-        .find(|line| line.contains("origin"))
-        .and_then(|line| line.split_whitespace().nth(1));
+    let remote_url = remote_output.as_ref().and_then(|output| {
+        let remote_str = String::from_utf8_lossy(&output.stdout);
+        remote_str
+            .lines()
+            .find(|line| line.contains("origin"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(String::from)
+    });
 
     let workspace_output = Command::new("jj")
         .args(["workspace", "list", "--ignore-working-copy"])
         .current_dir(cwd)
         .output()
-        .ok()?;
+        .ok();
 
-    let workspace_count = String::from_utf8_lossy(&workspace_output.stdout)
-        .lines()
-        .count();
+    let workspace_count = workspace_output.as_ref().map_or(1, |output| {
+        String::from_utf8_lossy(&output.stdout).lines().count()
+    });
 
     let root_output = Command::new("jj")
         .args(["root", "--ignore-working-copy"])
         .current_dir(cwd)
         .output()
-        .ok()?;
+        .ok();
 
-    let jj_root = String::from_utf8_lossy(&root_output.stdout)
-        .trim()
-        .to_string();
+    // Use jj root if available, otherwise use the cwd
+    let jj_root = root_output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.to_string_lossy().to_string());
 
     Some(ProjectIdentity::from_jj_output(
-        remote_url,
+        remote_url.as_deref(),
         workspace_count,
         &jj_root,
     ))
@@ -106,7 +114,7 @@ impl IngestEvent {
         let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let id = format!("remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
 
-        let jj_identity = get_jj_identity(Path::new(&cwd));
+        let git_identity = get_git_identity(Path::new(&cwd));
 
         Self {
             id,
@@ -117,8 +125,8 @@ impl IngestEvent {
             pane_id,
             tmux_session,
             window_index,
-            jj_project: jj_identity.as_ref().map(|i| i.project_name.clone()),
-            jj_workspace: jj_identity.and_then(|i| i.workspace_name),
+            git_project: git_identity.as_ref().map(|i| i.project_name.clone()),
+            git_workspace: git_identity.and_then(|i| i.workspace_name),
         }
     }
 }
@@ -413,15 +421,19 @@ fn create_session_events(session: &ClaudeSession) -> Vec<StoredEvent> {
             event_type: event_type.to_string(),
             source: "claude".to_string(),
             schema_version: 1,
-            data: json!({
-                "claude_session_id": session.claude_session_id,
-                "project_path": session.project_path,
-                "session_type": session.session_type.as_str(),
-            }),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some(session.project_path.clone()),
             session_id: Some(session.claude_session_id.clone()),
             stream_id: None,
             assignment_source: None,
+            data: json!({}),
         };
 
     let mut events = Vec::new();
@@ -895,7 +907,7 @@ fn test_debounce_file_corruption_recovery() {
 }
 
 #[test]
-fn test_jj_identity_extraction_from_jj_directory() {
+fn test_git_identity_extraction_from_jj_directory() {
     let temp_dir = tempfile::tempdir().unwrap();
     let data_dir = temp_dir.path().join(".time-tracker");
 
@@ -912,9 +924,9 @@ fn test_jj_identity_extraction_from_jj_directory() {
 
     let events = read_events_from(&data_dir).unwrap();
     assert_eq!(events.len(), 1);
-    // jj_project is extracted from the directory name when jj is present
+    // git_project is extracted from the directory name when jj is present
     // but no git remote is configured
-    assert_eq!(events[0].jj_project, Some("my-project".to_string()));
+    assert_eq!(events[0].git_project, Some("my-project".to_string()));
 }
 
 #[test]
@@ -932,9 +944,9 @@ fn test_no_jj_directory_returns_no_identity() {
 
     let events = read_events_from(&data_dir).unwrap();
     assert_eq!(events.len(), 1);
-    // jj fields should be None when there's no .jj directory
-    assert_eq!(events[0].jj_project, None);
-    assert_eq!(events[0].jj_workspace, None);
+    // git fields should be None when there's no .jj directory
+    assert_eq!(events[0].git_project, None);
+    assert_eq!(events[0].git_workspace, None);
 }
 
 #[test]

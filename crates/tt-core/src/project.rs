@@ -1,8 +1,8 @@
-//! jj/git project identity extraction.
+//! Git project identity extraction.
 
 use std::path::Path;
 
-/// Project identity from jj context.
+/// Project identity from git/jj context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectIdentity {
     pub project_name: String,
@@ -10,12 +10,24 @@ pub struct ProjectIdentity {
 }
 
 /// Extract repo name from a git remote URL.
+///
+/// Handles both HTTPS and SSH URL formats:
+/// - `https://github.com/user/repo.git` -> "repo"
+/// - `git@github.com:user/repo.git` -> "repo"
+/// - `git@github.com:repo.git` -> "repo"
 pub fn parse_remote_name(url: &str) -> Option<String> {
-    let name = url
-        .rsplit('/')
-        .next()
-        .or_else(|| url.rsplit(':').next())?
-        .trim_end_matches(".git");
+    // First try splitting by '/' for HTTPS URLs or SSH URLs with user path
+    let after_slash = url.rsplit('/').next()?;
+
+    // If the result still contains ':', it's an SSH URL without a '/' after the host
+    // e.g., "git@github.com:repo.git" -> after_slash is "git@github.com:repo.git"
+    let name = if after_slash.contains(':') {
+        after_slash.rsplit(':').next()?
+    } else {
+        after_slash
+    };
+
+    let name = name.trim_end_matches(".git");
 
     if name.is_empty() {
         None
@@ -60,14 +72,29 @@ mod tests {
 
     #[test]
     fn test_parse_git_remote_url() {
+        // HTTPS format
         assert_eq!(
             parse_remote_name("https://github.com/user/time-tracker.git"),
             Some("time-tracker".to_string())
         );
+        // SSH format with user path
         assert_eq!(
             parse_remote_name("git@github.com:user/dotfiles.git"),
             Some("dotfiles".to_string())
         );
+        // SSH format without user path (edge case)
+        assert_eq!(
+            parse_remote_name("git@github.com:myrepo.git"),
+            Some("myrepo".to_string())
+        );
+        // Without .git suffix
+        assert_eq!(
+            parse_remote_name("https://github.com/user/project"),
+            Some("project".to_string())
+        );
+        // Empty and edge cases
+        assert_eq!(parse_remote_name(""), None);
+        assert_eq!(parse_remote_name(".git"), None);
     }
 
     #[test]

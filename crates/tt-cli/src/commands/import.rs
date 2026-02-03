@@ -48,7 +48,14 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         }
 
         match serde_json::from_str::<StoredEvent>(&line) {
-            Ok(event) => {
+            Ok(mut event) => {
+                // Clear stream_id and assignment_source during import - events will be
+                // re-assigned to streams after import via the inference algorithm.
+                // The original stream_id would violate foreign key constraints anyway
+                // since the stream doesn't exist in this database.
+                event.stream_id = None;
+                event.assignment_source = None;
+
                 result.total_read += 1;
                 batch.push(event);
 
