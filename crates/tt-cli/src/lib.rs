@@ -6,5 +6,5 @@ mod cli;
 pub mod commands;
 mod config;
 
-pub use cli::{Cli, Commands, IngestEvent};
+pub use cli::{Cli, Commands, IngestEvent, StreamsAction};
 pub use config::Config;

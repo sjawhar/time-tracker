@@ -67,7 +67,7 @@ pub fn get_streams_for_display(db: &Database, today: NaiveDate) -> Result<Vec<St
             stream.time_direct_ms > 0 || stream.time_delegated_ms > 0
         })
         .map(|(stream, tags)| {
-            let id_short = stream.id[..6.min(stream.id.len())].to_string();
+            let id_short: String = stream.id.chars().take(6).collect();
             StreamEntry {
                 id: stream.id,
                 id_short,
@@ -191,6 +191,34 @@ pub fn run(db: &Database, json: bool) -> Result<()> {
         print!("{output}");
     }
 
+    Ok(())
+}
+
+/// Create a new stream with the given name.
+///
+/// Generates a UUID, inserts the stream into the database, and prints the ID to stdout.
+pub fn create(db: &Database, name: String) -> Result<()> {
+    use anyhow::Context;
+    use tt_db::Stream;
+    use uuid::Uuid;
+
+    let now = Utc::now();
+
+    let stream = Stream {
+        id: Uuid::new_v4().to_string(),
+        name: Some(name),
+        created_at: now,
+        updated_at: now,
+        time_direct_ms: 0,
+        time_delegated_ms: 0,
+        first_event_at: None,
+        last_event_at: None,
+        needs_recompute: true,
+    };
+
+    db.insert_stream(&stream)
+        .context("failed to create stream")?;
+    println!("{}", stream.id);
     Ok(())
 }
 

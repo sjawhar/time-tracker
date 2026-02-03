@@ -72,18 +72,6 @@ pub enum Commands {
         before: Option<String>,
     },
 
-    /// Run stream inference on unassigned events.
-    ///
-    /// Clusters events into streams based on working directory and temporal
-    /// proximity (>30min gap starts a new stream).
-    Infer {
-        /// Clear all inferred assignments and re-run inference.
-        ///
-        /// User assignments are preserved.
-        #[arg(long)]
-        force: bool,
-    },
-
     /// Recompute direct/delegated time for streams.
     ///
     /// Uses the attention allocation algorithm to calculate time based on
@@ -120,27 +108,6 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Shortcut for `report --week`.
-    Week {
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Shortcut for `report --day`.
-    Today {
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Shortcut for `report --last-day`.
-    Yesterday {
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Add a tag to a stream.
     ///
     /// Tags are additive—multiple tags per stream are supported.
@@ -166,14 +133,62 @@ pub enum Commands {
         json: bool,
     },
 
-    /// List all streams with time totals and tags.
+    /// Manage streams.
+    #[command(subcommand)]
+    Streams(StreamsAction),
+
+    /// Output context for stream inference (JSON).
+    ///
+    /// Outputs JSON containing events, agents, streams, and gaps for a time range.
+    /// Each section is opt-in via flags.
+    Context {
+        /// Include chronological events.
+        #[arg(long)]
+        events: bool,
+
+        /// Include Claude session metadata.
+        #[arg(long)]
+        agents: bool,
+
+        /// Include existing streams.
+        #[arg(long)]
+        streams: bool,
+
+        /// Include gaps between user input events.
+        #[arg(long)]
+        gaps: bool,
+
+        /// Minimum gap duration to include (minutes).
+        #[arg(long, default_value = "5")]
+        gap_threshold: u32,
+
+        /// Start of time range (ISO 8601 or relative like "4 hours ago").
+        #[arg(long)]
+        start: Option<String>,
+
+        /// End of time range (ISO 8601, defaults to now).
+        #[arg(long)]
+        end: Option<String>,
+    },
+}
+
+/// Streams subcommand actions.
+#[derive(Debug, Subcommand)]
+pub enum StreamsAction {
+    /// List streams with time totals and tags.
     ///
     /// Shows streams from the last 7 days, sorted by total time.
     /// Use 'tt tag <id> <tag>' to organize streams into projects.
-    Streams {
+    List {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Create a new stream (prints ID to stdout).
+    Create {
+        /// Name for the stream.
+        name: String,
     },
 }
 
@@ -198,4 +213,9 @@ pub enum IngestEvent {
         #[arg(long)]
         window: Option<u32>,
     },
+
+    /// Index Claude Code sessions from ~/.claude/projects/.
+    ///
+    /// Scans session JSONL files and stores metadata in the database.
+    Sessions,
 }

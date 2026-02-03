@@ -28,6 +28,8 @@ figment.workspace = true
 iana-time-zone = "0.1"
 dirs.workspace = true
 fs2 = "0.4"
+regex = "1.11"
+uuid.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
