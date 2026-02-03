@@ -276,13 +276,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                     let idle_start = data
                         .get("idle_duration_ms")
                         .and_then(serde_json::Value::as_i64)
-                        .map_or(event_time, |duration_ms| {
-                            if duration_ms > 0 {
-                                event_time - Duration::milliseconds(duration_ms)
-                            } else {
-                                event_time
-                            }
-                        });
+                        .filter(|&ms| ms > 0)
+                        .map_or(event_time, |ms| event_time - Duration::milliseconds(ms));
 
                     // Close focus at idle_start, not event_time
                     if let FocusState::Focused { focus_start, .. } = &focus_state {

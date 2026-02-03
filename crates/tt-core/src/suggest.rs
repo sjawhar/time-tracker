@@ -126,11 +126,11 @@ fn extract_project_from_path(path: &str) -> Option<String> {
 
 /// Check if path components represent a user home directory.
 fn is_home_directory(components: &[&str]) -> bool {
-    match components {
+    matches!(
+        components,
         // /home/username, /Users/username (macOS), or /root
-        ["home" | "Users", _] | ["root"] => true,
-        _ => false,
-    }
+        ["home" | "Users", _] | ["root"]
+    )
 }
 
 /// Check if path is a generic system path not indicating a project.
