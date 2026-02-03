@@ -2,13 +2,18 @@
 //!
 //! This module implements `tt report` with various period options
 //! (--week, --last-week, --day, --last-day) and output formats (human-readable, JSON).
+//!
+//! Time is calculated from events within the period using the allocation algorithm,
+//! not from cumulative stream totals. This ensures accurate per-period reporting.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
-use tt_db::{Database, Stream};
+use tt_core::{AllocationConfig, allocate_time};
+use tt_db::Database;
 
 /// Report period type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +32,15 @@ pub enum PeriodType {
     Day,
 }
 
+/// Computed time for a stream within the report period.
+#[derive(Debug, Clone)]
+pub struct ReportStreamTime {
+    pub id: String,
+    pub name: Option<String>,
+    pub time_direct_ms: i64,
+    pub time_delegated_ms: i64,
+}
+
 /// Computed report data.
 #[derive(Debug)]
 pub struct ReportData {
@@ -35,7 +49,8 @@ pub struct ReportData {
     pub period_end: DateTime<Utc>,
     pub period_type: PeriodType,
     pub timezone: String,
-    pub streams: Vec<Stream>,
+    /// Time computed for each stream from events within the period.
+    pub streams: Vec<ReportStreamTime>,
 }
 
 // ========== Period Date Calculation ==========
@@ -160,6 +175,9 @@ pub fn progress_bar(value: i64, max: i64) -> String {
 // ========== Report Generation ==========
 
 /// Generates report data from the database.
+///
+/// Time is calculated from events within the period using the allocation algorithm,
+/// ensuring accurate per-period reporting (not cumulative totals).
 pub fn generate_report_data(
     db: &Database,
     period: Period,
@@ -175,15 +193,33 @@ pub fn generate_report_data(
 
     let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
 
-    // Get all streams and filter by period
-    let all_streams = db.get_streams()?;
-    let streams: Vec<_> = all_streams
+    // Get events within the period
+    let events = db
+        .get_events_in_range(period_start, period_end)
+        .context("failed to get events in period")?;
+
+    // Calculate time from events using the allocation algorithm
+    let config = AllocationConfig::default();
+    let result = allocate_time(&events, &config, Some(period_end));
+
+    // Get stream metadata (names) for display
+    let all_streams = db.get_streams().context("failed to get streams")?;
+    let stream_names: HashMap<String, Option<String>> = all_streams
         .into_iter()
-        .filter(|s| {
-            s.last_event_at
-                .is_some_and(|t| t >= period_start && t < period_end)
+        .map(|s| (s.id, s.name))
+        .collect();
+
+    // Convert allocation results to report format, excluding zero-time streams
+    let streams: Vec<ReportStreamTime> = result
+        .stream_times
+        .into_iter()
+        .filter(|t| t.time_direct_ms > 0 || t.time_delegated_ms > 0)
+        .map(|t| ReportStreamTime {
+            name: stream_names.get(&t.stream_id).cloned().flatten(),
+            id: t.stream_id,
+            time_direct_ms: t.time_direct_ms,
+            time_delegated_ms: t.time_delegated_ms,
         })
-        .filter(|s| s.time_direct_ms > 0 || s.time_delegated_ms > 0) // Exclude zero-time
         .collect();
 
     Ok(ReportData {
@@ -591,18 +627,12 @@ mod tests {
 
     // ========== Integration Tests (Snapshot) ==========
 
-    fn make_test_stream(id: &str, name: &str, direct_ms: i64, delegated_ms: i64) -> Stream {
-        let now = Utc::now();
-        Stream {
+    fn make_test_stream(id: &str, name: &str, direct_ms: i64, delegated_ms: i64) -> ReportStreamTime {
+        ReportStreamTime {
             id: id.to_string(),
             name: Some(name.to_string()),
-            created_at: now,
-            updated_at: now,
             time_direct_ms: direct_ms,
             time_delegated_ms: delegated_ms,
-            first_event_at: Some(now),
-            last_event_at: Some(now),
-            needs_recompute: false,
         }
     }
 
@@ -682,7 +712,7 @@ mod tests {
     #[test]
     fn test_report_truncation() {
         // Create 8 streams to test truncation (>5)
-        let streams: Vec<Stream> = (0..8)
+        let streams: Vec<ReportStreamTime> = (0..8)
             .map(|i| {
                 make_test_stream(
                     &format!("stream{i:02}abcdef"),
@@ -757,9 +787,9 @@ mod tests {
     fn test_zero_time_streams_excluded() {
         let db = tt_db::Database::open_in_memory().unwrap();
 
-        // Create a stream with zero time
+        // Create a stream with zero time (using tt_db::Stream for database insertion)
         let now = Utc::now();
-        let zero_stream = Stream {
+        let zero_stream = tt_db::Stream {
             id: "zero-stream".to_string(),
             name: Some("empty".to_string()),
             created_at: now,
@@ -772,10 +802,10 @@ mod tests {
         };
         db.insert_stream(&zero_stream).unwrap();
 
-        // Generate report
+        // Generate report - with no events, the allocation returns no time
         let data = generate_report_data(&db, Period::Week, now).unwrap();
 
-        // Zero-time stream should be excluded
+        // Zero-time stream should be excluded (no events = no time allocated)
         assert!(
             data.streams.is_empty(),
             "zero-time streams should be excluded"
