@@ -1,0 +1,22 @@
+---
+source: crates/tt-cli/src/commands/streams.rs
+expression: output
+---
+{
+  "streams": [
+    {
+      "id": "abc123def456",
+      "id_short": "abc123",
+      "name": "tmux/dev/session-1",
+      "time_direct_ms": 8100000,
+      "time_delegated_ms": 16200000,
+      "tags": [
+        "acme-webapp"
+      ]
+    }
+  ],
+  "period": {
+    "start": "2025-01-23",
+    "end": "2025-01-29"
+  }
+}

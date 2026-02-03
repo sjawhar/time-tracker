@@ -1,0 +1,24 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+expression: output
+---
+TIME REPORT: Week of Jan 27, 2025
+
+BY TAG
+──────
+(no tagged streams)
+
+(untagged)                                 4h 30m  ██████████
+  Direct:    2h 45m
+  Delegated: 1h 45m
+  Sessions:
+    abc123  tmux/dev/session-1        (3h 15m)
+    def456  tmux/dev/session-2        (1h 15m)
+
+  Tip: Run 'tt tag abc123 <project>' to assign
+
+SUMMARY
+───────
+Total tracked:  4h 30m
+Direct time:    2h 45m (61%)
+Delegated time: 1h 45m (39%)

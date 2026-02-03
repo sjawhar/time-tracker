@@ -1,0 +1,7 @@
+---
+source: crates/tt-cli/src/commands/status.rs
+expression: output
+---
+Database: /path/to/events.db
+
+No events recorded yet.
