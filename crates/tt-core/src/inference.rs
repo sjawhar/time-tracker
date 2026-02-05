@@ -46,11 +46,11 @@ pub trait InferableEvent {
     /// Returns the stream ID if already assigned.
     fn stream_id(&self) -> Option<&str>;
 
-    /// Returns the jj project name, if available.
+    /// Returns the git project name, if available.
     ///
     /// This is preferred over the directory basename for stream naming
     /// since it provides a more meaningful project identifier.
-    fn jj_project(&self) -> Option<&str>;
+    fn git_project(&self) -> Option<&str>;
 }
 
 /// A stream assignment produced by inference.
@@ -228,7 +228,7 @@ fn normalize_path(path: Option<&str>) -> String {
 
 /// Generate a stream name from events.
 ///
-/// - Prefers `jj_project` from the first event if available
+/// - Prefers `git_project` from the first event if available
 /// - Falls back to directory basename (e.g., `/home/user/project` → "project")
 /// - For null-cwd, returns "Uncategorized"
 /// - Handles collisions by tracking counts
@@ -237,10 +237,9 @@ fn generate_stream_name<E: InferableEvent>(
     cwd_key: &str,
     name_counts: &mut std::collections::HashMap<String, u32>,
 ) -> String {
-    // Try jj_project from first event
-    let base_name = events.first().and_then(|e| e.jj_project()).map_or_else(
+    // Try git_project from first event, fall back to directory basename
+    let base_name = events.first().and_then(|e| e.git_project()).map_or_else(
         || {
-            // Fallback to directory basename
             if cwd_key.is_empty() {
                 "Uncategorized".to_string()
             } else {
@@ -304,7 +303,7 @@ mod tests {
         cwd: Option<String>,
         assignment_source: Option<String>,
         stream_id: Option<String>,
-        jj_project: Option<String>,
+        git_project: Option<String>,
     }
 
     impl TestEvent {
@@ -315,7 +314,7 @@ mod tests {
                 cwd: cwd.map(String::from),
                 assignment_source: None,
                 stream_id: None,
-                jj_project: None,
+                git_project: None,
             }
         }
 
@@ -331,8 +330,8 @@ mod tests {
             self
         }
 
-        fn with_jj_project(mut self, project: &str) -> Self {
-            self.jj_project = Some(project.to_string());
+        fn with_git_project(mut self, project: &str) -> Self {
+            self.git_project = Some(project.to_string());
             self
         }
     }
@@ -358,8 +357,8 @@ mod tests {
             self.stream_id.as_deref()
         }
 
-        fn jj_project(&self) -> Option<&str> {
-            self.jj_project.as_deref()
+        fn git_project(&self) -> Option<&str> {
+            self.git_project.as_deref()
         }
     }
 
@@ -588,14 +587,14 @@ mod tests {
     }
 
     #[test]
-    fn test_jj_project_preferred_over_directory() {
-        // Events in /home/user/time-tracker/default with jj_project="time-tracker"
+    fn test_git_project_preferred_over_directory() {
+        // Events in /home/user/time-tracker/default with git_project="time-tracker"
         // Should use "time-tracker" as stream name, not "default"
         let events = vec![
             TestEvent::new("e1", ts(0), Some("/home/user/time-tracker/default"))
-                .with_jj_project("time-tracker"),
+                .with_git_project("time-tracker"),
             TestEvent::new("e2", ts(5), Some("/home/user/time-tracker/default"))
-                .with_jj_project("time-tracker"),
+                .with_git_project("time-tracker"),
         ];
 
         let config = InferenceConfig::default();
@@ -606,8 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_to_directory_without_jj_project() {
-        // Events without jj_project should fall back to directory basename
+    fn test_fallback_to_directory_without_git_project() {
+        // Events without git_project should fall back to directory basename
         let events = vec![
             TestEvent::new("e1", ts(0), Some("/home/user/my-project")),
             TestEvent::new("e2", ts(5), Some("/home/user/my-project")),
@@ -621,15 +620,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jj_project_same_name_different_directories() {
-        // Two different workspaces of the same project should have same jj_project
+    fn test_git_project_same_name_different_directories() {
+        // Two different workspaces of the same project should have same git_project
         // but different cwd paths - they should be in different streams (by cwd)
         // but both named "time-tracker"
         let events = vec![
             TestEvent::new("e1", ts(0), Some("/home/user/time-tracker/default"))
-                .with_jj_project("time-tracker"),
+                .with_git_project("time-tracker"),
             TestEvent::new("e2", ts(5), Some("/home/user/time-tracker/feature"))
-                .with_jj_project("time-tracker"),
+                .with_git_project("time-tracker"),
         ];
 
         let config = InferenceConfig::default();
@@ -645,11 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_jj_project_and_no_jj_project() {
-        // Some events have jj_project, some don't
+    fn test_mixed_git_project_and_no_git_project() {
+        // Some events have git_project, some don't
         let events = vec![
             TestEvent::new("e1", ts(0), Some("/home/user/project-a"))
-                .with_jj_project("my-jj-project"),
+                .with_git_project("my-git-project"),
             TestEvent::new("e2", ts(5), Some("/home/user/project-b")),
         ];
 
@@ -671,7 +670,7 @@ mod tests {
                 .any(|a| a.event_id == "e2" && a.stream_id == s.id)
         });
 
-        assert_eq!(stream_a.unwrap().name, "my-jj-project");
+        assert_eq!(stream_a.unwrap().name, "my-git-project");
         assert_eq!(stream_b.unwrap().name, "project-b");
     }
 }

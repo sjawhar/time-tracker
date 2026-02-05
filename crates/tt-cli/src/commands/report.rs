@@ -204,10 +204,8 @@ pub fn generate_report_data(
 
     // Get stream metadata (names) for display
     let all_streams = db.get_streams().context("failed to get streams")?;
-    let stream_names: HashMap<String, Option<String>> = all_streams
-        .into_iter()
-        .map(|s| (s.id, s.name))
-        .collect();
+    let stream_names: HashMap<String, Option<String>> =
+        all_streams.into_iter().map(|s| (s.id, s.name)).collect();
 
     // Convert allocation results to report format, excluding zero-time streams
     let streams: Vec<ReportStreamTime> = result
@@ -627,7 +625,12 @@ mod tests {
 
     // ========== Integration Tests (Snapshot) ==========
 
-    fn make_test_stream(id: &str, name: &str, direct_ms: i64, delegated_ms: i64) -> ReportStreamTime {
+    fn make_test_stream(
+        id: &str,
+        name: &str,
+        direct_ms: i64,
+        delegated_ms: i64,
+    ) -> ReportStreamTime {
         ReportStreamTime {
             id: id.to_string(),
             name: Some(name.to_string()),

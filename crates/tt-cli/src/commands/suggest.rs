@@ -61,11 +61,9 @@ pub async fn run(db: &Database, stream_id: &str, json: bool) -> Result<()> {
 
     // Try metadata-based suggestion first
     let mut suggestion = suggest_from_metadata(&cwds);
-    let mut source = if suggestion.is_some() {
-        SuggestionSource::Metadata
-    } else {
-        SuggestionSource::None
-    };
+    let mut source = suggestion
+        .as_ref()
+        .map_or(SuggestionSource::None, |_| SuggestionSource::Metadata);
 
     // If metadata is ambiguous, try LLM
     if suggestion.is_none() && is_metadata_ambiguous(&cwds) {
@@ -239,11 +237,19 @@ mod tests {
             event_type: "tmux_pane_focus".to_string(),
             source: "remote.tmux".to_string(),
             schema_version: 1,
-            data: json!({}),
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: None,
             cwd: Some(cwd.to_string()),
             session_id: None,
             stream_id: Some(stream_id.to_string()),
             assignment_source: Some("inferred".to_string()),
+            data: json!({}),
         }
     }
 
