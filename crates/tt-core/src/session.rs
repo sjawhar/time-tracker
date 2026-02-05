@@ -1,4 +1,4 @@
-//! Claude Code session indexing with performance optimizations.
+//! Coding assistant session indexing with performance optimizations.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -9,7 +9,45 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Type of Claude Code session.
+/// Source of the coding session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSource {
+    #[default]
+    Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
+}
+
+impl SessionSource {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SessionSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude" => Ok(Self::Claude),
+            "opencode" => Ok(Self::OpenCode),
+            _ => Err(format!("invalid session source: {s}")),
+        }
+    }
+}
+
+/// Type of coding session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionType {
@@ -72,14 +110,14 @@ const BUFFER_SIZE: usize = 64 * 1024;
 const WORKSPACE_NAMES: &[&str] = &["default", "main", "dev", "feature", "master"];
 
 /// Maximum number of user prompts to extract per session.
-const MAX_USER_PROMPTS: usize = 5;
+pub(crate) const MAX_USER_PROMPTS: usize = 5;
 
 /// Maximum length of each user prompt (bytes). ~500 tokens, covers P90.
-const MAX_PROMPT_LENGTH: usize = 2000;
+pub(crate) const MAX_PROMPT_LENGTH: usize = 2000;
 
 /// Maximum number of user message timestamps to store per session.
 /// Prevents unbounded memory growth for very long sessions.
-const MAX_USER_MESSAGE_TIMESTAMPS: usize = 1000;
+pub(crate) const MAX_USER_MESSAGE_TIMESTAMPS: usize = 1000;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -91,12 +129,19 @@ pub enum SessionError {
     NoMessages,
     #[error("no project path found in session")]
     NoProjectPath,
+    #[error("invalid timestamp: {0} ms")]
+    InvalidTimestamp(i64),
+    #[error("empty session ID")]
+    EmptySessionId,
 }
 
-/// An indexed Claude Code session.
+/// An indexed coding assistant session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeSession {
-    pub claude_session_id: String,
+pub struct AgentSession {
+    pub session_id: String,
+    /// Source tool (Claude Code or `OpenCode`).
+    #[serde(default)]
+    pub source: SessionSource,
     pub parent_session_id: Option<String>,
     /// Type of session (user, agent, subagent).
     #[serde(default)]
@@ -163,7 +208,7 @@ fn might_be_relevant(line: &str) -> bool {
 }
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
-fn truncate_prompt(content: &str) -> String {
+pub(crate) fn truncate_prompt(content: &str) -> String {
     if content.len() <= MAX_PROMPT_LENGTH {
         return content.to_string();
     }
@@ -198,9 +243,9 @@ fn update_timestamps(
 /// Parse a Claude Code session JSONL file.
 pub fn parse_session_file(
     path: &Path,
-    claude_session_id: &str,
+    session_id: &str,
     parent_session_id: Option<&str>,
-) -> Result<ClaudeSession, SessionError> {
+) -> Result<AgentSession, SessionError> {
     let file = File::open(path)?;
     let reader = BufReader::with_capacity(BUFFER_SIZE, file);
 
@@ -289,10 +334,11 @@ pub fn parse_session_file(
     let start_time = first_timestamp.ok_or(SessionError::NoMessages)?;
     let project_path = project_path.ok_or(SessionError::NoProjectPath)?;
 
-    Ok(ClaudeSession {
-        claude_session_id: claude_session_id.to_string(),
+    Ok(AgentSession {
+        session_id: session_id.to_string(),
+        source: SessionSource::Claude,
         parent_session_id: parent_session_id.map(String::from),
-        session_type: SessionType::from_session_id(claude_session_id),
+        session_type: SessionType::from_session_id(session_id),
         project_name: extract_project_name(&project_path),
         project_path,
         start_time,
@@ -312,7 +358,7 @@ pub fn parse_session_file(
 }
 
 /// Extract project name from path.
-pub fn extract_project_name(path: &str) -> String {
+pub(crate) fn extract_project_name(path: &str) -> String {
     let path_obj = Path::new(path);
     let basename = path_obj
         .file_name()
@@ -334,12 +380,12 @@ pub fn extract_project_name(path: &str) -> String {
 #[derive(Debug)]
 struct SessionFile {
     path: std::path::PathBuf,
-    claude_session_id: String,
+    session_id: String,
     parent_session_id: Option<String>,
 }
 
 /// Scan Claude Code projects directory and build session index.
-pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<ClaudeSession>, SessionError> {
+pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<AgentSession>, SessionError> {
     if !projects_dir.exists() {
         return Ok(Vec::new());
     }
@@ -359,21 +405,21 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<ClaudeSession>, S
             let session_path = session_entry.path();
 
             if session_path.is_file() && session_path.extension().is_some_and(|e| e == "jsonl") {
-                let claude_session_id = session_path
+                let session_id = session_path
                     .file_stem()
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string();
 
                 // Skip files with empty session IDs to prevent invalid event ID generation
-                if claude_session_id.is_empty() {
+                if session_id.is_empty() {
                     tracing::warn!(path = ?session_path, "skipping session file with empty session ID");
                     continue;
                 }
 
                 session_files.push(SessionFile {
                     path: session_path,
-                    claude_session_id,
+                    session_id,
                     parent_session_id: None,
                 });
             } else if session_path.is_dir() {
@@ -391,21 +437,21 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<ClaudeSession>, S
                             if subagent_path.is_file()
                                 && subagent_path.extension().is_some_and(|e| e == "jsonl")
                             {
-                                let claude_session_id = subagent_path
+                                let session_id = subagent_path
                                     .file_stem()
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("")
                                     .to_string();
 
                                 // Skip files with empty session IDs to prevent invalid event ID generation
-                                if claude_session_id.is_empty() {
+                                if session_id.is_empty() {
                                     tracing::warn!(path = ?subagent_path, "skipping subagent session file with empty session ID");
                                     continue;
                                 }
 
                                 session_files.push(SessionFile {
                                     path: subagent_path,
-                                    claude_session_id,
+                                    session_id,
                                     parent_session_id: parent_session_id.clone(),
                                 });
                             }
@@ -416,14 +462,10 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<ClaudeSession>, S
         }
     }
 
-    let mut entries: Vec<ClaudeSession> = session_files
+    let mut entries: Vec<AgentSession> = session_files
         .par_iter()
         .filter_map(|sf| {
-            match parse_session_file(
-                &sf.path,
-                &sf.claude_session_id,
-                sf.parent_session_id.as_deref(),
-            ) {
+            match parse_session_file(&sf.path, &sf.session_id, sf.parent_session_id.as_deref()) {
                 Ok(entry) => Some(entry),
                 Err(e) => {
                     tracing::warn!(path = ?sf.path, error = %e, "skipping invalid session");
@@ -709,7 +751,7 @@ mod tests {
 
         let entry =
             parse_session_file(file.path(), "child-session", Some("parent-session")).unwrap();
-        assert_eq!(entry.claude_session_id, "child-session");
+        assert_eq!(entry.session_id, "child-session");
         assert_eq!(entry.parent_session_id.as_deref(), Some("parent-session"));
     }
 
@@ -778,7 +820,7 @@ mod tests {
         let sessions = scan_claude_sessions(projects_dir).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].claude_session_id, "subagent-1");
+        assert_eq!(sessions[0].session_id, "subagent-1");
         assert_eq!(
             sessions[0].parent_session_id.as_deref(),
             Some("parent-session-id")
@@ -809,7 +851,7 @@ mod tests {
 
         // Should only find the regular session file
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].claude_session_id, "regular-session");
+        assert_eq!(sessions[0].session_id, "regular-session");
         assert!(sessions[0].parent_session_id.is_none());
     }
 
@@ -891,5 +933,48 @@ mod tests {
             let parsed: SessionType = s.parse().unwrap();
             assert_eq!(parsed, st);
         }
+    }
+
+    #[test]
+    fn test_session_source_roundtrip() {
+        for src in [SessionSource::Claude, SessionSource::OpenCode] {
+            let s = src.as_str();
+            let parsed: SessionSource = s.parse().unwrap();
+            assert_eq!(parsed, src);
+            assert_eq!(src.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn test_session_source_serde_matches_as_str() {
+        // Verify serde serialization produces the same string as as_str().
+        // This prevents inconsistency between JSON export and DB storage.
+        for src in [SessionSource::Claude, SessionSource::OpenCode] {
+            let serde_value = serde_json::to_value(src).unwrap();
+            assert_eq!(
+                serde_value.as_str().unwrap(),
+                src.as_str(),
+                "serde serialization of {src:?} should match as_str()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_type_serde_matches_as_str() {
+        // Verify serde serialization produces the same string as as_str().
+        for st in [SessionType::User, SessionType::Agent, SessionType::Subagent] {
+            let serde_value = serde_json::to_value(st).unwrap();
+            assert_eq!(
+                serde_value.as_str().unwrap(),
+                st.as_str(),
+                "serde serialization of {st:?} should match as_str()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_source_invalid() {
+        let result = "invalid".parse::<SessionSource>();
+        assert!(result.is_err());
     }
 }

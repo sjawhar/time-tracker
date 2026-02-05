@@ -24,13 +24,21 @@ Optional: Time range (default: "8 hours ago")
 
 Example: `/infer-streams 3 days ago`
 
-## Phase 1: Gather Context
+## Phase 1: Run Ingestion
+
+**CRITICAL: Always run ingestion before gathering context.** Without this, `tt context` returns stale/incomplete data — you may miss 75%+ of sessions.
+
+```bash
+cargo build 2>/dev/null && cargo run -- ingest sessions
+```
+
+## Phase 2: Gather Context
 
 ```bash
 tt context --events --agents --streams --gaps --start "{time_range}"
 ```
 
-## Phase 2: Identify Projects
+## Phase 3: Identify Projects
 
 **Extract project from path:**
 - `/home/sami/pivot` → project: `pivot`
@@ -41,7 +49,7 @@ tt context --events --agents --streams --gaps --start "{time_range}"
 **Detect renamed directories:**
 - If two directories have similar content/activity patterns but different names, they may be the same project renamed
 
-## Phase 3: Identify Streams Within Projects
+## Phase 4: Identify Streams Within Projects
 
 For each project, identify distinct streams using:
 
@@ -67,7 +75,7 @@ For each project, identify distinct streams using:
 - "legion: controller implementation"
 - "time-tracker: stream inference feature"
 
-## Phase 4: Calculate Time
+## Phase 5: Calculate Time
 
 **All times reported in Pacific Time (UTC-8).**
 
@@ -90,7 +98,7 @@ Calculation:
 - Example: 3 agents × 10 min = 30 agent-minutes
 - Track `parent_session_id` to identify subagents
 
-## Phase 5: Output Report
+## Phase 6: Output Report
 
 **All times in Pacific Time.**
 
@@ -135,6 +143,7 @@ For each stream, brief summary:
 
 | Mistake | Fix |
 |---------|-----|
+| Skipping ingestion | **Always** run `tt ingest sessions` before `tt context`. Without it you miss most data. |
 | Treating project as stream | Project = repo. Stream = task/feature within repo |
 | Splitting subdirectories as different projects | `/pivot/agents` is part of `pivot`, not a separate project |
 | Streams too coarse ("pivot work") | Use task-specific names ("pivot: execution engine refactor") |

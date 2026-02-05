@@ -214,8 +214,10 @@ pub enum IngestEvent {
         window: Option<u32>,
     },
 
-    /// Index Claude Code sessions from ~/.claude/projects/.
+    /// Index coding assistant sessions.
     ///
-    /// Scans session JSONL files and stores metadata in the database.
+    /// Scans Claude Code (~/.claude/projects/) and `OpenCode`
+    /// (~/.local/share/opencode/storage/) session files and stores
+    /// metadata in the database.
     Sessions,
 }

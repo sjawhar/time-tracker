@@ -22,13 +22,15 @@ digraph standup {
   node [shape=box];
 
   start [label="1. Parse date\n(convert to ISO 8601 UTC)" shape=ellipse];
-  gather [label="2. Gather context\ntt context --events --agents"];
-  analyze [label="3. Analyze sessions\nGroup by project"];
-  draft [label="4. Draft update\n(context for readers)"];
-  confirm [label="5. Confirm channel\nwith user"];
-  post [label="6. Post to Slack"];
+  ingest [label="2. Run ingestion\ntt ingest sessions"];
+  gather [label="3. Gather context\ntt context --events --agents"];
+  analyze [label="4. Invoke infer-streams\n(Skill tool, NOT subagent)"];
+  prs [label="5. Look up PRs\n(gh search prs)"];
+  draft [label="6. Draft update\n(logical projects, PR links)"];
+  confirm [label="7. Confirm channel\nwith user"];
+  post [label="8. Post to Slack"];
 
-  start -> gather -> analyze -> draft -> confirm -> post;
+  start -> ingest -> gather -> analyze -> prs -> draft -> confirm -> post;
 }
 ```
 
@@ -51,7 +53,17 @@ START=$(date -u -d "yesterday 00:00 PST" +%Y-%m-%dT%H:%M:%SZ)
 END=$(date -u -d "today 00:00 PST" +%Y-%m-%dT%H:%M:%SZ)
 ```
 
-## Phase 2: Gather Context
+## Phase 2: Run Ingestion
+
+**CRITICAL: Always run ingestion before gathering context.** Session data is only available after ingestion — without this step you will miss most of the data.
+
+```bash
+cargo build 2>/dev/null && cargo run -- ingest sessions
+```
+
+This scans Claude Code and OpenCode session files and stores metadata in the database. Without it, `tt context` returns stale/incomplete data.
+
+## Phase 3: Gather Context
 
 ```bash
 tt context --events --agents --start "$START" --end "$END"
@@ -61,39 +73,70 @@ This outputs JSON with:
 - `agents[]`: Claude sessions with `project_name`, `summary`, `tool_call_count`, `start_time`, `end_time`
 - `events[]`: Raw activity signals (used for direct time calculation)
 
-## Phase 3: Analyze Sessions
+## Phase 4: Analyze Streams
 
-Group agents by `project_name`. For each project:
+**REQUIRED: Invoke the `infer-streams` skill** to analyze the `tt context` output. Do NOT try to analyze streams yourself or launch a subagent — use the Skill tool:
 
-1. **Count sessions** with substantive work (`tool_call_count > 10` or non-trivial summary)
-2. **Extract work items** from `summary` field — if null, check `starting_prompt` for context
-3. **Calculate delegated time**: Sum of `(end_time - start_time)` for sessions with both times; estimate for null end_times based on tool_call_count (~1 min per 10 tool calls)
-4. **Note direct time**: Rough proxy using session count × 15-30 min per substantive session
+```
+Skill("infer-streams")
+```
 
-**Filtering heuristics:**
-- Skip sessions with `tool_call_count < 10` AND no meaningful summary
-- Skip `/clear`, `/ide`, `/context` sessions (administrative, no real work)
-- Include sessions where `starting_prompt` shows real user intent even if summary is null
+The infer-streams skill handles:
+- Grouping sessions into projects and streams
+- Calculating direct vs delegated time
+- Handling subdirectory merging, null end_times, etc.
 
-**Project naming caveat:** The time-tracker extracts `project_name` from the working directory. For nested repos (e.g., `/eval-pipeline/pivot`), only the deepest directory is captured (`pivot`). Check `cwd` in events if work seems missing from a parent project.
+Use its output (the time breakdown table and stream details) as the data source for drafting the standup.
 
-## Phase 4: Draft Update
+## Phase 5: Look Up PRs
+
+**CRITICAL: Always look up open and recently merged PRs to link in the report.** A standup without PR links is incomplete — readers want to see the artifacts.
+
+```bash
+# Open PRs
+gh search prs --author=@me --state=open --limit=20 --json url,title,repository,state
+
+# Recently merged PRs
+gh search prs --author=@me --merged --sort=updated --limit=20
+```
+
+Match PRs to streams by repo name and title. Every accomplishment that produced or advanced a PR should link to it using markdown: `[PR #123](url)`.
+
+## Phase 6: Draft Update
 
 **Format: YTH (Yesterday, Today, Hopes/Blockers)**
 
-Write for readers who have no context about your projects:
+Write for readers who have no context about your projects.
+
+### Organize by Logical Project, Not Repository
+
+**CRITICAL: Do NOT report streams grouped by repo directory.** The infer-streams output groups by repo path (e.g., `dotfiles`, `sami-home`, `eval-pipeline`). You MUST reorganize into logical projects that make sense to the reader.
+
+**Common reorganizations:**
+- Dotfiles/config repos are never a project — classify by what the work was actually for (e.g., install script for tool X → tool X project; PR reviews for repo Y → repo Y)
+- Home directory sessions are usually meta-work — attribute to the actual project or group as "tooling"
+- Multiple repos serving one goal should be combined (e.g., a library repo + the app that depends on it → one section)
+- Infra debugging (CPU, disk, network) should be attributed to the project it was blocking
+
+**Ask the user** if you're unsure how to group — they know what the logical projects are. Present your best guess and let them correct it.
+
+### Include PR Links
+
+Every accomplishment that produced or advanced a PR should include a markdown link: `[PR #123](url)`. Use the PRs gathered in Phase 5.
+
+### Template
 
 ```markdown
 ## Standup - {Day of Week} {Date}
 
 ### Yesterday ({Date})
 
-- **{Project}** — {time estimate}
-  - {What was accomplished in 1 sentence, understandable to outsiders}
-  - {Another accomplishment if significant}
+- **{Logical Project}** — {time estimate}
+  - {Accomplishment} — [PR #N](url) (merged/open)
+  - {Another accomplishment}
 
-- **{Project}** — {time estimate}
-  - {Accomplishment}
+- **{Logical Project}** — {time estimate}
+  - {Accomplishment} — [PR #N](url)
 
 **Totals:** ~{X} hrs direct | ~{Y} hrs delegated
 
@@ -116,7 +159,7 @@ Write for readers who have no context about your projects:
 - Time estimates are approximate—don't overthink precision
 - Delegated time can be very high with parallel agents (10+ hours is normal for heavy days)
 
-## Phase 5: Ask for "Today" Plans
+## Phase 7: Ask for "Today" Plans
 
 The time-tracker data only shows past activity. Ask the user:
 - "What are your plans for today?"
@@ -124,7 +167,7 @@ The time-tracker data only shows past activity. Ask the user:
 
 If user provided plans in the invocation, use those. Otherwise, infer reasonable continuations from yesterday's work (e.g., "continue X" or "open PR for Y").
 
-## Phase 6: Confirm Before Posting
+## Phase 8: Confirm Before Posting
 
 Show the drafted message and confirm:
 - Target channel is correct
@@ -132,7 +175,7 @@ Show the drafted message and confirm:
 
 Use AskUserQuestion if channel wasn't provided or to confirm before posting.
 
-## Phase 7: Post to Slack
+## Phase 9: Post to Slack
 
 Use `mcp__slack__conversations_add_message`:
 - `channel_id`: Use `#channel-name` format
@@ -156,11 +199,14 @@ If posting fails:
 
 | Mistake | Fix |
 |---------|-----|
+| Skipping ingestion | **Always** run `tt ingest sessions` before `tt context`. Without it you miss most data. |
+| Reporting by repo directory | Organize by logical project, not filesystem path. `dotfiles` is never a project. Ask the user. |
+| No PR links | Always run `gh search prs` and link every PR mentioned in the report. |
 | Date format error | Use ISO 8601: `2026-02-02T08:00:00Z` or relative like "1 day ago" |
 | Wrong year | Check current date first—don't assume from context |
 | Updates too terse | Include context for outsiders ("what" and "why") |
+| Launching subagent for analysis | Use `Skill("infer-streams")`, NOT the Task tool |
 | Missing sessions | Check `starting_prompt` when `summary` is null |
-| Null end_time | Estimate from tool_call_count (~1 min per 10 calls) |
 | No "Today" plans | Ask user—can't infer future plans from past data |
 
 ## Example Output

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -432,9 +432,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
 
-            -- Claude sessions table: indexed Claude Code sessions
-            CREATE TABLE IF NOT EXISTS claude_sessions (
-                claude_session_id TEXT PRIMARY KEY,
+            -- Agent sessions table: indexed coding assistant sessions
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                session_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT 'claude',
                 parent_session_id TEXT,
                 session_type TEXT NOT NULL DEFAULT 'user',
                 project_path TEXT NOT NULL,
@@ -448,9 +449,9 @@ impl Database {
                 assistant_message_count INTEGER DEFAULT 0,
                 tool_call_count INTEGER DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_start_time ON claude_sessions(start_time);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_project_path ON claude_sessions(project_path);
-            CREATE INDEX IF NOT EXISTS idx_claude_sessions_parent ON claude_sessions(parent_session_id);
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_start_time ON agent_sessions(start_time);
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_path ON agent_sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent ON agent_sessions(parent_session_id);
             ",
         )?;
 
@@ -1043,21 +1044,23 @@ impl Database {
         })
     }
 
-    // ========== Claude Session Methods ==========
+    // ========== Agent Session Methods ==========
 
-    /// Insert or update a Claude Code session entry.
+    /// Insert or update an agent session entry.
     ///
     /// Uses `INSERT ... ON CONFLICT DO UPDATE` for idempotent upserts.
     /// If a session with the same ID already exists, all fields are updated.
-    pub fn upsert_claude_session(
+    pub fn upsert_agent_session(
         &self,
-        entry: &tt_core::session::ClaudeSession,
+        entry: &tt_core::session::AgentSession,
     ) -> Result<(), DbError> {
-        let user_prompts_json = serde_json::to_string(&entry.user_prompts).unwrap_or_default();
+        let user_prompts_json =
+            serde_json::to_string(&entry.user_prompts).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
-            "INSERT INTO claude_sessions (claude_session_id, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(claude_session_id) DO UPDATE SET
+            "INSERT INTO agent_sessions (session_id, source, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(session_id) DO UPDATE SET
+                source = excluded.source,
                 parent_session_id = excluded.parent_session_id,
                 project_path = excluded.project_path,
                 project_name = excluded.project_name,
@@ -1071,7 +1074,8 @@ impl Database {
                 tool_call_count = excluded.tool_call_count,
                 session_type = excluded.session_type",
             params![
-                entry.claude_session_id,
+                entry.session_id,
+                entry.source.as_str(),
                 entry.parent_session_id,
                 entry.project_path,
                 entry.project_name,
@@ -1089,7 +1093,7 @@ impl Database {
         Ok(())
     }
 
-    /// Get Claude Code sessions that overlap with a time range.
+    /// Get agent sessions that overlap with a time range.
     ///
     /// A session overlaps if:
     /// - Its `start_time` is at or before the range end, AND
@@ -1097,14 +1101,14 @@ impl Database {
     ///
     /// Sessions are returned ordered by `start_time` ascending.
     /// Sessions with malformed timestamps in the database are skipped with a warning.
-    pub fn claude_sessions_in_range(
+    pub fn agent_sessions_in_range(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> Result<Vec<tt_core::session::ClaudeSession>, DbError> {
+    ) -> Result<Vec<tt_core::session::AgentSession>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT claude_session_id, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type
-             FROM claude_sessions
+            "SELECT session_id, source, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type
+             FROM agent_sessions
              WHERE start_time <= ?2 AND (end_time IS NULL OR end_time >= ?1)
              ORDER BY start_time"
         )?;
@@ -1113,15 +1117,16 @@ impl Database {
         let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
 
         while let Some(row) = rows.next()? {
-            let claude_session_id: String = row.get(0)?;
-            let start_time_str: String = row.get(4)?;
-            let end_time_str: Option<String> = row.get(5)?;
-            let user_prompts_str: Option<String> = row.get(8)?;
+            let session_id: String = row.get(0)?;
+            let source_str: String = row.get(1)?;
+            let start_time_str: String = row.get(5)?;
+            let end_time_str: Option<String> = row.get(6)?;
+            let user_prompts_str: Option<String> = row.get(9)?;
 
             let start_time = match DateTime::parse_from_rfc3339(&start_time_str) {
                 Ok(dt) => dt.with_timezone(&Utc),
                 Err(e) => {
-                    tracing::warn!(claude_session_id, error = %e, "skipping session with malformed start_time");
+                    tracing::warn!(session_id, error = %e, "skipping session with malformed start_time");
                     continue;
                 }
             };
@@ -1130,7 +1135,7 @@ impl Database {
                 Some(s) => match DateTime::parse_from_rfc3339(&s) {
                     Ok(dt) => Some(dt.with_timezone(&Utc)),
                     Err(e) => {
-                        tracing::warn!(claude_session_id, error = %e, "skipping session with malformed end_time");
+                        tracing::warn!(session_id, error = %e, "skipping session with malformed end_time");
                         continue;
                     }
                 },
@@ -1141,20 +1146,21 @@ impl Database {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
 
-            sessions.push(tt_core::session::ClaudeSession {
-                claude_session_id,
-                parent_session_id: row.get(1)?,
-                session_type: row.get::<_, String>(12)?.parse().unwrap_or_default(),
-                project_path: row.get(2)?,
-                project_name: row.get(3)?,
+            sessions.push(tt_core::session::AgentSession {
+                session_id,
+                source: source_str.parse().unwrap_or_default(),
+                parent_session_id: row.get(2)?,
+                session_type: row.get::<_, String>(13)?.parse().unwrap_or_default(),
+                project_path: row.get(3)?,
+                project_name: row.get(4)?,
                 start_time,
                 end_time,
-                message_count: row.get(6)?,
-                summary: row.get(7)?,
+                message_count: row.get(7)?,
+                summary: row.get(8)?,
                 user_prompts,
-                starting_prompt: row.get(9)?,
-                assistant_message_count: row.get(10)?,
-                tool_call_count: row.get(11)?,
+                starting_prompt: row.get(10)?,
+                assistant_message_count: row.get(11)?,
+                tool_call_count: row.get(12)?,
                 // Not stored in database - events are created during indexing
                 user_message_timestamps: Vec::new(),
             });
@@ -2030,14 +2036,15 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_session_storage() {
+    fn test_agent_session_storage() {
         use chrono::TimeZone;
-        use tt_core::session::ClaudeSession;
+        use tt_core::session::{AgentSession, SessionSource};
 
         let db = Database::open_in_memory().unwrap();
 
-        let entry = ClaudeSession {
-            claude_session_id: "test-session".to_string(),
+        let entry = AgentSession {
+            session_id: "test-session".to_string(),
+            source: SessionSource::default(),
             parent_session_id: None,
             session_type: tt_core::session::SessionType::default(),
             project_path: "/home/user/project".to_string(),
@@ -2053,11 +2060,11 @@ mod tests {
             user_message_timestamps: Vec::new(),
         };
 
-        db.upsert_claude_session(&entry).unwrap();
+        db.upsert_agent_session(&entry).unwrap();
 
         let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
         let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
-        let sessions = db.claude_sessions_in_range(start, end).unwrap();
+        let sessions = db.agent_sessions_in_range(start, end).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].project_name, "project");
@@ -2071,9 +2078,46 @@ mod tests {
         );
         assert_eq!(sessions[0].assistant_message_count, 5);
         assert_eq!(sessions[0].tool_call_count, 12);
+        assert_eq!(sessions[0].source, SessionSource::Claude);
     }
 
-    // NOTE: Migration tests removed. Schema v6 is a breaking change - old databases
+    #[test]
+    fn test_agent_session_source_opencode_roundtrip() {
+        use chrono::TimeZone;
+        use tt_core::session::{AgentSession, SessionSource};
+
+        let db = Database::open_in_memory().unwrap();
+
+        let entry = AgentSession {
+            session_id: "ses_opencode_test".to_string(),
+            source: SessionSource::OpenCode,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap(),
+            end_time: None,
+            message_count: 1,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 0,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+
+        db.upsert_agent_session(&entry).unwrap();
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
+        let sessions = db.agent_sessions_in_range(start, end).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_opencode_test");
+        assert_eq!(sessions[0].source, SessionSource::OpenCode);
+    }
+
+    // NOTE: Migration tests removed. Schema v7 is a breaking change - old databases
     // must be deleted and re-imported from events.jsonl.
 
     // ========== streams_in_range Tests ==========

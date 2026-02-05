@@ -339,66 +339,70 @@ pub fn ingest_pane_focus(
 }
 
 // ========== Sessions Indexing ==========
-use tt_core::session::{ClaudeSession, scan_claude_sessions};
+use tt_core::opencode::scan_opencode_sessions;
+use tt_core::session::{AgentSession, scan_claude_sessions};
 use tt_db::StoredEvent;
 
 /// Run the sessions index command.
 ///
-/// Scans `~/.claude/projects/` for Claude Code session files and upserts
+/// Scans Claude Code and `OpenCode` session directories and upserts
 /// them into the database.
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
-    let projects_dir = get_claude_projects_dir()?;
+    let mut all_sessions = Vec::new();
 
-    if !projects_dir.exists() {
-        println!(
-            "No Claude Code projects directory found at: {}",
-            projects_dir.display()
-        );
-        println!("Sessions will be indexed once Claude Code creates session files.");
-        return Ok(());
+    // Claude Code
+    let claude_dir = get_claude_projects_dir()?;
+    if claude_dir.exists() {
+        println!("Scanning Claude Code sessions...");
+        let claude_sessions =
+            scan_claude_sessions(&claude_dir).context("failed to scan Claude Code sessions")?;
+        println!("  Found {} Claude sessions", claude_sessions.len());
+        all_sessions.extend(claude_sessions);
     }
 
-    println!("Scanning {}...", projects_dir.display());
+    // OpenCode
+    let opencode_dir = get_opencode_storage_dir()?;
+    if opencode_dir.exists() {
+        println!("Scanning OpenCode sessions...");
+        let opencode_sessions =
+            scan_opencode_sessions(&opencode_dir).context("failed to scan OpenCode sessions")?;
+        println!("  Found {} OpenCode sessions", opencode_sessions.len());
+        all_sessions.extend(opencode_sessions);
+    }
 
-    let sessions =
-        scan_claude_sessions(&projects_dir).context("failed to scan Claude Code sessions")?;
-
-    if sessions.is_empty() {
+    if all_sessions.is_empty() {
         println!("No sessions found.");
         return Ok(());
     }
 
     let mut event_count = 0usize;
-    for session in &sessions {
-        db.upsert_claude_session(session)
-            .with_context(|| format!("failed to upsert session {}", session.claude_session_id))?;
+    for session in &all_sessions {
+        db.upsert_agent_session(session)
+            .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
         let events = create_session_events(session);
         event_count += events.len();
         db.insert_events(&events).with_context(|| {
-            format!(
-                "failed to insert events for session {}",
-                session.claude_session_id
-            )
+            format!("failed to insert events for session {}", session.session_id)
         })?;
     }
 
     println!(
         "Indexed {} sessions ({} events)",
-        sessions.len(),
+        all_sessions.len(),
         event_count
     );
 
     let mut projects: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for session in &sessions {
+    for session in &all_sessions {
         *projects.entry(&session.project_name).or_default() += 1;
     }
 
-    let mut project_list: Vec<_> = projects.iter().collect();
-    project_list.sort_by(|a, b| b.1.cmp(a.1));
+    let mut project_list: Vec<_> = projects.into_iter().collect();
+    project_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
     println!("\nSessions by project:");
-    for (project, count) in project_list.iter().take(10) {
+    for (project, count) in &project_list[..project_list.len().min(10)] {
         println!("  {project}: {count} sessions");
     }
 
@@ -409,17 +413,17 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     Ok(())
 }
 
-/// Create events from a Claude session.
-fn create_session_events(session: &ClaudeSession) -> Vec<StoredEvent> {
+/// Create events from an agent session.
+fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
     use serde_json::json;
 
     // Helper to create a session event with common fields
     let make_event =
         |id_suffix: &str, timestamp: chrono::DateTime<chrono::Utc>, event_type: &str| StoredEvent {
-            id: format!("{}-{id_suffix}", session.claude_session_id),
+            id: format!("{}-{id_suffix}", session.session_id),
             timestamp,
             event_type: event_type.to_string(),
-            source: "claude".to_string(),
+            source: session.source.as_str().to_string(),
             schema_version: 1,
             pane_id: None,
             tmux_session: None,
@@ -430,7 +434,7 @@ fn create_session_events(session: &ClaudeSession) -> Vec<StoredEvent> {
             idle_duration_ms: None,
             action: None,
             cwd: Some(session.project_path.clone()),
-            session_id: Some(session.claude_session_id.clone()),
+            session_id: Some(session.session_id.clone()),
             stream_id: None,
             assignment_source: None,
             data: json!({}),
@@ -457,10 +461,20 @@ fn create_session_events(session: &ClaudeSession) -> Vec<StoredEvent> {
     events
 }
 
+/// Return the user's home directory.
+fn home_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home))
+}
+
 /// Get the Claude Code projects directory path.
 fn get_claude_projects_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME environment variable not set")?;
-    Ok(PathBuf::from(home).join(".claude").join("projects"))
+    Ok(home_dir()?.join(".claude").join("projects"))
+}
+
+/// Get the `OpenCode` storage directory path.
+fn get_opencode_storage_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".local/share/opencode/storage"))
 }
 
 /// Reads all events from the events file in the specified data directory.
@@ -728,10 +742,11 @@ mod tests {
     #[test]
     fn test_create_session_events_session_start() {
         use chrono::TimeZone;
-        use tt_core::session::ClaudeSession;
+        use tt_core::session::{AgentSession, SessionSource};
 
-        let session = ClaudeSession {
-            claude_session_id: "test-session-123".to_string(),
+        let session = AgentSession {
+            session_id: "test-session-123".to_string(),
+            source: SessionSource::default(),
             parent_session_id: None,
             session_type: tt_core::session::SessionType::default(),
             project_path: "/home/user/project".to_string(),
@@ -760,10 +775,11 @@ mod tests {
     #[test]
     fn test_create_session_events_session_start_and_end() {
         use chrono::TimeZone;
-        use tt_core::session::ClaudeSession;
+        use tt_core::session::{AgentSession, SessionSource};
 
-        let session = ClaudeSession {
-            claude_session_id: "test-session-456".to_string(),
+        let session = AgentSession {
+            session_id: "test-session-456".to_string(),
+            source: SessionSource::default(),
             parent_session_id: None,
             session_type: tt_core::session::SessionType::default(),
             project_path: "/home/user/project".to_string(),
@@ -790,13 +806,14 @@ mod tests {
     #[test]
     fn test_create_session_events_user_messages() {
         use chrono::TimeZone;
-        use tt_core::session::ClaudeSession;
+        use tt_core::session::{AgentSession, SessionSource};
 
         let ts1 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 5, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 10, 0).unwrap();
 
-        let session = ClaudeSession {
-            claude_session_id: "test-session-789".to_string(),
+        let session = AgentSession {
+            session_id: "test-session-789".to_string(),
+            source: SessionSource::default(),
             parent_session_id: None,
             session_type: tt_core::session::SessionType::default(),
             project_path: "/home/user/project".to_string(),
@@ -820,6 +837,39 @@ mod tests {
         assert_eq!(events[1].timestamp, ts1);
         assert_eq!(events[2].event_type, "user_message");
         assert_eq!(events[2].timestamp, ts2);
+    }
+
+    #[test]
+    fn test_create_session_events_opencode_source() {
+        use chrono::TimeZone;
+        use tt_core::session::{AgentSession, SessionSource};
+
+        let session = AgentSession {
+            session_id: "ses_opencode_123".to_string(),
+            source: SessionSource::OpenCode,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2026, 2, 2, 11, 0, 0).unwrap()),
+            message_count: 2,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 1,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+
+        let events = create_session_events(&session);
+
+        assert_eq!(events.len(), 2);
+        // Events should have "opencode" as source, not "claude"
+        assert_eq!(events[0].source, "opencode");
+        assert_eq!(events[1].source, "opencode");
+        assert_eq!(events[0].id, "ses_opencode_123-session_start");
+        assert_eq!(events[0].session_id, Some("ses_opencode_123".to_string()));
     }
 
     #[test]
@@ -1067,10 +1117,11 @@ fn test_rotation_preserves_old_content() {
 #[test]
 fn test_create_session_events_with_empty_timestamps() {
     use chrono::TimeZone;
-    use tt_core::session::ClaudeSession;
+    use tt_core::session::{AgentSession, SessionSource};
 
-    let session = ClaudeSession {
-        claude_session_id: "test".to_string(),
+    let session = AgentSession {
+        session_id: "test".to_string(),
+        source: SessionSource::default(),
         parent_session_id: None,
         session_type: tt_core::session::SessionType::default(),
         project_path: "/test".to_string(),

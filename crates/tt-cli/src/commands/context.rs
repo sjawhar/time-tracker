@@ -51,7 +51,7 @@ pub struct EventExport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,10 +60,14 @@ pub struct EventExport {
     pub stream_id: Option<String>,
 }
 
-/// Agent (Claude session) information for context export.
+/// Agent session information for context export.
 #[derive(Debug, Serialize)]
 pub struct AgentExport {
-    pub claude_session_id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub session_type: tt_core::SessionType,
+    pub source: tt_core::SessionSource,
     pub project_path: String,
     pub project_name: String,
     pub start_time: DateTime<Utc>,
@@ -102,11 +106,6 @@ pub struct GapExport {
     pub after_event_type: String,
 }
 
-/// Extract a string field from JSON data.
-fn extract_str(data: &serde_json::Value, key: &str) -> Option<String> {
-    data.get(key).and_then(|v| v.as_str()).map(String::from)
-}
-
 /// Export events from the database within the given time range.
 fn export_events(
     db: &Database,
@@ -117,49 +116,36 @@ fn export_events(
         .get_events_in_range(start, end)?
         .into_iter()
         .map(|e| EventExport {
-            claude_session_id: e
-                .session_id
-                .clone()
-                .or_else(|| extract_str(&e.data, "claude_session_id")),
-            tmux_session: e
-                .tmux_session
-                .clone()
-                .or_else(|| extract_str(&e.data, "tmux_session"))
-                .or_else(|| extract_str(&e.data, "session_name")),
-            pane_id: e
-                .pane_id
-                .clone()
-                .or_else(|| extract_str(&e.data, "pane_id")),
-            git_project: e
-                .git_project
-                .clone()
-                .or_else(|| extract_str(&e.data, "git_project")),
-            git_workspace: e
-                .git_workspace
-                .clone()
-                .or_else(|| extract_str(&e.data, "git_workspace")),
             id: e.id,
             timestamp: e.timestamp,
             event_type: e.event_type,
             source: e.source,
             cwd: e.cwd,
+            git_project: e.git_project,
+            git_workspace: e.git_workspace,
+            session_id: e.session_id,
+            tmux_session: e.tmux_session,
+            pane_id: e.pane_id,
             stream_id: e.stream_id,
         })
         .collect())
 }
 
-/// Export agents (Claude sessions) from the database within the given time range.
+/// Export agent sessions from the database within the given time range.
 fn export_agents(
     db: &Database,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> anyhow::Result<Vec<AgentExport>> {
     Ok(db
-        .claude_sessions_in_range(start, end)?
+        .agent_sessions_in_range(start, end)?
         .into_iter()
         .map(|s| AgentExport {
             user_prompt_count: i32::try_from(s.user_prompts.len()).unwrap_or(i32::MAX),
-            claude_session_id: s.claude_session_id,
+            session_id: s.session_id,
+            parent_session_id: s.parent_session_id,
+            session_type: s.session_type,
+            source: s.source,
             project_path: s.project_path,
             project_name: s.project_name,
             start_time: s.start_time,
@@ -433,7 +419,7 @@ mod tests {
                 cwd: Some("/home/user/project".to_string()),
                 git_project: Some("project".to_string()),
                 git_workspace: Some("default".to_string()),
-                claude_session_id: None,
+                session_id: None,
                 tmux_session: Some("main".to_string()),
                 pane_id: Some("%0".to_string()),
                 stream_id: None,
@@ -461,7 +447,7 @@ mod tests {
             cwd: None,
             git_project: None,
             git_workspace: None,
-            claude_session_id: None,
+            session_id: None,
             tmux_session: None,
             pane_id: None,
             stream_id: None,
@@ -470,7 +456,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         // Optional fields should not be serialized when None
         assert!(!json.contains("\"cwd\""));
-        assert!(!json.contains("\"claude_session_id\""));
+        assert!(!json.contains("\"session_id\""));
         assert!(!json.contains("\"tmux_session\""));
         assert!(!json.contains("\"pane_id\""));
         assert!(!json.contains("\"stream_id\""));
@@ -479,7 +465,10 @@ mod tests {
     #[test]
     fn test_agent_export_serialization() {
         let agent = AgentExport {
-            claude_session_id: "session-123".to_string(),
+            session_id: "session-123".to_string(),
+            parent_session_id: None,
+            session_type: tt_core::SessionType::User,
+            source: tt_core::SessionSource::Claude,
             project_path: "/home/user/project".to_string(),
             project_name: "project".to_string(),
             start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
@@ -499,12 +488,203 @@ mod tests {
         };
 
         let json = serde_json::to_string(&agent).unwrap();
-        assert!(json.contains("\"claude_session_id\""));
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"session_type\""));
         assert!(json.contains("\"project_path\""));
         assert!(json.contains("\"user_prompts\""));
         assert!(json.contains("\"tool_call_count\""));
+        assert!(json.contains("\"source\":\"claude\""));
+        assert!(json.contains("\"session_type\":\"user\""));
+        // parent_session_id should be skipped when None
+        assert!(!json.contains("\"parent_session_id\""));
     }
 
+    #[test]
+    fn test_agent_export_with_parent_session_id() {
+        let agent = AgentExport {
+            session_id: "agent-a913a65".to_string(),
+            parent_session_id: Some("d66718b7-3b37-47c8-b3a6-f01b637d8c13".to_string()),
+            session_type: tt_core::SessionType::Subagent,
+            source: tt_core::SessionSource::Claude,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_time: None,
+            summary: None,
+            starting_prompt: None,
+            user_prompts: vec![],
+            user_prompt_count: 0,
+            assistant_message_count: 0,
+            tool_call_count: 0,
+        };
+
+        let json = serde_json::to_string(&agent).unwrap();
+        assert!(json.contains("\"parent_session_id\""));
+        assert!(json.contains("d66718b7-3b37-47c8-b3a6-f01b637d8c13"));
+        assert!(json.contains("\"session_type\":\"subagent\""));
+    }
+
+    #[test]
+    fn test_export_agents_includes_parent_session_id() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+
+        // Insert a parent session
+        let parent = tt_core::session::AgentSession {
+            session_id: "parent-session-id".to_string(),
+            source: tt_core::session::SessionSource::default(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::User,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_time: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            message_count: 3,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 1,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+        db.upsert_agent_session(&parent).unwrap();
+
+        // Insert a subagent session with parent
+        let child = tt_core::session::AgentSession {
+            session_id: "agent-a913a65".to_string(),
+            source: tt_core::session::SessionSource::default(),
+            parent_session_id: Some("parent-session-id".to_string()),
+            session_type: tt_core::session::SessionType::Subagent,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_time: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            message_count: 2,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 1,
+            tool_call_count: 5,
+            user_message_timestamps: Vec::new(),
+        };
+        db.upsert_agent_session(&child).unwrap();
+
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-01-15T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let exports = export_agents(&db, start, end).unwrap();
+
+        assert_eq!(exports.len(), 2);
+
+        let parent_export = exports
+            .iter()
+            .find(|e| e.session_id == "parent-session-id")
+            .unwrap();
+        assert!(parent_export.parent_session_id.is_none());
+        assert_eq!(parent_export.session_type, tt_core::SessionType::User);
+
+        let child_export = exports
+            .iter()
+            .find(|e| e.session_id == "agent-a913a65")
+            .unwrap();
+        assert_eq!(
+            child_export.parent_session_id.as_deref(),
+            Some("parent-session-id")
+        );
+        assert_eq!(child_export.session_type, tt_core::SessionType::Subagent);
+    }
+
+    #[test]
+    fn test_export_agents_preserves_source_field() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+
+        // Insert a Claude session
+        let claude_session = tt_core::session::AgentSession {
+            session_id: "claude-session-1".to_string(),
+            source: tt_core::session::SessionSource::Claude,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::User,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_time: None,
+            message_count: 1,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 0,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+        db.upsert_agent_session(&claude_session).unwrap();
+
+        // Insert an OpenCode session
+        let opencode_session = tt_core::session::AgentSession {
+            session_id: "ses_opencode_1".to_string(),
+            source: tt_core::session::SessionSource::OpenCode,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::User,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_time: None,
+            message_count: 1,
+            summary: None,
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 0,
+            tool_call_count: 0,
+            user_message_timestamps: Vec::new(),
+        };
+        db.upsert_agent_session(&opencode_session).unwrap();
+
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-01-15T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let exports = export_agents(&db, start, end).unwrap();
+        assert_eq!(exports.len(), 2);
+
+        let claude_export = exports
+            .iter()
+            .find(|e| e.session_id == "claude-session-1")
+            .unwrap();
+        assert_eq!(claude_export.source, tt_core::SessionSource::Claude);
+
+        let opencode_export = exports
+            .iter()
+            .find(|e| e.session_id == "ses_opencode_1")
+            .unwrap();
+        assert_eq!(opencode_export.source, tt_core::SessionSource::OpenCode);
+
+        // Verify JSON serialization uses consistent values
+        let json = serde_json::to_string(&opencode_export).unwrap();
+        assert!(json.contains("\"source\":\"opencode\""));
+    }
     #[test]
     fn test_stream_export_serialization() {
         let stream = StreamExport {
@@ -776,7 +956,7 @@ mod tests {
         assert_eq!(export.event_type, "tmux_pane_focus");
         assert_eq!(export.source, "remote.tmux");
         assert_eq!(export.cwd, Some("/home/user/project".to_string()));
-        assert_eq!(export.claude_session_id, Some("session-abc".to_string()));
+        assert_eq!(export.session_id, Some("session-abc".to_string()));
         assert_eq!(export.tmux_session, Some("main".to_string()));
         assert_eq!(export.pane_id, Some("%0".to_string()));
         assert_eq!(export.stream_id, Some("stream-xyz".to_string()));
@@ -897,9 +1077,10 @@ mod tests {
     fn test_export_agents_returns_sessions_in_range() {
         let db = tt_db::Database::open_in_memory().unwrap();
 
-        // Insert a test Claude session
-        let session = tt_core::session::ClaudeSession {
-            claude_session_id: "test-session-123".to_string(),
+        // Insert a test agent session
+        let session = tt_core::session::AgentSession {
+            session_id: "test-session-123".to_string(),
+            source: tt_core::session::SessionSource::default(),
             parent_session_id: None,
             session_type: tt_core::session::SessionType::default(),
             project_path: "/home/user/my-project".to_string(),
@@ -920,7 +1101,7 @@ mod tests {
             tool_call_count: 15,
             user_message_timestamps: Vec::new(),
         };
-        db.upsert_claude_session(&session).unwrap();
+        db.upsert_agent_session(&session).unwrap();
 
         // Query for sessions in range
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
@@ -934,7 +1115,7 @@ mod tests {
 
         assert_eq!(exports.len(), 1);
         let agent = &exports[0];
-        assert_eq!(agent.claude_session_id, "test-session-123");
+        assert_eq!(agent.session_id, "test-session-123");
         assert_eq!(agent.project_path, "/home/user/my-project");
         assert_eq!(agent.project_name, "my-project");
         assert_eq!(agent.summary.as_deref(), Some("Implemented feature X"));
