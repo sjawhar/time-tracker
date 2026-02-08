@@ -4,9 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{
-    context, events, export, import, ingest, recompute, report, status, streams, suggest, sync, tag,
-};
+use tt_cli::commands::{context, export, import, ingest, recompute, report, status, streams, tag};
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
 /// Load config and open database, ensuring the parent directory exists.
@@ -66,14 +64,6 @@ fn main() -> Result<()> {
             let (db, _config) = open_database(cli.config.as_deref())?;
             import::run(&db)?;
         }
-        Some(Commands::Sync { remote }) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
-            sync::run(&db, remote)?;
-        }
-        Some(Commands::Events { after, before }) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
-            events::run(&db, after.as_deref(), before.as_deref())?;
-        }
         Some(Commands::Status) => {
             let (db, config) = open_database(cli.config.as_deref())?;
             status::run(&db, &config.database_path)?;
@@ -87,6 +77,7 @@ fn main() -> Result<()> {
             last_week,
             day,
             last_day,
+            weeks,
             json,
         }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
@@ -99,7 +90,7 @@ fn main() -> Result<()> {
             } else {
                 report::Period::Week
             };
-            report::run(&db, period, *json)?;
+            report::run(&db, period, *json, *weeks)?;
         }
         Some(Commands::Tag {
             stream,
@@ -107,11 +98,6 @@ fn main() -> Result<()> {
         }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
             tag::run(&db, stream, tag_name)?;
-        }
-        Some(Commands::Suggest { stream, json }) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
-            let rt = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
-            rt.block_on(suggest::run(&db, stream, *json))?;
         }
         Some(Commands::Streams(action)) => {
             let (db, _config) = open_database(cli.config.as_deref())?;

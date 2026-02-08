@@ -11,13 +11,28 @@ expression: output
     "end": "2025-02-02",
     "type": "week"
   },
-  "by_tag": [],
+  "by_tag": [
+    {
+      "tag": "development",
+      "time_direct_ms": 7200000,
+      "time_delegated_ms": 4500000,
+      "streams": [
+        "abc123def456"
+      ]
+    },
+    {
+      "tag": "time-tracker",
+      "time_direct_ms": 7200000,
+      "time_delegated_ms": 4500000,
+      "streams": [
+        "abc123def456"
+      ]
+    }
+  ],
   "untagged": {
-    "time_direct_ms": 7200000,
-    "time_delegated_ms": 4500000,
-    "streams": [
-      "abc123def456"
-    ]
+    "time_direct_ms": 0,
+    "time_delegated_ms": 0,
+    "streams": []
   },
   "agent_sessions": {
     "total": 0,

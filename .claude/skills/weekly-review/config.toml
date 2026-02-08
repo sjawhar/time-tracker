@@ -1,0 +1,50 @@
+# Weekly Review Configuration
+# Review-specific settings for the weekly-review skill
+
+[prompts]
+# Default reflection questions presented during Phase 4 narration
+successes = "What went well this week?"
+mistakes = "What mistakes did I make?"
+bottlenecks = "What bottlenecks or blockers did I encounter?"
+bottleneck_action = "What's one thing you'll change next week to address this?"
+priorities_check = "Are you working on the highest impact items?"
+iteration = "What's one thing you'll iterate on next week?"
+
+[goals]
+# Checkbox items for goal tracking (Phase 3 & 5)
+# User can mention any of these during narration
+items = [
+  { id = "paired_engineer", label = "Paired with an engineer" },
+  { id = "read_writeups", label = "Read team members' writeups" },
+  { id = "left_comments", label = "Left comments on others' work" },
+  { id = "gave_feedback", label = "Gave constructive feedback" },
+  { id = "asked_help", label = "Asked for help when stuck" },
+  { id = "documented", label = "Documented decisions or learnings" },
+  { id = "mentored", label = "Mentored or helped onboard someone" },
+  { id = "shipped", label = "Shipped something to users" },
+]
+
+[ratings]
+# Self-assessment rating dimensions (1-7 scale, Phase 3 & 5)
+dimensions = [
+  { id = "mental", label = "Mental clarity", min = 1, max = 7 },
+  { id = "productivity", label = "Productivity", min = 1, max = 7 },
+  { id = "prioritization", label = "Prioritization", min = 1, max = 7 },
+  { id = "time_mgmt", label = "Time management", min = 1, max = 7 },
+  { id = "engagement", label = "Engagement", min = 1, max = 7 },
+  { id = "overall", label = "Overall", min = 1, max = 7 },
+]
+
+[review]
+# Review output and configuration
+jsonl_path = ".claude/weekly-reviews.jsonl"
+week_start_day = "monday"
+
+# Timezone for date range calculations (Phase 2)
+# Default: US Pacific (America/Los_Angeles)
+# Used to determine Sunday-Saturday window for tt report queries
+timezone = "America/Los_Angeles"
+
+# Historical trend analysis window (Phase 1)
+# Number of weeks to analyze for patterns and anomalies
+trend_weeks = 8
