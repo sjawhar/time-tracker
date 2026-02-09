@@ -11,12 +11,21 @@ expression: output
     "end": "2025-02-02",
     "type": "week"
   },
-  "by_tag": [],
+  "by_tag": [
+    {
+      "tag": "dev",
+      "time_direct_ms": 1200000,
+      "time_delegated_ms": 0,
+      "streams": [
+        "abc123def456"
+      ]
+    }
+  ],
   "untagged": {
-    "time_direct_ms": 7200000,
-    "time_delegated_ms": 4500000,
+    "time_direct_ms": 600000,
+    "time_delegated_ms": 300000,
     "streams": [
-      "abc123def456"
+      "def456ghi789"
     ]
   },
   "agent_sessions": {
@@ -26,8 +35,8 @@ expression: output
     "top_sessions": []
   },
   "totals": {
-    "time_direct_ms": 7200000,
-    "time_delegated_ms": 4500000,
-    "stream_count": 1
+    "time_direct_ms": 1800000,
+    "time_delegated_ms": 300000,
+    "stream_count": 2
   }
 }

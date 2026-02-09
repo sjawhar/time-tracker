@@ -14,10 +14,8 @@ path = "src/main.rs"
 [dependencies]
 tt-core.workspace = true
 tt-db.workspace = true
-tt-llm.workspace = true
 
 clap.workspace = true
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

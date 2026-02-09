@@ -6,4 +6,4 @@ STREAMS (last 7 days)
 
 No streams with activity in the last 7 days.
 
-Hint: Run 'tt sync <remote>' to import events.
+Hint: Run 'ssh <remote> tt export | tt import' to import events from a remote host.

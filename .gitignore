@@ -322,3 +322,6 @@ $RECYCLE.BIN/
 .envrc
 *.db-journal
 .env
+
+.sisyphus/*
+!.sisyphus/rules/

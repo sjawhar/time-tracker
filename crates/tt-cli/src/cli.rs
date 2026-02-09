@@ -47,31 +47,6 @@ pub enum Commands {
     /// Duplicate events (same ID) are silently ignored.
     Import,
 
-    /// Sync events from a remote host via SSH.
-    ///
-    /// Executes `ssh <remote> tt export` and imports the output into the
-    /// local `SQLite` database. Requires SSH key authentication (no password prompts).
-    Sync {
-        /// Remote host in SSH format (user@host or host).
-        ///
-        /// Uses your SSH config for custom ports/keys. Configure in ~/.ssh/config.
-        remote: String,
-    },
-
-    /// Query events from local database (debugging).
-    ///
-    /// Outputs all events as JSONL (one JSON object per line).
-    /// Use --after/--before to limit range for large databases.
-    Events {
-        /// Only show events after this timestamp (ISO 8601).
-        #[arg(long)]
-        after: Option<String>,
-
-        /// Only show events before this timestamp (ISO 8601).
-        #[arg(long)]
-        before: Option<String>,
-    },
-
     /// Recompute direct/delegated time for streams.
     ///
     /// Uses the attention allocation algorithm to calculate time based on
@@ -103,6 +78,10 @@ pub enum Commands {
         #[arg(long, group = "period")]
         last_day: bool,
 
+        /// Number of weekly reports to generate (most recent first).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..), group = "period")]
+        weeks: Option<u32>,
+
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -118,19 +97,6 @@ pub enum Commands {
 
         /// Tag to add.
         tag: String,
-    },
-
-    /// Suggest a tag for a stream based on event metadata.
-    ///
-    /// Analyzes working directories from events to suggest a project tag.
-    /// When metadata is ambiguous, uses LLM analysis (requires `ANTHROPIC_API_KEY`).
-    Suggest {
-        /// Stream ID or name.
-        stream: String,
-
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
     },
 
     /// Manage streams.

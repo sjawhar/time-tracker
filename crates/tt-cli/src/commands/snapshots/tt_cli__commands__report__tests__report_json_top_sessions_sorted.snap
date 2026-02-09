@@ -1,0 +1,75 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+expression: output
+---
+{
+  "generated_at": "2025-01-29T16:00:00+00:00",
+  "timezone": "America/Los_Angeles",
+  "week_start_day": "monday",
+  "period": {
+    "start": "2025-01-27",
+    "end": "2025-02-02",
+    "type": "week"
+  },
+  "by_tag": [],
+  "untagged": {
+    "time_direct_ms": 7200000,
+    "time_delegated_ms": 4500000,
+    "streams": [
+      "abc123def456"
+    ]
+  },
+  "agent_sessions": {
+    "total": 6,
+    "by_source": {
+      "claude": 4,
+      "opencode": 2
+    },
+    "by_type": {
+      "subagent": 2,
+      "user": 4
+    },
+    "top_sessions": [
+      {
+        "session_id": "session-d",
+        "source": "claude",
+        "type": "subagent",
+        "duration_ms": 1800000,
+        "starting_prompt": "longest"
+      },
+      {
+        "session_id": "session-e",
+        "source": "opencode",
+        "type": "user",
+        "duration_ms": 1500000,
+        "starting_prompt": "second"
+      },
+      {
+        "session_id": "session-b",
+        "source": "claude",
+        "type": "user",
+        "duration_ms": 1200000,
+        "starting_prompt": "longer"
+      },
+      {
+        "session_id": "session-c",
+        "source": "opencode",
+        "type": "subagent",
+        "duration_ms": 900000,
+        "starting_prompt": "mid"
+      },
+      {
+        "session_id": "session-f",
+        "source": "claude",
+        "type": "user",
+        "duration_ms": 600000,
+        "starting_prompt": "cutoff"
+      }
+    ]
+  },
+  "totals": {
+    "time_direct_ms": 7200000,
+    "time_delegated_ms": 4500000,
+    "stream_count": 1
+  }
+}

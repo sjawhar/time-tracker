@@ -12,15 +12,12 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Path to the database file.
     pub database_path: PathBuf,
-    /// Claude API key (optional).
-    pub api_key: Option<String>,
 }
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("database_path", &self.database_path)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -30,7 +27,6 @@ impl Default for Config {
         let data_dir = dirs_config_path().unwrap_or_else(|| PathBuf::from("."));
         Self {
             database_path: data_dir.join("tt.db"),
-            api_key: None,
         }
     }
 }

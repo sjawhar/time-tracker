@@ -253,33 +253,6 @@ impl StoredEvent {
     }
 }
 
-// Implement InferableEvent for StoredEvent so it can be used with the inference algorithm
-impl tt_core::InferableEvent for StoredEvent {
-    fn event_id(&self) -> &str {
-        &self.id
-    }
-
-    fn timestamp(&self) -> DateTime<Utc> {
-        self.timestamp
-    }
-
-    fn cwd(&self) -> Option<&str> {
-        self.cwd.as_deref()
-    }
-
-    fn assignment_source(&self) -> Option<&str> {
-        self.assignment_source.as_deref()
-    }
-
-    fn stream_id(&self) -> Option<&str> {
-        self.stream_id.as_deref()
-    }
-
-    fn git_project(&self) -> Option<&str> {
-        self.git_project.as_deref()
-    }
-}
-
 // Implement AllocatableEvent for StoredEvent so it can be used with the time allocation algorithm
 impl tt_core::AllocatableEvent for StoredEvent {
     fn timestamp(&self) -> DateTime<Utc> {

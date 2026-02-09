@@ -97,7 +97,11 @@ pub fn format_streams(entries: &[StreamEntry]) -> String {
     if entries.is_empty() {
         writeln!(output, "No streams with activity in the last 7 days.").unwrap();
         writeln!(output).unwrap();
-        writeln!(output, "Hint: Run 'tt sync <remote>' to import events.").unwrap();
+        writeln!(
+            output,
+            "Hint: Run 'ssh <remote> tt export | tt import' to import events from a remote host."
+        )
+        .unwrap();
         return output;
     }
 

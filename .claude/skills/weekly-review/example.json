@@ -1,0 +1,56 @@
+{
+  "timestamp": "2026-01-19T10:30:00Z",
+  "week": {"start": "2026-01-12", "end": "2026-01-18"},
+  "activities": {
+    "admin": "0-5", "code_review": "10-20", "data": "0",
+    "design": "0-5", "development": "40-50", "events": "0",
+    "meetings": "10-20", "messages": "0-5", "ops": "0-5",
+    "planning": "0-5", "reading": "5-10", "research": "0",
+    "training": "0", "writing": "5-10", "other": "0"
+  },
+  "projects": {
+    "time-tracker": "30-40", "pivot": "20-30",
+    "legion": "5-10", "dotfiles": "0-5",
+    "other": "0"
+  },
+  "tt": {
+    "by_tag": {
+      "development": {"direct_ms": 54000000, "delegated_ms": 79200000},
+      "code_review": {"direct_ms": 10800000, "delegated_ms": 0},
+      "time-tracker": {"direct_ms": 45000000, "delegated_ms": 29520000},
+      "pivot": {"direct_ms": 18000000, "delegated_ms": 54000000}
+    },
+    "totals": {"direct_ms": 75600000, "delegated_ms": 97920000},
+    "agent_sessions": {"total": 47, "by_source": {"claude": 12, "opencode": 35}},
+    "period": {"start": "2026-01-12T08:00:00Z", "end": "2026-01-19T08:00:00Z"}
+  },
+  "goals": {
+    "completed": ["paired_engineer", "read_writeups", "left_comments"],
+    "notes": "Paired with Thomas on the auth bug"
+  },
+  "reflection": {
+    "successes": "The foobar feature went really well, users are really happy with it. I think we...",
+    "mistakes": "I should have been more patient with Jaime when they asked about timelines. Maybe I could...",
+    "bottlenecks": "Waiting on PR reviews blocked me for a day. The auth PR has been open for a week now...",
+    "bottleneck_action": "Set up office hours for quick reviews",
+    "priorities_check": "Yes, working on the highest impact item",
+    "iteration": "Add a daily standup check-in"
+  },
+  "ratings": {
+    "mental": 5, "productivity": 6, "prioritization": 5,
+    "time_mgmt": 4, "engagement": 5, "overall": 5
+  },
+  "next_week": {
+    "priorities": ["Ship viewer", "Onboard Rafael", "Plan Q1"],
+    "on_track_project": "yes",
+    "on_track_personal": "unsure"
+  },
+  "optional": {
+    "prompt": "What surprised me this week?",
+    "response": "How much energy I had on Tuesday"
+  },
+  "red_team": {
+    "challenges": "You've mentioned 'communicate better' for 3 weeks now — what's concretely blocking that?",
+    "user_responses": "I think I need to add a buffer before responding to pushback..."
+  }
+}
