@@ -13,9 +13,6 @@ authors = ["Sami"]
 # CLI
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 
-# Async runtime
-tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "fs", "process"] }
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
@@ -44,9 +41,6 @@ uuid = { version = "1.11", features = ["v4"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 dirs = "6.0"
 
-# HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
 # Testing
 insta = "1.42"
 tempfile = "3.15"
@@ -54,7 +48,6 @@ tempfile = "3.15"
 # Internal crates
 tt-core = { path = "crates/tt-core" }
 tt-db = { path = "crates/tt-db" }
-tt-llm = { path = "crates/tt-llm" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

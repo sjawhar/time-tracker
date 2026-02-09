@@ -1,0 +1,48 @@
+---
+source: crates/tt-cli/src/commands/report.rs
+expression: output
+---
+{
+  "generated_at": "2025-01-29T16:00:00+00:00",
+  "timezone": "America/Los_Angeles",
+  "week_start_day": "monday",
+  "period": {
+    "start": "2025-01-27",
+    "end": "2025-02-02",
+    "type": "week"
+  },
+  "by_tag": [
+    {
+      "tag": "dev",
+      "time_direct_ms": 3600000,
+      "time_delegated_ms": 0,
+      "streams": [
+        "abc123def456"
+      ]
+    },
+    {
+      "tag": "ops",
+      "time_direct_ms": 1800000,
+      "time_delegated_ms": 600000,
+      "streams": [
+        "def456ghi789"
+      ]
+    }
+  ],
+  "untagged": {
+    "time_direct_ms": 0,
+    "time_delegated_ms": 0,
+    "streams": []
+  },
+  "agent_sessions": {
+    "total": 0,
+    "by_source": {},
+    "by_type": {},
+    "top_sessions": []
+  },
+  "totals": {
+    "time_direct_ms": 5400000,
+    "time_delegated_ms": 600000,
+    "stream_count": 2
+  }
+}
