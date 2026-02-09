@@ -254,10 +254,13 @@ pub fn allocate_time<E: AllocatableEvent>(
                             browser_focus_state.stream_id.as_deref(),
                         );
                         if let Some(resolved_stream) = &resolved {
+                            let max_end =
+                                *focus_start + Duration::milliseconds(config.attention_window_ms);
+                            let actual_end = event_time.min(max_end);
                             add_direct(
                                 resolved_stream,
                                 *focus_start,
-                                event_time,
+                                actual_end,
                                 &mut activity_intervals,
                                 &mut stream_times,
                             );
@@ -292,10 +295,13 @@ pub fn allocate_time<E: AllocatableEvent>(
                                 browser_focus_state.stream_id.as_deref(),
                             );
                             if let Some(resolved_stream) = &resolved {
+                                let max_end = *focus_start
+                                    + Duration::milliseconds(config.attention_window_ms);
+                                let actual_end = end_time.min(max_end);
                                 add_direct(
                                     resolved_stream,
                                     *focus_start,
-                                    end_time, // Use calculated idle_start, not event_time
+                                    actual_end, // Use calculated idle_start, not event_time
                                     &mut activity_intervals,
                                     &mut stream_times,
                                 );
@@ -327,10 +333,13 @@ pub fn allocate_time<E: AllocatableEvent>(
                     if let Some(resolved_stream) = &resolved {
                         if event_stream == Some(resolved_stream.as_str()) {
                             if event_time > *focus_start {
+                                let max_end = *focus_start
+                                    + Duration::milliseconds(config.attention_window_ms);
+                                let actual_end = event_time.min(max_end);
                                 add_direct(
                                     resolved_stream,
                                     *focus_start,
-                                    event_time,
+                                    actual_end,
                                     &mut activity_intervals,
                                     &mut stream_times,
                                 );
@@ -410,8 +419,6 @@ pub fn allocate_time<E: AllocatableEvent>(
             }
 
             "browser_tab" => {
-                browser_focus_state.stream_id = event.stream_id().map(String::from);
-
                 // If we're in a browser app and have focus, update focus state
                 if window_focus_state
                     .app
@@ -427,10 +434,13 @@ pub fn allocate_time<E: AllocatableEvent>(
                                 browser_focus_state.stream_id.as_deref(),
                             );
                             if let Some(resolved_stream) = &resolved {
+                                let max_end = *focus_start
+                                    + Duration::milliseconds(config.attention_window_ms);
+                                let actual_end = event_time.min(max_end);
                                 add_direct(
                                     resolved_stream,
                                     *focus_start,
-                                    event_time,
+                                    actual_end,
                                     &mut activity_intervals,
                                     &mut stream_times,
                                 );
@@ -443,6 +453,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                         };
                     }
                 }
+
+                browser_focus_state.stream_id = event.stream_id().map(String::from);
             }
 
             _ => {}
@@ -779,9 +791,10 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(11)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Direct time: 0->5 (focus to scroll) + 5->10 (scroll to scroll) + 10->11 (scroll to period_end, capped by attention window)
-        // Total: 5 + 5 + 1 = 11 minutes
-        assert_eq!(stream_a.time_direct_ms, 11 * 60 * 1000);
+        // Direct time capped per attention window:
+        // 0->1 (focus to scroll), 5->6 (scroll to scroll), 10->11 (scroll to period_end)
+        // Total: 3 minutes
+        assert_eq!(stream_a.time_direct_ms, 3 * 60 * 1000);
     }
 
     // Test 2: Focus switches between streams
@@ -798,8 +811,8 @@ mod tests {
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
 
-        // Stream A: 0 to 10 = 10 minutes
-        assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
+        // Stream A: 0 to min(10, 0+1) = 1 minute (attention window)
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
         // Stream B: 10 to min(20, 10+1) = 10 to 11 = 1 minute (attention window)
         assert_eq!(stream_b.time_direct_ms, 60 * 1000);
     }
@@ -817,8 +830,8 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Direct time: 0-10 only (AFK pauses at 10, active at 15 doesn't restore)
-        assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
+        // Direct time capped at attention window before AFK: 1 minute
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
     }
 
     // Test 4: AFK active doesn't restore focus
@@ -835,8 +848,8 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Direct time: only 0-5 (AFK at 5)
-        assert_eq!(stream_a.time_direct_ms, 5 * 60 * 1000);
+        // Direct time capped at attention window: 1 minute
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
     }
 
     // Test 5: Single agent session
@@ -1043,9 +1056,9 @@ mod tests {
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
 
-        // Direct: from 0 to 10 (AFK pauses) = 10 minutes
+        // Direct: from 0 to min(10, 0+1) = 1 minute (attention window)
         // Delegated: from 5 to 30 = 25 minutes
-        assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
         assert_eq!(stream_a.time_delegated_ms, 25 * 60 * 1000);
     }
 
@@ -1063,10 +1076,10 @@ mod tests {
         let config = AllocationConfig::default();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
-        // Direct: [0, 10) = 10 min
+        // Direct: [0, 1) = 1 min (attention window)
         // Delegated: [5, 20) = 15 min
-        // Union: [0, 20) = 20 min
-        assert_eq!(result.total_tracked_ms, 20 * 60 * 1000);
+        // Union: [0, 1) + [5, 20) = 16 min
+        assert_eq!(result.total_tracked_ms, 16 * 60 * 1000);
     }
 
     // Test: Multiple tool uses in one session
@@ -1132,8 +1145,8 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(10)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Window focus + tmux focus on same stream = 10 minutes
-        assert_eq!(stream_a.time_direct_ms, 10 * 60 * 1000);
+        // Window focus + tmux focus on same stream = 1 minute (attention window)
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
     }
 
     #[test]
@@ -1166,8 +1179,8 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(6)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Terminal window focus + tmux focus = time goes to tmux stream A
-        assert_eq!(stream_a.time_direct_ms, 6 * 60 * 1000);
+        // Terminal window focus + tmux focus = time goes to tmux stream A, capped per window
+        assert_eq!(stream_a.time_direct_ms, 2 * 60 * 1000);
     }
 
     #[test]
@@ -1182,8 +1195,8 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(6)));
 
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
-        // Browser window focus + browser tab = time goes to browser stream B
-        assert_eq!(stream_b.time_direct_ms, 6 * 60 * 1000);
+        // Browser window focus + browser tab = time goes to browser stream B, capped per window
+        assert_eq!(stream_b.time_direct_ms, 2 * 60 * 1000);
     }
 
     #[test]
@@ -1198,7 +1211,156 @@ mod tests {
         let result = allocate_time(&events, &config, Some(ts(5)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
-        // Direct time: only 0-2 min (idle started at 2 min retroactively)
-        assert_eq!(stream_a.time_direct_ms, 2 * 60 * 1000);
+        // Direct time capped at attention window: 1 minute
+        assert_eq!(stream_a.time_direct_ms, 60 * 1000);
+    }
+
+    #[test]
+    fn test_focus_switch_caps_gap_at_attention_window() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::tmux_focus(ts(120), "stream-b"), // 2 hours later
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        assert_eq!(
+            stream_a.time_direct_ms, 60_000,
+            "stream-a should be capped to 1 min, not 120 min"
+        );
+        let stream_b = get_stream_time(&result, "stream-b").expect("stream-b should exist");
+        assert_eq!(
+            stream_b.time_direct_ms, 60_000,
+            "stream-b capped at finalization"
+        );
+    }
+
+    #[test]
+    fn test_scroll_caps_gap_at_attention_window() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::tmux_scroll(ts(120), "stream-a"), // 2 hours later
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        // First interval 0→1min capped, scroll resets window, second interval 120→121min = 60s
+        assert_eq!(
+            stream_a.time_direct_ms, 120_000,
+            "60s capped + 60s finalization = 120s"
+        );
+    }
+
+    #[test]
+    fn test_afk_caps_gap_at_attention_window() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::afk_change(ts(120), "idle"), // 2 hours later
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        assert_eq!(
+            stream_a.time_direct_ms, 60_000,
+            "should be capped to 1 min, not 120 min"
+        );
+    }
+
+    #[test]
+    fn test_browser_tab_switch_caps_gap_at_attention_window() {
+        let events = vec![
+            TestEvent::window_focus(ts(0), "firefox", Some("stream-a")),
+            TestEvent::browser_tab(ts(0), "stream-a"),
+            TestEvent::browser_tab(ts(120), "stream-b"), // 2 hours later
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        assert_eq!(
+            stream_a.time_direct_ms, 60_000,
+            "previous tab gets capped 60s"
+        );
+        let stream_b = get_stream_time(&result, "stream-b").expect("stream-b should exist");
+        assert_eq!(
+            stream_b.time_direct_ms, 60_000,
+            "new tab gets finalization 60s"
+        );
+    }
+
+    #[test]
+    fn test_scroll_within_window_not_capped() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::tmux_scroll(ts(0) + Duration::seconds(30), "stream-a"), // within window
+            TestEvent::tmux_focus(ts(120), "stream-b"),
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        // First interval: 0→30s (NOT capped, within window)
+        // Second interval: 30s→30s+60s=90s (capped at attention window from scroll to next focus switch at ts(120))
+        assert_eq!(
+            stream_a.time_direct_ms, 90_000,
+            "30s uncapped + 60s capped = 90s"
+        );
+    }
+
+    #[test]
+    fn test_multiple_focus_switches_with_gaps_all_capped() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::tmux_focus(ts(120), "stream-b"), // 2h gap
+            TestEvent::tmux_focus(ts(240), "stream-c"), // another 2h gap
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(241)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        let stream_b = get_stream_time(&result, "stream-b").expect("stream-b should exist");
+        let stream_c = get_stream_time(&result, "stream-c").expect("stream-c should exist");
+        assert_eq!(stream_a.time_direct_ms, 60_000, "stream-a capped");
+        assert_eq!(stream_b.time_direct_ms, 60_000, "stream-b capped");
+        assert_eq!(
+            stream_c.time_direct_ms, 60_000,
+            "stream-c capped at finalization"
+        );
+    }
+
+    #[test]
+    fn test_afk_retroactive_duration_caps_at_attention_window() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::afk_with_duration(ts(120), "idle", 30 * 60 * 1000), // idle 30min retroactively
+                                                                           // idle_start = ts(120) - 30min = ts(90)
+        ];
+        let config = AllocationConfig {
+            attention_window_ms: 60_000,
+            ..Default::default()
+        };
+        let result = allocate_time(&events, &config, Some(ts(121)));
+        let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
+        // idle_start = ts(90), end_time = max(ts(90), ts(0)) = ts(90)
+        // But capped: max_end = ts(0) + 60s = ts(1), capped_end = min(ts(90), ts(1)) = ts(1)
+        assert_eq!(
+            stream_a.time_direct_ms, 60_000,
+            "capped at attention window"
+        );
     }
 }
