@@ -1,367 +1,362 @@
 //! `OpenCode` session parsing.
 
-use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use rayon::prelude::*;
-use serde::Deserialize;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::session::{
     AgentSession, MAX_USER_MESSAGE_TIMESTAMPS, MAX_USER_PROMPTS, SessionError, SessionSource,
     SessionType, extract_project_name, truncate_prompt,
 };
 
-/// `OpenCode` session metadata.
-#[derive(Debug, Deserialize)]
-struct OpenCodeSession {
-    id: String,
-    directory: String,
-    title: Option<String>,
-    #[serde(rename = "parentID")]
-    parent_id: Option<String>,
-    time: OpenCodeTime,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenCodeTime {
-    created: i64,
-    updated: Option<i64>,
-}
-
-/// `OpenCode` message role.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum MessageRole {
-    User,
-    Assistant,
-    #[serde(other)]
-    Other,
-}
-
-/// `OpenCode` message metadata.
-#[derive(Debug, Deserialize)]
-struct OpenCodeMessage {
-    id: String,
-    role: MessageRole,
-    time: OpenCodeMessageTime,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenCodeMessageTime {
-    created: i64,
-}
-
-/// `OpenCode` message part type.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum PartType {
-    Text,
-    Tool,
-    #[serde(other)]
-    Other,
-}
-
-/// `OpenCode` message part.
-#[derive(Debug, Deserialize)]
-struct OpenCodePart {
-    /// Part ID -- used for deterministic ordering since `read_json_files`
-    /// returns entries in filesystem-dependent order.
-    id: String,
-    #[serde(rename = "type")]
-    part_type: PartType,
-    text: Option<String>,
-}
-
 fn unix_ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
-/// Read and deserialize all JSON files from a directory.
-fn read_json_files<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<T> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|e| {
-            let path = e.path();
-            let data = match fs::read_to_string(&path) {
-                Ok(d) => d,
-                Err(err) => {
-                    tracing::warn!(path = ?path, error = %err, "failed to read JSON file");
-                    return None;
-                }
-            };
-            match serde_json::from_str(&data) {
-                Ok(v) => Some(v),
-                Err(err) => {
-                    tracing::warn!(path = ?path, error = %err, "failed to parse JSON file");
-                    None
-                }
-            }
-        })
-        .collect()
+#[derive(Debug)]
+struct SessionRow {
+    id: String,
+    directory: String,
+    title: String,
+    parent_id: Option<String>,
+    time_created: i64,
+    time_updated: i64,
 }
 
-/// Parse an `OpenCode` session from its session file.
-pub fn parse_opencode_session(
-    storage_dir: &Path,
-    session_file: &Path,
-) -> Result<AgentSession, SessionError> {
-    let data = fs::read_to_string(session_file)?;
-    let session: OpenCodeSession = serde_json::from_str(&data)?;
+#[derive(Debug)]
+struct MessageStats {
+    user_message_count: i32,
+    assistant_message_count: i32,
+    user_prompts: Vec<String>,
+    starting_prompt: Option<String>,
+    user_message_timestamps: Vec<DateTime<Utc>>,
+    last_message_time: Option<i64>,
+}
 
-    if session.id.is_empty() {
-        return Err(SessionError::EmptySessionId);
-    }
-
-    let message_dir = storage_dir.join("message").join(&session.id);
-
-    let mut messages: Vec<OpenCodeMessage> = read_json_files(&message_dir);
-    messages.sort_by_key(|m| m.time.created);
-
-    let mut user_message_count = 0i32;
-    let mut assistant_message_count = 0i32;
-    let mut tool_call_count = 0i32;
-    let mut user_prompts: Vec<String> = Vec::new();
-    let mut starting_prompt: Option<String> = None;
-    let mut user_message_timestamps: Vec<DateTime<Utc>> = Vec::new();
-    let mut last_message_time: Option<i64> = None;
-
-    for msg in &messages {
-        last_message_time = Some(msg.time.created);
-
-        let mut parts: Vec<OpenCodePart> = match msg.role {
-            MessageRole::User | MessageRole::Assistant => {
-                read_json_files(&storage_dir.join("part").join(&msg.id))
-            }
-            MessageRole::Other => continue,
-        };
-        // Sort by ID for deterministic ordering (fs::read_dir order is platform-dependent)
-        parts.sort_by(|a, b| a.id.cmp(&b.id));
-
-        match msg.role {
-            MessageRole::User => {
-                user_message_count = user_message_count.saturating_add(1);
-
-                let text: String = parts
-                    .iter()
-                    .filter(|p| p.part_type == PartType::Text)
-                    .filter_map(|p| p.text.as_deref())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if !text.is_empty() {
-                    if starting_prompt.is_none() {
-                        starting_prompt = Some(truncate_prompt(&text));
-                    }
-                    if user_prompts.len() < MAX_USER_PROMPTS {
-                        user_prompts.push(truncate_prompt(&text));
-                    }
-                    if user_message_timestamps.len() < MAX_USER_MESSAGE_TIMESTAMPS {
-                        if let Some(ts) = unix_ms_to_datetime(msg.time.created) {
-                            user_message_timestamps.push(ts);
-                        }
-                    }
-                }
-            }
-            MessageRole::Assistant => {
-                assistant_message_count = assistant_message_count.saturating_add(1);
-
-                let count = parts
-                    .iter()
-                    .filter(|p| p.part_type == PartType::Tool)
-                    .count();
-                tool_call_count =
-                    tool_call_count.saturating_add(i32::try_from(count).unwrap_or(i32::MAX));
-            }
-            MessageRole::Other => unreachable!(),
+pub fn scan_opencode_sessions(db_path: &Path) -> Result<Vec<AgentSession>, SessionError> {
+    // NO_MUTEX is safe: single connection used from a single thread (no rayon).
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match Connection::open_with_flags(db_path, flags) {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(path = ?db_path, error = %err, "failed to open OpenCode database");
+            return Ok(Vec::new());
         }
-    }
-
-    let message_count = user_message_count.saturating_add(assistant_message_count);
-    let start_time = unix_ms_to_datetime(session.time.created)
-        .ok_or(SessionError::InvalidTimestamp(session.time.created))?;
-
-    // end_time: latest of last message time or session updated time
-    let end_ms = match (last_message_time, session.time.updated) {
-        (Some(msg), Some(upd)) => Some(msg.max(upd)),
-        (any, other) => any.or(other),
-    };
-    let end_time = end_ms
-        .and_then(unix_ms_to_datetime)
-        .filter(|t| *t > start_time);
-
-    let session_type = if session.parent_id.is_some() {
-        SessionType::Subagent
-    } else {
-        SessionType::User
     };
 
-    let project_name = extract_project_name(&session.directory);
-
-    Ok(AgentSession {
-        session_id: session.id,
-        source: SessionSource::OpenCode,
-        parent_session_id: session.parent_id,
-        session_type,
-        project_path: session.directory,
-        project_name,
-        start_time,
-        end_time,
-        message_count,
-        summary: session.title,
-        user_prompts,
-        starting_prompt,
-        assistant_message_count,
-        tool_call_count,
-        user_message_timestamps,
-    })
-}
-
-/// Scan `OpenCode` storage directory for sessions.
-pub fn scan_opencode_sessions(storage_dir: &Path) -> Result<Vec<AgentSession>, SessionError> {
-    let session_dir = storage_dir.join("session");
-    if !session_dir.exists() {
+    if let Err(err) = conn.busy_timeout(Duration::from_secs(5)) {
+        tracing::warn!(path = ?db_path, error = %err, "failed to set OpenCode db timeout");
         return Ok(Vec::new());
     }
 
-    let mut session_files = Vec::new();
-
-    for project_entry in fs::read_dir(&session_dir)? {
-        let project_path = project_entry?.path();
-        if !project_path.is_dir() {
-            continue;
+    let mut stmt = match conn
+        .prepare("SELECT id, directory, title, parent_id, time_created, time_updated FROM session")
+    {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
+            return Ok(Vec::new());
         }
-        for session_entry in fs::read_dir(&project_path)? {
-            let session_path = session_entry?.path();
-            if session_path.extension().is_some_and(|e| e == "json") {
-                session_files.push(session_path);
+    };
+
+    let session_rows = match stmt.query_map([], |row| {
+        Ok(SessionRow {
+            id: row.get::<_, String>(0)?,
+            directory: row.get::<_, String>(1)?,
+            title: row.get::<_, String>(2)?,
+            parent_id: row.get::<_, Option<String>>(3)?,
+            time_created: row.get::<_, i64>(4)?,
+            time_updated: row.get::<_, i64>(5)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut sessions = Vec::new();
+    for session_row in session_rows {
+        match session_row {
+            Ok(row) => {
+                if let Err(err) = build_agent_session(&conn, row).map(|s| sessions.push(s)) {
+                    tracing::warn!(error = %err, "skipping invalid OpenCode session");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "skipping invalid OpenCode session row");
             }
         }
     }
-
-    let mut sessions: Vec<AgentSession> = session_files
-        .par_iter()
-        .filter_map(|path| match parse_opencode_session(storage_dir, path) {
-            Ok(session) => Some(session),
-            Err(e) => {
-                tracing::warn!(path = ?path, error = %e, "skipping invalid OpenCode session");
-                None
-            }
-        })
-        .collect();
 
     sessions.sort_by_key(|e| e.start_time);
     Ok(sessions)
 }
 
+fn build_agent_session(
+    conn: &Connection,
+    session_row: SessionRow,
+) -> Result<AgentSession, SessionError> {
+    if session_row.id.is_empty() {
+        return Err(SessionError::EmptySessionId);
+    }
+
+    let message_stats = collect_message_stats(conn, &session_row.id)?;
+    let tool_call_count = count_tool_calls(conn, &session_row.id)?;
+    let message_count = message_stats
+        .user_message_count
+        .saturating_add(message_stats.assistant_message_count);
+    let start_time = unix_ms_to_datetime(session_row.time_created)
+        .ok_or(SessionError::InvalidTimestamp(session_row.time_created))?;
+
+    let end_ms = message_stats
+        .last_message_time
+        .map_or(session_row.time_updated, |msg| {
+            msg.max(session_row.time_updated)
+        });
+    let end_time = unix_ms_to_datetime(end_ms).filter(|t| *t > start_time);
+
+    let session_type = if session_row.parent_id.is_some() {
+        SessionType::Subagent
+    } else {
+        SessionType::User
+    };
+
+    let summary = (!session_row.title.is_empty()).then_some(session_row.title);
+
+    let project_name = extract_project_name(&session_row.directory);
+
+    Ok(AgentSession {
+        session_id: session_row.id,
+        source: SessionSource::OpenCode,
+        parent_session_id: session_row.parent_id,
+        session_type,
+        project_path: session_row.directory,
+        project_name,
+        start_time,
+        end_time,
+        message_count,
+        summary,
+        user_prompts: message_stats.user_prompts,
+        starting_prompt: message_stats.starting_prompt,
+        assistant_message_count: message_stats.assistant_message_count,
+        tool_call_count,
+        user_message_timestamps: message_stats.user_message_timestamps,
+    })
+}
+
+fn count_tool_calls(conn: &Connection, session_id: &str) -> Result<i32, SessionError> {
+    let mut tool_stmt = conn.prepare_cached(
+        "SELECT COUNT(*) FROM part p \
+         JOIN message m ON p.message_id = m.id \
+         WHERE p.session_id = ?1 AND json_valid(p.data) \
+         AND json_extract(p.data, '$.type') = 'tool' \
+         AND json_valid(m.data) \
+         AND json_extract(m.data, '$.role') = 'assistant'",
+    )?;
+    let tool_count: i64 = tool_stmt.query_row([session_id], |row| row.get::<_, i64>(0))?;
+    Ok(i32::try_from(tool_count).unwrap_or(i32::MAX))
+}
+
+fn collect_message_stats(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<MessageStats, SessionError> {
+    let mut message_stmt = conn.prepare_cached(
+        "SELECT id, time_created, \
+                CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END as role \
+         FROM message WHERE session_id = ?1 ORDER BY time_created",
+    )?;
+    let mut part_stmt = conn.prepare_cached(
+        "SELECT CASE WHEN json_valid(data) THEN json_extract(data, '$.text') END as text \
+         FROM part WHERE message_id = ?1 AND json_valid(data) \
+         AND json_extract(data, '$.type') = 'text' \
+         ORDER BY id",
+    )?;
+
+    let mut stats = MessageStats {
+        user_message_count: 0,
+        assistant_message_count: 0,
+        user_prompts: Vec::new(),
+        starting_prompt: None,
+        user_message_timestamps: Vec::new(),
+        last_message_time: None,
+    };
+
+    let messages = message_stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+
+    for message in messages {
+        let (message_id, created_ms, role) = message?;
+        let Some(role) = role else {
+            continue;
+        };
+        stats.last_message_time = Some(created_ms);
+        match role.as_str() {
+            "user" => {
+                stats.user_message_count = stats.user_message_count.saturating_add(1);
+
+                let text = collect_text_parts(&mut part_stmt, &message_id)?;
+                if !text.is_empty() {
+                    if stats.starting_prompt.is_none() {
+                        stats.starting_prompt = Some(truncate_prompt(&text));
+                    }
+                    if stats.user_prompts.len() < MAX_USER_PROMPTS {
+                        stats.user_prompts.push(truncate_prompt(&text));
+                    }
+                    if stats.user_message_timestamps.len() < MAX_USER_MESSAGE_TIMESTAMPS {
+                        if let Some(ts) = unix_ms_to_datetime(created_ms) {
+                            stats.user_message_timestamps.push(ts);
+                        }
+                    }
+                }
+            }
+            "assistant" => {
+                stats.assistant_message_count = stats.assistant_message_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(stats)
+}
+
+fn collect_text_parts(
+    part_stmt: &mut rusqlite::Statement<'_>,
+    message_id: &str,
+) -> Result<String, SessionError> {
+    let text_parts = part_stmt.query_map([message_id], |row| row.get::<_, Option<String>>(0))?;
+    let mut text_values = Vec::new();
+    for part in text_parts {
+        if let Some(text) = part? {
+            text_values.push(text);
+        }
+    }
+    Ok(text_values.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::fs;
     use tempfile::TempDir;
 
-    /// Create a minimal `OpenCode` session fixture.
-    #[expect(clippy::too_many_arguments, reason = "test fixture helper")]
-    fn create_session_fixture(
-        storage_dir: &Path,
-        project_hash: &str,
-        session_id: &str,
-        directory: &str,
-        title: Option<&str>,
-        parent_id: Option<&str>,
-        created_ms: i64,
-        updated_ms: Option<i64>,
-    ) -> std::path::PathBuf {
-        let session_dir = storage_dir.join("session").join(project_hash);
-        fs::create_dir_all(&session_dir).unwrap();
-
-        let session_data = serde_json::json!({
-            "id": session_id,
-            "directory": directory,
-            "title": title,
-            "parentID": parent_id,
-            "time": {
-                "created": created_ms,
-                "updated": updated_ms,
-            }
-        });
-
-        let path = session_dir.join(format!("{session_id}.json"));
-        fs::write(&path, serde_json::to_string(&session_data).unwrap()).unwrap();
-        path
+    fn create_test_db() -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL DEFAULT '',
+                parent_id TEXT,
+                slug TEXT NOT NULL DEFAULT '',
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX message_session_idx ON message(session_id);
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX part_message_idx ON part(message_id);
+            CREATE INDEX part_session_idx ON part(session_id);",
+        )
+        .unwrap();
+        (temp, db_path)
     }
 
-    fn create_message_fixture(
-        storage_dir: &Path,
-        session_id: &str,
-        message_id: &str,
-        role: &str,
+    fn insert_session(
+        db_path: &Path,
+        id: &str,
+        directory: &str,
+        title: &str,
+        parent_id: Option<&str>,
         created_ms: i64,
+        updated_ms: i64,
     ) {
-        let msg_dir = storage_dir.join("message").join(session_id);
-        fs::create_dir_all(&msg_dir).unwrap();
-
-        let msg_data = serde_json::json!({
-            "id": message_id,
-            "sessionID": session_id,
-            "role": role,
-            "time": { "created": created_ms }
-        });
-
-        fs::write(
-            msg_dir.join(format!("{message_id}.json")),
-            serde_json::to_string(&msg_data).unwrap(),
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, title, parent_id, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (id, directory, title, parent_id, created_ms, updated_ms),
         )
         .unwrap();
     }
 
-    fn create_part_fixture(
-        storage_dir: &Path,
+    fn insert_message(db_path: &Path, id: &str, session_id: &str, role: &str, created_ms: i64) {
+        let conn = Connection::open(db_path).unwrap();
+        let data = serde_json::json!({ "role": role }).to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (id, session_id, created_ms, created_ms, data),
+        )
+        .unwrap();
+    }
+
+    fn insert_part(
+        db_path: &Path,
+        id: &str,
         message_id: &str,
-        part_id: &str,
+        session_id: &str,
         part_type: &str,
         text: Option<&str>,
+        created_ms: i64,
     ) {
-        let part_dir = storage_dir.join("part").join(message_id);
-        fs::create_dir_all(&part_dir).unwrap();
-
-        let mut part_data = serde_json::json!({
-            "id": part_id,
-            "type": part_type,
-        });
-        if let Some(t) = text {
-            part_data["text"] = serde_json::Value::String(t.to_string());
+        let conn = Connection::open(db_path).unwrap();
+        let mut data = serde_json::json!({ "type": part_type });
+        if let Some(value) = text {
+            data["text"] = serde_json::Value::String(value.to_string());
         }
-
-        fs::write(
-            part_dir.join(format!("{part_id}.json")),
-            serde_json::to_string(&part_data).unwrap(),
+        let data = data.to_string();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (id, message_id, session_id, created_ms, created_ms, data),
         )
         .unwrap();
     }
 
     #[test]
-    fn test_parse_basic_session() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+    fn test_basic_session() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_test1",
             "/home/user/my-project",
-            Some("Test session"),
+            "Test session",
             None,
             1_700_000_000_000,
-            Some(1_700_000_060_000),
+            1_700_000_060_000,
         );
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
-
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
         assert_eq!(session.session_id, "ses_test1");
         assert_eq!(session.source, SessionSource::OpenCode);
         assert_eq!(session.session_type, SessionType::User);
@@ -374,31 +369,58 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_session_with_messages() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+    fn test_session_with_messages() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_msg",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            None,
+            1_700_000_010_000,
+        );
+        // User message
+        insert_message(&db_path, "msg_u1", "ses_msg", "user", 1_700_000_001_000);
+        insert_part(
+            &db_path,
+            "prt_u1",
+            "msg_u1",
+            "ses_msg",
+            "text",
+            Some("hello world"),
+            1_700_000_001_000,
         );
 
-        // User message
-        create_message_fixture(storage, "ses_msg", "msg_u1", "user", 1_700_000_001_000);
-        create_part_fixture(storage, "msg_u1", "prt_u1", "text", Some("hello world"));
-
         // Assistant message with tool
-        create_message_fixture(storage, "ses_msg", "msg_a1", "assistant", 1_700_000_002_000);
-        create_part_fixture(storage, "msg_a1", "prt_a1_text", "text", Some("I'll help"));
-        create_part_fixture(storage, "msg_a1", "prt_a1_tool", "tool", None);
+        insert_message(
+            &db_path,
+            "msg_a1",
+            "ses_msg",
+            "assistant",
+            1_700_000_002_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_a1_text",
+            "msg_a1",
+            "ses_msg",
+            "text",
+            Some("I'll help"),
+            1_700_000_002_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_a1_tool",
+            "msg_a1",
+            "ses_msg",
+            "tool",
+            None,
+            1_700_000_002_000,
+        );
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let session = &sessions[0];
 
         assert_eq!(session.message_count, 2);
         assert_eq!(session.assistant_message_count, 1);
@@ -410,45 +432,40 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_subagent_session() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+    fn test_subagent_session() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_child",
             "/home/user/project",
-            None,
+            "",
             Some("ses_parent"),
             1_700_000_000_000,
-            None,
+            1_700_000_010_000,
         );
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let session = &sessions[0];
 
         assert_eq!(session.session_type, SessionType::Subagent);
         assert_eq!(session.parent_session_id.as_deref(), Some("ses_parent"));
     }
 
     #[test]
-    fn test_parse_session_missing_messages_dir() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+    fn test_session_with_no_messages() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_empty",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            None,
+            1_700_000_000_000,
         );
 
-        // No message dir created
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let session = &sessions[0];
 
         assert_eq!(session.message_count, 0);
         assert!(session.user_prompts.is_empty());
@@ -456,32 +473,29 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_opencode_sessions() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+    fn test_scan_multiple_sessions() {
+        let (_temp, db_path) = create_test_db();
 
-        create_session_fixture(
-            storage,
-            "proj1",
+        insert_session(
+            &db_path,
             "ses_a",
             "/home/user/project-a",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            None,
+            1_700_000_000_000,
         );
-        create_session_fixture(
-            storage,
-            "proj2",
+        insert_session(
+            &db_path,
             "ses_b",
             "/home/user/project-b",
-            None,
+            "",
             None,
             1_700_000_100_000,
-            None,
+            1_700_000_100_000,
         );
 
-        let sessions = scan_opencode_sessions(storage).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
 
         assert_eq!(sessions.len(), 2);
         // Sorted by start_time
@@ -490,70 +504,60 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_nonexistent_dir() {
+    fn test_scan_nonexistent_db() {
         let result = scan_opencode_sessions(Path::new("/nonexistent")).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_user_prompts_limited() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_many",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            None,
+            1_700_000_100_000,
         );
-
         for i in 0..10 {
             let msg_id = format!("msg_u{i}");
             let part_id = format!("prt_u{i}");
-            create_message_fixture(
-                storage,
-                "ses_many",
-                &msg_id,
-                "user",
-                1_700_000_000_000 + i64::from(i) * 1000,
-            );
-            create_part_fixture(
-                storage,
-                &msg_id,
+            let created_ms = 1_700_000_000_000 + i64::from(i) * 1000;
+            insert_message(&db_path, &msg_id, "ses_many", "user", created_ms);
+            insert_part(
+                &db_path,
                 &part_id,
+                &msg_id,
+                "ses_many",
                 "text",
                 Some(&format!("prompt {i}")),
+                created_ms,
             );
         }
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let session = &sessions[0];
 
         assert_eq!(session.user_prompts.len(), MAX_USER_PROMPTS);
         assert_eq!(session.starting_prompt.as_deref(), Some("prompt 0"));
     }
 
     #[test]
-    fn test_parse_session_with_invalid_timestamp() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+    fn test_invalid_timestamp() {
+        let (_temp, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: "ses_bad_ts".to_string(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: i64::MAX,
+            time_updated: i64::MAX,
+        };
 
-        // Use an out-of-range timestamp (i64::MAX milliseconds)
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
-            "ses_bad_ts",
-            "/home/user/project",
-            None,
-            None,
-            i64::MAX,
-            None,
-        );
-
-        let result = parse_opencode_session(storage, &session_file);
+        let result = build_agent_session(&conn, session_row);
         assert!(result.is_err());
         assert!(
             matches!(result.unwrap_err(), SessionError::InvalidTimestamp(ts) if ts == i64::MAX)
@@ -562,99 +566,121 @@ mod tests {
 
     #[test]
     fn test_end_time_none_when_equal_to_start_time() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+        let (_temp, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: "ses_same_ts".to_string(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: 1_700_000_000_000,
+            time_updated: 1_700_000_000_000,
+        };
 
-        // updated == created → end_time should be None
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
-            "ses_same_ts",
-            "/home/user/project",
-            None,
-            None,
-            1_700_000_000_000,
-            Some(1_700_000_000_000),
-        );
-
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let session = build_agent_session(&conn, session_row).unwrap();
         assert!(session.end_time.is_none());
     }
 
     #[test]
     fn test_end_time_from_last_message_beats_updated() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        // session.updated is earlier than last message
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_msg_later",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            Some(1_700_000_010_000),
+            1_700_000_010_000,
         );
 
-        create_message_fixture(storage, "ses_msg_later", "msg_1", "user", 1_700_000_020_000);
-        create_part_fixture(storage, "msg_1", "prt_1", "text", Some("hi"));
+        insert_message(
+            &db_path,
+            "msg_1",
+            "ses_msg_later",
+            "user",
+            1_700_000_020_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_1",
+            "msg_1",
+            "ses_msg_later",
+            "text",
+            Some("hi"),
+            1_700_000_020_000,
+        );
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: "ses_msg_later".to_string(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: 1_700_000_000_000,
+            time_updated: 1_700_000_010_000,
+        };
+        let session = build_agent_session(&conn, session_row).unwrap();
         // end_time should be from last message (20s), not session.updated (10s)
         assert_eq!(session.end_time, unix_ms_to_datetime(1_700_000_020_000));
     }
 
     #[test]
-    fn test_parse_session_malformed_json_file() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+    fn test_malformed_message_data() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_bad_msg",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
 
-        let session_dir = storage.join("session").join("proj1");
-        fs::create_dir_all(&session_dir).unwrap();
-        fs::write(session_dir.join("bad.json"), "not valid json").unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                "msg_bad",
+                "ses_bad_msg",
+                1_700_000_001_000i64,
+                1_700_000_001_000i64,
+                "not json",
+            ),
+        )
+        .unwrap();
 
-        let result = parse_opencode_session(storage, &session_dir.join("bad.json"));
-        assert!(matches!(result, Err(SessionError::Json(_))));
-    }
-
-    #[test]
-    fn test_parse_session_missing_required_fields() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_dir = storage.join("session").join("proj1");
-        fs::create_dir_all(&session_dir).unwrap();
-        // Valid JSON but missing required fields (no id, directory, time)
-        fs::write(session_dir.join("incomplete.json"), r#"{"title": "test"}"#).unwrap();
-
-        let result = parse_opencode_session(storage, &session_dir.join("incomplete.json"));
-        assert!(matches!(result, Err(SessionError::Json(_))));
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].message_count, 0);
     }
 
     #[test]
     fn test_scan_skips_malformed_sessions() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+        let (_temp, db_path) = create_test_db();
 
-        // One good session
-        create_session_fixture(
-            storage,
-            "proj1",
+        insert_session(
+            &db_path,
             "ses_good",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_session(
+            &db_path,
+            "",
+            "/home/user/bad",
+            "",
             None,
+            1_700_000_100_000,
+            1_700_000_110_000,
         );
 
-        // One bad session (invalid JSON)
-        let bad_dir = storage.join("session").join("proj1");
-        fs::write(bad_dir.join("ses_bad.json"), "not json").unwrap();
-
-        let sessions = scan_opencode_sessions(storage).unwrap();
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
         // Should only contain the good session
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "ses_good");
@@ -662,37 +688,51 @@ mod tests {
 
     #[test]
     fn test_parse_session_with_messages_verifies_end_time() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
-
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
             "ses_verify_end",
             "/home/user/project",
-            None,
+            "",
             None,
             1_700_000_000_000,
-            None,
+            1_700_000_002_000,
         );
 
-        create_message_fixture(
-            storage,
-            "ses_verify_end",
+        insert_message(
+            &db_path,
             "msg_u1",
+            "ses_verify_end",
             "user",
             1_700_000_001_000,
         );
-        create_part_fixture(storage, "msg_u1", "prt_u1", "text", Some("hello"));
-        create_message_fixture(
-            storage,
+        insert_part(
+            &db_path,
+            "prt_u1",
+            "msg_u1",
             "ses_verify_end",
+            "text",
+            Some("hello"),
+            1_700_000_001_000,
+        );
+        insert_message(
+            &db_path,
             "msg_a1",
+            "ses_verify_end",
             "assistant",
             1_700_000_005_000,
         );
 
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: "ses_verify_end".to_string(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: 1_700_000_000_000,
+            time_updated: 1_700_000_002_000,
+        };
+        let session = build_agent_session(&conn, session_row).unwrap();
 
         // end_time should be the last message's timestamp
         assert_eq!(session.end_time, unix_ms_to_datetime(1_700_000_005_000));
@@ -700,22 +740,18 @@ mod tests {
 
     #[test]
     fn test_end_time_none_when_updated_before_created() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+        let (_temp, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: "ses_skew".to_string(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: 1_700_000_000_000,
+            time_updated: 1_699_999_000_000,
+        };
 
-        // session.updated < session.created (clock skew or data corruption)
-        let session_file = create_session_fixture(
-            storage,
-            "proj1",
-            "ses_skew",
-            "/home/user/project",
-            None,
-            None,
-            1_700_000_000_000,
-            Some(1_699_999_000_000), // 1000 seconds before created
-        );
-
-        let session = parse_opencode_session(storage, &session_file).unwrap();
+        let session = build_agent_session(&conn, session_row).unwrap();
         assert!(
             session.end_time.is_none(),
             "end_time should be None when updated is before created"
@@ -724,21 +760,28 @@ mod tests {
 
     #[test]
     fn test_empty_session_id_rejected() {
-        let temp = TempDir::new().unwrap();
-        let storage = temp.path();
+        let (_temp, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let session_row = SessionRow {
+            id: String::new(),
+            directory: "/home/user/project".to_string(),
+            title: String::new(),
+            parent_id: None,
+            time_created: 1_700_000_000_000,
+            time_updated: 1_700_000_000_000,
+        };
 
-        let session_dir = storage.join("session").join("proj1");
-        fs::create_dir_all(&session_dir).unwrap();
-
-        let data = serde_json::json!({
-            "id": "",
-            "directory": "/home/user/project",
-            "time": { "created": 1_700_000_000_000i64 }
-        });
-        let path = session_dir.join("empty_id.json");
-        fs::write(&path, serde_json::to_string(&data).unwrap()).unwrap();
-
-        let result = parse_opencode_session(storage, &path);
+        let result = build_agent_session(&conn, session_row);
         assert!(matches!(result, Err(SessionError::EmptySessionId)));
+    }
+
+    #[test]
+    fn test_scan_corrupt_db() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("opencode.db");
+        fs::write(&db_path, "").unwrap();
+
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        assert!(sessions.is_empty());
     }
 }
