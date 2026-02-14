@@ -1000,6 +1000,7 @@ dependencies = [
  "chrono",
  "insta",
  "rayon",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

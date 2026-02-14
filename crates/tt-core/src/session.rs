@@ -125,6 +125,8 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
     #[error("no messages found in session")]
     NoMessages,
     #[error("no project path found in session")]

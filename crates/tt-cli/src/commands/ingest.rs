@@ -345,8 +345,8 @@ use tt_db::StoredEvent;
 
 /// Run the sessions index command.
 ///
-/// Scans Claude Code and `OpenCode` session directories and upserts
-/// them into the database.
+/// Scans Claude Code session directories and the `OpenCode` `SQLite`
+/// database, then upserts discovered sessions into the database.
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     let mut all_sessions = Vec::new();
 
@@ -361,11 +361,11 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     }
 
     // OpenCode
-    let opencode_dir = get_opencode_storage_dir()?;
-    if opencode_dir.exists() {
+    let opencode_db = get_opencode_db_path()?;
+    if opencode_db.exists() {
         println!("Scanning OpenCode sessions...");
         let opencode_sessions =
-            scan_opencode_sessions(&opencode_dir).context("failed to scan OpenCode sessions")?;
+            scan_opencode_sessions(&opencode_db).context("failed to scan OpenCode sessions")?;
         println!("  Found {} OpenCode sessions", opencode_sessions.len());
         all_sessions.extend(opencode_sessions);
     }
@@ -472,9 +472,9 @@ fn get_claude_projects_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join("projects"))
 }
 
-/// Get the `OpenCode` storage directory path.
-fn get_opencode_storage_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local/share/opencode/storage"))
+/// Get the `OpenCode` database path.
+fn get_opencode_db_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".local/share/opencode/opencode.db"))
 }
 
 /// Reads all events from the events file in the specified data directory.
