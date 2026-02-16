@@ -29,8 +29,8 @@ pub struct AllocationConfig {
 impl Default for AllocationConfig {
     fn default() -> Self {
         Self {
-            attention_window_ms: 60_000, // 1 minute
-            agent_timeout_ms: 1_800_000, // 30 minutes
+            attention_window_ms: 300_000, // 5 minutes
+            agent_timeout_ms: 1_800_000,  // 30 minutes
         }
     }
 }
@@ -618,6 +618,13 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
+    fn test_config() -> AllocationConfig {
+        AllocationConfig {
+            attention_window_ms: 60_000,
+            agent_timeout_ms: 1_800_000,
+        }
+    }
+
     /// Test event implementation.
     struct TestEvent {
         timestamp: DateTime<Utc>,
@@ -786,7 +793,7 @@ mod tests {
             TestEvent::tmux_scroll(ts(10), "A"),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         // Set period_end to cap the final attention window
         let result = allocate_time(&events, &config, Some(ts(11)));
 
@@ -805,7 +812,7 @@ mod tests {
             TestEvent::tmux_focus(ts(10), "B"),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -826,7 +833,7 @@ mod tests {
             TestEvent::afk_change(ts(15), "active"),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -844,7 +851,7 @@ mod tests {
             // No focus event after active
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -861,7 +868,7 @@ mod tests {
             TestEvent::agent_session(ts(30), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(30)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -878,7 +885,7 @@ mod tests {
             TestEvent::agent_session(ts(30), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(30)));
 
         // No tool use = no delegated time
@@ -921,7 +928,7 @@ mod tests {
             TestEvent::agent_session(ts(30), "ended", "sess2", Some("B")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(30)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -942,7 +949,7 @@ mod tests {
             TestEvent::agent_session(ts(30), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(30)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1001,7 +1008,7 @@ mod tests {
             TestEvent::tmux_scroll(ts(5), "B"), // This scroll doesn't affect focus since focus is on A
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(10)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1027,7 +1034,7 @@ mod tests {
             data: json!({"pane_id": "%1"}),
         }];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(10)));
 
         // No streams should have time
@@ -1051,7 +1058,7 @@ mod tests {
             TestEvent::agent_session(ts(30), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(30)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1073,7 +1080,7 @@ mod tests {
             TestEvent::agent_session(ts(20), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         // Direct: [0, 1) = 1 min (attention window)
@@ -1093,7 +1100,7 @@ mod tests {
             TestEvent::agent_session(ts(20), "ended", "sess1", Some("A")),
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(20)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1126,7 +1133,7 @@ mod tests {
     #[test]
     fn test_empty_events() {
         let events: Vec<TestEvent> = vec![];
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, None);
 
         assert!(result.stream_times.is_empty());
@@ -1141,7 +1148,7 @@ mod tests {
             TestEvent::tmux_focus(ts(10), "A"), // Activity to close interval
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(10)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1156,7 +1163,7 @@ mod tests {
             TestEvent::browser_tab(ts(10), "B"), // Activity to close interval
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(10)));
 
         // Browser tab alone doesn't grant direct time without window focus
@@ -1175,7 +1182,7 @@ mod tests {
             TestEvent::tmux_scroll(ts(5), "A"),               // Activity
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(6)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
@@ -1191,7 +1198,7 @@ mod tests {
             TestEvent::browser_tab(ts(5), "B"), // Activity
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(6)));
 
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
@@ -1207,7 +1214,7 @@ mod tests {
             TestEvent::afk_with_duration(ts(5), "idle", 180_000), // idle_duration_ms = 3 min
         ];
 
-        let config = AllocationConfig::default();
+        let config = test_config();
         let result = allocate_time(&events, &config, Some(ts(5)));
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
