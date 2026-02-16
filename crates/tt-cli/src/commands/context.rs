@@ -118,7 +118,7 @@ fn export_events(
         .map(|e| EventExport {
             id: e.id,
             timestamp: e.timestamp,
-            event_type: e.event_type,
+            event_type: e.event_type.to_string(),
             source: e.source,
             cwd: e.cwd,
             git_project: e.git_project,
@@ -179,18 +179,16 @@ fn export_streams(
         .collect())
 }
 
-/// Event types that represent direct user activity.
-const USER_EVENT_TYPES: &[&str] = &[
-    "user_message",
-    "tmux_pane_focus",
-    "tmux_scroll",
-    "window_focus",
-    "browser_tab",
-];
-
 /// Check if an event type represents direct user activity.
-fn is_user_event(event_type: &str) -> bool {
-    USER_EVENT_TYPES.contains(&event_type)
+const fn is_user_event(event_type: tt_core::EventType) -> bool {
+    matches!(
+        event_type,
+        tt_core::EventType::UserMessage
+            | tt_core::EventType::TmuxPaneFocus
+            | tt_core::EventType::TmuxScroll
+            | tt_core::EventType::WindowFocus
+            | tt_core::EventType::BrowserTab
+    )
 }
 
 /// Export gaps (periods of inactivity) between user events.
@@ -205,7 +203,7 @@ fn export_gaps(
     // Filter to user events only
     let user_events: Vec<_> = events
         .iter()
-        .filter(|e| is_user_event(&e.event_type))
+        .filter(|e| is_user_event(e.event_type))
         .collect();
 
     if user_events.len() < 2 {
@@ -225,8 +223,8 @@ fn export_gaps(
                 start: before.timestamp,
                 end: after.timestamp,
                 duration_minutes: gap_ms / 60_000,
-                before_event_type: before.event_type.clone(),
-                after_event_type: after.event_type.clone(),
+                before_event_type: before.event_type.to_string(),
+                after_event_type: after.event_type.to_string(),
             });
         }
     }
@@ -346,13 +344,13 @@ mod tests {
     fn make_test_event(
         id: &str,
         timestamp: chrono::DateTime<Utc>,
-        event_type: &str,
+        event_type: tt_core::EventType,
         source: &str,
     ) -> tt_db::StoredEvent {
         tt_db::StoredEvent {
             id: id.to_string(),
             timestamp,
-            event_type: event_type.to_string(),
+            event_type,
             source: source.to_string(),
             schema_version: 1,
             pane_id: None,
@@ -553,6 +551,7 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
         db.upsert_agent_session(&parent).unwrap();
 
@@ -579,6 +578,7 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 5,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
         db.upsert_agent_session(&child).unwrap();
 
@@ -634,6 +634,7 @@ mod tests {
             assistant_message_count: 0,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
         db.upsert_agent_session(&claude_session).unwrap();
 
@@ -656,6 +657,7 @@ mod tests {
             assistant_message_count: 0,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
         db.upsert_agent_session(&opencode_session).unwrap();
 
@@ -908,7 +910,7 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            "tmux_pane_focus",
+            tt_core::EventType::TmuxPaneFocus,
             "remote.tmux",
         );
         event.session_id = Some("session-abc".to_string());
@@ -972,7 +974,7 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            "tmux_pane_focus",
+            tt_core::EventType::TmuxPaneFocus,
             "remote.tmux",
         );
         event.tmux_session = Some("dev".to_string());
@@ -1100,6 +1102,7 @@ mod tests {
             assistant_message_count: 4,
             tool_call_count: 15,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
         db.upsert_agent_session(&session).unwrap();
 
@@ -1148,19 +1151,17 @@ mod tests {
     // Tests for is_user_event
     #[test]
     fn test_is_user_event_recognizes_user_events() {
-        assert!(is_user_event("user_message"));
-        assert!(is_user_event("tmux_pane_focus"));
-        assert!(is_user_event("tmux_scroll"));
-        assert!(is_user_event("window_focus"));
-        assert!(is_user_event("browser_tab"));
+        assert!(is_user_event(tt_core::EventType::UserMessage));
+        assert!(is_user_event(tt_core::EventType::TmuxPaneFocus));
+        assert!(is_user_event(tt_core::EventType::TmuxScroll));
+        assert!(is_user_event(tt_core::EventType::WindowFocus));
+        assert!(is_user_event(tt_core::EventType::BrowserTab));
     }
 
     #[test]
     fn test_is_user_event_rejects_non_user_events() {
-        assert!(!is_user_event("agent_tool_use"));
-        assert!(!is_user_event("assistant_message"));
-        assert!(!is_user_event("agent_session"));
-        assert!(!is_user_event("unknown_event"));
+        assert!(!is_user_event(tt_core::EventType::AgentToolUse));
+        assert!(!is_user_event(tt_core::EventType::AgentSession));
     }
 
     // Tests for export_gaps
@@ -1174,8 +1175,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 10, 0).unwrap(); // 10 min later
 
-        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
-        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
+        let event1 = make_test_event("e1", ts1, tt_core::EventType::TmuxPaneFocus, "remote.tmux");
+        let event2 = make_test_event("e2", ts2, tt_core::EventType::UserMessage, "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1201,8 +1202,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 3, 0).unwrap(); // 3 min later
 
-        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
-        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
+        let event1 = make_test_event("e1", ts1, tt_core::EventType::TmuxPaneFocus, "remote.tmux");
+        let event2 = make_test_event("e2", ts2, tt_core::EventType::UserMessage, "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1230,7 +1231,7 @@ mod tests {
 
         // Single user event - no gaps (need at least 2 to form a gap)
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
-        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
+        let event1 = make_test_event("e1", ts1, tt_core::EventType::TmuxPaneFocus, "remote.tmux");
         db.insert_event(&event1).unwrap();
 
         let gaps = export_gaps(&db, start, end, 5).unwrap();
@@ -1248,9 +1249,9 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 5, 0).unwrap(); // non-user event
         let ts3 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 20, 0).unwrap(); // 20 min after first
 
-        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
-        let event2 = make_test_event("e2", ts2, "agent_tool_use", "remote.agent"); // NOT a user event
-        let event3 = make_test_event("e3", ts3, "window_focus", "remote.window");
+        let event1 = make_test_event("e1", ts1, tt_core::EventType::TmuxPaneFocus, "remote.tmux");
+        let event2 = make_test_event("e2", ts2, tt_core::EventType::AgentToolUse, "remote.agent"); // NOT a user event
+        let event3 = make_test_event("e3", ts3, tt_core::EventType::WindowFocus, "remote.window");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1277,7 +1278,7 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            "tmux_pane_focus",
+            tt_core::EventType::TmuxPaneFocus,
             "remote.tmux",
         );
         event.pane_id = Some("%1".to_string());
@@ -1308,8 +1309,8 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2026, 1, 15, 10, 5, 0).unwrap(); // Exactly 5 min
 
-        let event1 = make_test_event("e1", ts1, "tmux_pane_focus", "remote.tmux");
-        let event2 = make_test_event("e2", ts2, "user_message", "remote.agent");
+        let event1 = make_test_event("e1", ts1, tt_core::EventType::TmuxPaneFocus, "remote.tmux");
+        let event2 = make_test_event("e2", ts2, tt_core::EventType::UserMessage, "remote.agent");
 
         db.insert_event(&event1).unwrap();
         db.insert_event(&event2).unwrap();
@@ -1348,10 +1349,9 @@ mod tests {
 
     #[test]
     fn test_is_user_event_case_sensitivity() {
-        // Verify event type matching is exact (case-sensitive)
-        assert!(!is_user_event("User_Message")); // Wrong case
-        assert!(!is_user_event("TMUX_PANE_FOCUS")); // Wrong case
-        assert!(is_user_event("user_message")); // Correct
+        assert!(is_user_event(tt_core::EventType::UserMessage));
+        assert!(is_user_event(tt_core::EventType::TmuxPaneFocus));
+        assert!(!is_user_event(tt_core::EventType::AgentToolUse));
     }
 
     #[test]
@@ -1369,7 +1369,12 @@ mod tests {
         ];
 
         for (i, ts) in times.iter().enumerate() {
-            let event = make_test_event(&format!("e{i}"), *ts, "tmux_pane_focus", "remote.tmux");
+            let event = make_test_event(
+                &format!("e{i}"),
+                *ts,
+                tt_core::EventType::TmuxPaneFocus,
+                "remote.tmux",
+            );
             db.insert_event(&event).unwrap();
         }
 

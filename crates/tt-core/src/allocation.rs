@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::EventType;
+
 /// Configuration for time allocation.
 #[derive(Debug, Clone)]
 pub struct AllocationConfig {
@@ -66,8 +68,8 @@ pub trait AllocatableEvent {
     /// Returns the event's timestamp.
     fn timestamp(&self) -> DateTime<Utc>;
 
-    /// Returns the event's type (e.g., "`tmux_pane_focus`", "`agent_session`").
-    fn event_type(&self) -> &str;
+    /// Returns the event's type.
+    fn event_type(&self) -> EventType;
 
     /// Returns the stream ID if assigned.
     fn stream_id(&self) -> Option<&str>;
@@ -244,7 +246,7 @@ pub fn allocate_time<E: AllocatableEvent>(
         }
 
         match event_type {
-            "tmux_pane_focus" => {
+            EventType::TmuxPaneFocus => {
                 if let Some(stream_id) = event.stream_id() {
                     // Close previous focus interval using resolved stream
                     if let FocusState::Focused { focus_start, .. } = &focus_state {
@@ -275,7 +277,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 }
             }
 
-            "afk_change" => {
+            EventType::AfkChange => {
                 let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 if status == "idle" {
                     // Check for retroactive idle duration
@@ -313,7 +315,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 // Note: "active" does NOT restore focus - wait for next focus event
             }
 
-            "tmux_scroll" | "user_message" => {
+            EventType::TmuxScroll | EventType::UserMessage => {
                 // These confirm focus and reset attention window, but only if
                 // the event is for the currently focused stream (using resolved stream)
                 if let FocusState::Focused {
@@ -354,7 +356,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 }
             }
 
-            "agent_session" => {
+            EventType::AgentSession => {
                 let action = event.action().unwrap_or("");
                 let session_id = event.session_id().unwrap_or("");
 
@@ -396,7 +398,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 }
             }
 
-            "agent_tool_use" => {
+            EventType::AgentToolUse => {
                 let session_id = event.session_id().unwrap_or("");
                 if let Some(session) = agent_sessions.get_mut(session_id) {
                     if !session.ended {
@@ -409,7 +411,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 }
             }
 
-            "window_focus" => {
+            EventType::WindowFocus => {
                 let app = data
                     .get("app")
                     .and_then(|v| v.as_str())
@@ -418,7 +420,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 window_focus_state.stream_id = event.stream_id().map(String::from);
             }
 
-            "browser_tab" => {
+            EventType::BrowserTab => {
                 // If we're in a browser app and have focus, update focus state
                 if window_focus_state
                     .app
@@ -456,8 +458,6 @@ pub fn allocate_time<E: AllocatableEvent>(
 
                 browser_focus_state.stream_id = event.stream_id().map(String::from);
             }
-
-            _ => {}
         }
 
         last_event_time = Some(event_time);
@@ -628,7 +628,7 @@ mod tests {
     /// Test event implementation.
     struct TestEvent {
         timestamp: DateTime<Utc>,
-        event_type: String,
+        event_type: EventType,
         stream_id: Option<String>,
         session_id: Option<String>,
         action: Option<String>,
@@ -639,7 +639,7 @@ mod tests {
         fn tmux_focus(ts: DateTime<Utc>, stream_id: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "tmux_pane_focus".to_string(),
+                event_type: EventType::TmuxPaneFocus,
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
                 action: None,
@@ -650,7 +650,7 @@ mod tests {
         fn afk_change(ts: DateTime<Utc>, status: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "afk_change".to_string(),
+                event_type: EventType::AfkChange,
                 stream_id: None,
                 session_id: None,
                 action: None,
@@ -661,7 +661,7 @@ mod tests {
         fn tmux_scroll(ts: DateTime<Utc>, stream_id: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "tmux_scroll".to_string(),
+                event_type: EventType::TmuxScroll,
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
                 action: None,
@@ -677,7 +677,7 @@ mod tests {
         ) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "agent_session".to_string(),
+                event_type: EventType::AgentSession,
                 stream_id: stream_id.map(String::from),
                 session_id: Some(session_id.to_string()),
                 action: Some(action.to_string()),
@@ -688,7 +688,7 @@ mod tests {
         fn agent_tool_use(ts: DateTime<Utc>, session_id: &str, stream_id: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "agent_tool_use".to_string(),
+                event_type: EventType::AgentToolUse,
                 stream_id: Some(stream_id.to_string()),
                 session_id: Some(session_id.to_string()),
                 action: None,
@@ -699,7 +699,7 @@ mod tests {
         fn user_message(ts: DateTime<Utc>, session_id: &str, stream_id: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "user_message".to_string(),
+                event_type: EventType::UserMessage,
                 stream_id: Some(stream_id.to_string()),
                 session_id: Some(session_id.to_string()),
                 action: None,
@@ -710,7 +710,7 @@ mod tests {
         fn window_focus(ts: DateTime<Utc>, app: &str, stream_id: Option<&str>) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "window_focus".to_string(),
+                event_type: EventType::WindowFocus,
                 stream_id: stream_id.map(String::from),
                 session_id: None,
                 action: None,
@@ -721,7 +721,7 @@ mod tests {
         fn browser_tab(ts: DateTime<Utc>, stream_id: &str) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "browser_tab".to_string(),
+                event_type: EventType::BrowserTab,
                 stream_id: Some(stream_id.to_string()),
                 session_id: None,
                 action: None,
@@ -732,7 +732,7 @@ mod tests {
         fn afk_with_duration(ts: DateTime<Utc>, status: &str, idle_duration_ms: i64) -> Self {
             Self {
                 timestamp: ts,
-                event_type: "afk_change".to_string(),
+                event_type: EventType::AfkChange,
                 stream_id: None,
                 session_id: None,
                 action: None,
@@ -746,8 +746,8 @@ mod tests {
             self.timestamp
         }
 
-        fn event_type(&self) -> &str {
-            &self.event_type
+        fn event_type(&self) -> EventType {
+            self.event_type
         }
 
         fn stream_id(&self) -> Option<&str> {
@@ -1027,7 +1027,7 @@ mod tests {
     fn test_events_without_stream_excluded() {
         let events = vec![TestEvent {
             timestamp: ts(0),
-            event_type: "tmux_pane_focus".to_string(),
+            event_type: EventType::TmuxPaneFocus,
             stream_id: None, // Not assigned to any stream
             session_id: None,
             action: None,

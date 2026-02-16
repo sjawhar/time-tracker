@@ -54,7 +54,7 @@ mod tests {
         StoredEvent {
             id: id.to_string(),
             timestamp,
-            event_type: "test_event".to_string(),
+            event_type: tt_core::EventType::TmuxPaneFocus,
             source: source.to_string(),
             schema_version: 1,
             pane_id: None,

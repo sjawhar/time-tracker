@@ -119,6 +119,8 @@ pub(crate) const MAX_PROMPT_LENGTH: usize = 2000;
 /// Prevents unbounded memory growth for very long sessions.
 pub(crate) const MAX_USER_MESSAGE_TIMESTAMPS: usize = 1000;
 
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 100;
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("IO error: {0}")]
@@ -169,6 +171,9 @@ pub struct AgentSession {
     /// Timestamps of user messages (not tool results).
     #[serde(default)]
     pub user_message_timestamps: Vec<DateTime<Utc>>,
+    /// Timestamps of agent tool calls (for delegated time computation).
+    #[serde(default)]
+    pub tool_call_timestamps: Vec<DateTime<Utc>>,
 }
 
 /// Minimal struct for typed deserialization (faster than `serde_json::Value`)
@@ -243,6 +248,10 @@ fn update_timestamps(
 }
 
 /// Parse a Claude Code session JSONL file.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Session parser keeps the IO loop in one function for clarity"
+)]
 pub fn parse_session_file(
     path: &Path,
     session_id: &str,
@@ -261,6 +270,7 @@ pub fn parse_session_file(
     let mut user_prompts: Vec<String> = Vec::new();
     let mut starting_prompt: Option<String> = None;
     let mut user_message_timestamps: Vec<DateTime<Utc>> = Vec::new();
+    let mut tool_call_timestamps: Vec<DateTime<Utc>> = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -315,7 +325,8 @@ pub fn parse_session_file(
             Some("assistant") => {
                 message_count = message_count.saturating_add(1);
                 assistant_message_count = assistant_message_count.saturating_add(1);
-                let _ = update_timestamps(&header, &mut first_timestamp, &mut last_timestamp);
+                let parsed_ts =
+                    update_timestamps(&header, &mut first_timestamp, &mut last_timestamp);
                 // Count tool_use blocks in assistant message content
                 if let Some(MessageContentValue::Blocks(blocks)) =
                     header.message.as_ref().and_then(|m| m.content.as_ref())
@@ -327,6 +338,10 @@ pub fn parse_session_file(
                     // Safe: tool_use count per message won't exceed i32::MAX
                     tool_call_count =
                         tool_call_count.saturating_add(i32::try_from(count).unwrap_or(i32::MAX));
+                    if let Some(ts) = parsed_ts {
+                        let capped_count = count.min(MAX_TOOL_CALLS_PER_MESSAGE);
+                        tool_call_timestamps.extend(std::iter::repeat_n(ts, capped_count));
+                    }
                 }
             }
             _ => {}
@@ -356,6 +371,7 @@ pub fn parse_session_file(
         assistant_message_count,
         tool_call_count,
         user_message_timestamps,
+        tool_call_timestamps,
     })
 }
 
@@ -650,6 +666,27 @@ mod tests {
 
         assert_eq!(entry.assistant_message_count, 2);
         assert_eq!(entry.tool_call_count, 3); // 2 + 1 tool_use blocks
+    }
+
+    #[test]
+    fn test_parse_session_extracts_tool_call_timestamps() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"run tool"}},"timestamp":"2026-01-29T10:00:00.000Z","cwd":"/home/sami/project"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"123","name":"Read","input":{{"file_path":"/test.txt"}}}},{{"type":"tool_use","id":"456","name":"Grep","input":{{"pattern":"test"}}}}]}},"timestamp":"2026-01-29T10:01:00.000Z"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"789","name":"Edit","input":{{}}}}]}},"timestamp":"2026-01-29T10:03:00.000Z"}}"#).unwrap();
+
+        let entry = parse_session_file(file.path(), "test-session", None).unwrap();
+
+        assert_eq!(entry.tool_call_timestamps.len(), 3);
+        let first_ts = DateTime::parse_from_rfc3339("2026-01-29T10:01:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second_ts = DateTime::parse_from_rfc3339("2026-01-29T10:03:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(entry.tool_call_timestamps[0], first_ts);
+        assert_eq!(entry.tool_call_timestamps[1], first_ts);
+        assert_eq!(entry.tool_call_timestamps[2], second_ts);
     }
 
     #[test]

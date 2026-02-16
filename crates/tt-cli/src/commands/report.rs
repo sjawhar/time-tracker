@@ -1014,6 +1014,7 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         }
     }
 
