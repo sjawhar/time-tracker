@@ -122,7 +122,7 @@ pub struct StoredEvent {
 
     /// Event type (e.g., `tmux_pane_focus`, `agent_session`).
     #[serde(rename = "type")]
-    pub event_type: String,
+    pub event_type: tt_core::EventType,
 
     /// Event source (e.g., "remote.tmux", "remote.agent").
     pub source: String,
@@ -259,8 +259,8 @@ impl tt_core::AllocatableEvent for StoredEvent {
         self.timestamp
     }
 
-    fn event_type(&self) -> &str {
-        &self.event_type
+    fn event_type(&self) -> tt_core::EventType {
+        self.event_type
     }
 
     fn stream_id(&self) -> Option<&str> {
@@ -308,6 +308,10 @@ impl Database {
         let db = Self { conn };
         db.init()?;
         Ok(db)
+    }
+
+    pub const fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Initializes the database schema.
@@ -467,7 +471,7 @@ impl Database {
                 let rows = stmt.execute(params![
                     event.id,
                     timestamp_str,
-                    event.event_type,
+                    event.event_type.to_string(),
                     event.source,
                     event.schema_version,
                     event.cwd,
@@ -919,7 +923,7 @@ impl Database {
     fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Option<StoredEvent>, rusqlite::Error> {
         let id: String = row.get(0)?;
         let timestamp_str: String = row.get(1)?;
-        let event_type: String = row.get(2)?;
+        let event_type_str: String = row.get(2)?;
         let source: String = row.get(3)?;
         let schema_version: i32 = row.get(4)?;
         let cwd: Option<String> = row.get(5)?;
@@ -939,6 +943,19 @@ impl Database {
             Ok(dt) => dt.with_timezone(&Utc),
             Err(e) => {
                 tracing::warn!(event_id = %id, error = %e, "skipping event with malformed timestamp");
+                return Ok(None);
+            }
+        };
+
+        let event_type = match event_type_str.parse::<tt_core::EventType>() {
+            Ok(event_type) => event_type,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %id,
+                    event_type = %event_type_str,
+                    error = %e,
+                    "skipping event with unknown type"
+                );
                 return Ok(None);
             }
         };
@@ -1136,6 +1153,7 @@ impl Database {
                 tool_call_count: row.get(12)?,
                 // Not stored in database - events are created during indexing
                 user_message_timestamps: Vec::new(),
+                tool_call_timestamps: Vec::new(),
             });
         }
 
@@ -1221,11 +1239,15 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    fn make_event(id: &str, timestamp: DateTime<Utc>) -> StoredEvent {
+    fn make_event(
+        id: &str,
+        timestamp: DateTime<Utc>,
+        event_type: tt_core::EventType,
+    ) -> StoredEvent {
         StoredEvent {
             id: id.to_string(),
             timestamp,
-            event_type: "tmux_pane_focus".to_string(),
+            event_type,
             source: "remote.tmux".to_string(),
             schema_version: 1,
             pane_id: Some("%3".to_string()),
@@ -1258,7 +1280,7 @@ mod tests {
         let event = StoredEvent {
             id: "test-event-123".to_string(),
             timestamp: ts,
-            event_type: "tmux_pane_focus".to_string(),
+            event_type: tt_core::EventType::TmuxPaneFocus,
             source: "remote.tmux".to_string(),
             schema_version: 1,
             pane_id: Some("%42".to_string()),
@@ -1285,7 +1307,7 @@ mod tests {
         let retrieved = &events[0];
         assert_eq!(retrieved.id, "test-event-123");
         assert_eq!(retrieved.timestamp, ts);
-        assert_eq!(retrieved.event_type, "tmux_pane_focus");
+        assert_eq!(retrieved.event_type, tt_core::EventType::TmuxPaneFocus);
         assert_eq!(retrieved.source, "remote.tmux");
         assert_eq!(retrieved.schema_version, 1);
         assert_eq!(retrieved.pane_id, Some("%42".to_string()));
@@ -1301,7 +1323,7 @@ mod tests {
     fn test_insert_event_idempotent() {
         let db = Database::open_in_memory().unwrap();
         let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
-        let event = make_event("duplicate-id", ts);
+        let event = make_event("duplicate-id", ts, tt_core::EventType::TmuxPaneFocus);
 
         let first_insert = db.insert_event(&event).unwrap();
         assert!(first_insert, "first insert should succeed");
@@ -1328,9 +1350,12 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Query events after 10:30
         let after = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
@@ -1349,9 +1374,12 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Query events before 11:30
         let before = Utc.with_ymd_and_hms(2025, 1, 15, 11, 30, 0).unwrap();
@@ -1370,9 +1398,12 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Query events between 10:30 and 11:30
         let after = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
@@ -1392,9 +1423,12 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         let events = db.get_events(None, None).unwrap();
 
@@ -1412,9 +1446,12 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Query with inclusive range matching exactly ts1 and ts2
         let events = db.get_events_in_range(ts1, ts2).unwrap();
@@ -1434,9 +1471,12 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         let start = Utc.with_ymd_and_hms(2025, 1, 15, 9, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2025, 1, 15, 13, 0, 0).unwrap();
@@ -1453,7 +1493,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        db.insert_event(&make_event("e1", ts)).unwrap();
+        db.insert_event(&make_event("e1", ts, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Query a range that doesn't include any events
         let start = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
@@ -1471,7 +1512,7 @@ mod tests {
         let event = StoredEvent {
             id: "no-optionals".to_string(),
             timestamp: ts,
-            event_type: "heartbeat".to_string(),
+            event_type: tt_core::EventType::WindowFocus,
             source: "remote.tmux".to_string(),
             schema_version: 1,
             pane_id: None,
@@ -1505,7 +1546,7 @@ mod tests {
         let events: Vec<StoredEvent> = (0..100)
             .map(|i| {
                 let ts = base_ts + chrono::Duration::seconds(i);
-                make_event(&format!("batch-{i}"), ts)
+                make_event(&format!("batch-{i}"), ts, tt_core::EventType::TmuxPaneFocus)
             })
             .collect();
 
@@ -1524,10 +1565,18 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 1).unwrap();
 
         // Insert first event
-        db.insert_event(&make_event("existing", ts1)).unwrap();
+        db.insert_event(&make_event(
+            "existing",
+            ts1,
+            tt_core::EventType::TmuxPaneFocus,
+        ))
+        .unwrap();
 
         // Batch insert: one new, one duplicate
-        let events = vec![make_event("existing", ts1), make_event("new", ts2)];
+        let events = vec![
+            make_event("existing", ts1, tt_core::EventType::TmuxPaneFocus),
+            make_event("new", ts2, tt_core::EventType::TmuxPaneFocus),
+        ];
 
         let count = db.insert_events(&events).unwrap();
         assert_eq!(count, 1, "should only count the new insert");
@@ -1539,7 +1588,8 @@ mod tests {
 
         // Insert a valid event
         let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        db.insert_event(&make_event("valid", ts)).unwrap();
+        db.insert_event(&make_event("valid", ts, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Insert malformed timestamp directly
         db.conn
@@ -1551,6 +1601,27 @@ mod tests {
             .unwrap();
 
         // Query should return only the valid event
+        let events = db.get_events(None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "valid");
+    }
+
+    #[test]
+    fn test_get_events_skips_unknown_event_type() {
+        let db = Database::open_in_memory().unwrap();
+
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        db.insert_event(&make_event("valid", ts, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+
+        db.conn
+            .execute(
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES ('unknown', ?1, 'not_a_real_type', 'test', 1)",
+                params![format_timestamp(ts)],
+            )
+            .unwrap();
+
         let events = db.get_events(None, None).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "valid");
@@ -1590,7 +1661,7 @@ mod tests {
         StoredEvent {
             id: id.to_string(),
             timestamp,
-            event_type: "test_event".to_string(),
+            event_type: tt_core::EventType::TmuxPaneFocus,
             source: source.to_string(),
             schema_version: 1,
             pane_id: None,
@@ -1755,7 +1826,8 @@ mod tests {
 
         // Create an event
         let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
-        db.insert_event(&make_event("e1", ts)).unwrap();
+        db.insert_event(&make_event("e1", ts, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Create a stream
         db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
@@ -1776,8 +1848,10 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Create a stream and assign one event
         db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
@@ -1798,9 +1872,12 @@ mod tests {
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
-        db.insert_event(&make_event("e3", ts3)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         // Create a stream
         db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
@@ -1827,8 +1904,10 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
 
-        db.insert_event(&make_event("e1", ts1)).unwrap();
-        db.insert_event(&make_event("e2", ts2)).unwrap();
+        db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
 
@@ -2031,6 +2110,7 @@ mod tests {
             assistant_message_count: 5,
             tool_call_count: 12,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
 
         db.upsert_agent_session(&entry).unwrap();
@@ -2077,6 +2157,7 @@ mod tests {
             assistant_message_count: 0,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
 
         db.upsert_agent_session(&entry).unwrap();
