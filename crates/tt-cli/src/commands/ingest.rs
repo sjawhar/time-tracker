@@ -350,14 +350,9 @@ use tt_db::StoredEvent;
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     let mut all_sessions = Vec::new();
 
-    let migrated_start = db.conn().execute(
-        "UPDATE events SET type = 'agent_session', action = 'started' WHERE type = 'session_start'",
-        [],
-    )?;
-    let migrated_end = db.conn().execute(
-        "UPDATE events SET type = 'agent_session', action = 'ended' WHERE type = 'session_end'",
-        [],
-    )?;
+    let (migrated_start, migrated_end) = db
+        .migrate_legacy_event_types()
+        .context("failed to migrate legacy event types")?;
     if migrated_start + migrated_end > 0 {
         tracing::info!(migrated_start, migrated_end, "migrated legacy event types");
     }
@@ -468,8 +463,8 @@ fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
         events.push(make_event(&id_suffix, *ts, EventType::UserMessage));
     }
 
-    for ts in &session.tool_call_timestamps {
-        let id_suffix = format!("tool_use-{}", ts.timestamp_millis());
+    for (index, ts) in session.tool_call_timestamps.iter().enumerate() {
+        let id_suffix = format!("tool_use-{}-{index}", ts.timestamp_millis());
         events.push(make_event(&id_suffix, *ts, EventType::AgentToolUse));
     }
 

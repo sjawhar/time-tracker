@@ -119,6 +119,8 @@ pub(crate) const MAX_PROMPT_LENGTH: usize = 2000;
 /// Prevents unbounded memory growth for very long sessions.
 pub(crate) const MAX_USER_MESSAGE_TIMESTAMPS: usize = 1000;
 
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 100;
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("IO error: {0}")]
@@ -337,7 +339,7 @@ pub fn parse_session_file(
                     tool_call_count =
                         tool_call_count.saturating_add(i32::try_from(count).unwrap_or(i32::MAX));
                     if let Some(ts) = parsed_ts {
-                        let capped_count = count.min(100);
+                        let capped_count = count.min(MAX_TOOL_CALLS_PER_MESSAGE);
                         tool_call_timestamps.extend(std::iter::repeat_n(ts, capped_count));
                     }
                 }

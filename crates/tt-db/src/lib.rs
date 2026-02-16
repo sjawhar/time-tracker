@@ -310,8 +310,20 @@ impl Database {
         Ok(db)
     }
 
-    pub const fn conn(&self) -> &Connection {
-        &self.conn
+    pub fn migrate_legacy_event_types(&self) -> Result<(usize, usize), DbError> {
+        let started = self.conn.execute(
+            "UPDATE events SET type = 'agent_session', action = 'started'
+             WHERE type = 'session_start'
+             OR (type = 'agent_session' AND action IS NULL AND id LIKE '%session_start')",
+            [],
+        )?;
+        let ended = self.conn.execute(
+            "UPDATE events SET type = 'agent_session', action = 'ended'
+             WHERE type = 'session_end'
+             OR (type = 'agent_session' AND action IS NULL AND id LIKE '%session_end')",
+            [],
+        )?;
+        Ok((started, ended))
     }
 
     /// Initializes the database schema.
@@ -2440,5 +2452,86 @@ mod tests {
         let streams = db.streams_in_range(start, end).unwrap();
         // Both should be included (inclusive boundaries)
         assert_eq!(streams.len(), 2);
+    }
+
+    #[test]
+    fn test_migrate_legacy_event_types_updates_actions() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+        let ts_str = ts.to_rfc3339();
+
+        db.conn
+            .execute(
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "sess-session_start",
+                    ts_str,
+                    "session_start",
+                    "remote.agent",
+                    1
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["sess-session_end", ts_str, "session_end", "remote.agent", 1],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "sess-agent-session_start",
+                    ts_str,
+                    "agent_session",
+                    "remote.agent",
+                    1
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO events (id, timestamp, type, source, schema_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "sess-agent-session_end",
+                    ts_str,
+                    "agent_session",
+                    "remote.agent",
+                    1
+                ],
+            )
+            .unwrap();
+
+        let (migrated_start, migrated_end) = db.migrate_legacy_event_types().unwrap();
+        assert_eq!(migrated_start, 2);
+        assert_eq!(migrated_end, 2);
+
+        let events = db.get_events(None, None).unwrap();
+        let start = events
+            .iter()
+            .find(|event| event.id == "sess-session_start")
+            .unwrap();
+        let end = events
+            .iter()
+            .find(|event| event.id == "sess-session_end")
+            .unwrap();
+        let legacy_start = events
+            .iter()
+            .find(|event| event.id == "sess-agent-session_start")
+            .unwrap();
+        let legacy_end = events
+            .iter()
+            .find(|event| event.id == "sess-agent-session_end")
+            .unwrap();
+
+        assert_eq!(start.action.as_deref(), Some("started"));
+        assert_eq!(end.action.as_deref(), Some("ended"));
+        assert_eq!(legacy_start.action.as_deref(), Some("started"));
+        assert_eq!(legacy_end.action.as_deref(), Some("ended"));
     }
 }

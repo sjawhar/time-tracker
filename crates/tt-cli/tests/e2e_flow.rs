@@ -594,3 +594,94 @@ fn test_context_exports_git_project_fields() {
     assert_eq!(event["pane_id"].as_str(), Some("%1"));
     assert_eq!(event["tmux_session"].as_str(), Some("dev"));
 }
+
+#[test]
+fn test_delegated_time_from_agent_session_events() {
+    use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
+    use tt_core::{AllocationConfig, EventType, allocate_time};
+    use tt_db::{Database, StoredEvent, Stream};
+
+    let db = Database::open_in_memory().unwrap();
+    let base = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+    let stream = Stream {
+        id: "stream-1".to_string(),
+        name: Some("test-stream".to_string()),
+        created_at: base,
+        updated_at: base,
+        time_direct_ms: 0,
+        time_delegated_ms: 0,
+        first_event_at: None,
+        last_event_at: None,
+        needs_recompute: false,
+    };
+    db.insert_stream(&stream).unwrap();
+
+    let session_id = "sess123".to_string();
+    let source = "remote.agent".to_string();
+    let make_event =
+        |id_suffix: &str, timestamp: chrono::DateTime<Utc>, event_type: EventType| -> StoredEvent {
+            StoredEvent {
+                id: format!("{session_id}-{id_suffix}"),
+                timestamp,
+                event_type,
+                source: source.clone(),
+                schema_version: 1,
+                pane_id: None,
+                tmux_session: None,
+                window_index: None,
+                git_project: None,
+                git_workspace: None,
+                status: None,
+                idle_duration_ms: None,
+                action: None,
+                cwd: Some("/project".to_string()),
+                session_id: Some(session_id.clone()),
+                stream_id: None,
+                assignment_source: None,
+                data: json!({}),
+            }
+        };
+
+    let mut events = Vec::new();
+    let mut start_event = make_event("session_start", base, EventType::AgentSession);
+    start_event.action = Some("started".to_string());
+    events.push(start_event);
+
+    let tool_ts1 = base + Duration::seconds(60);
+    let tool_ts2 = base + Duration::seconds(120);
+    events.push(make_event("tool_use-1", tool_ts1, EventType::AgentToolUse));
+    events.push(make_event("tool_use-2", tool_ts2, EventType::AgentToolUse));
+
+    let mut end_event = make_event(
+        "session_end",
+        base + Duration::seconds(180),
+        EventType::AgentSession,
+    );
+    end_event.action = Some("ended".to_string());
+    events.push(end_event);
+
+    db.insert_events(&events).unwrap();
+    let assignments: Vec<(String, String)> = events
+        .iter()
+        .map(|event| (event.id.clone(), stream.id.clone()))
+        .collect();
+    db.assign_events_to_stream(&assignments, "test").unwrap();
+
+    let stream_events = db.get_events_by_stream(&stream.id).unwrap();
+    let result = allocate_time(
+        &stream_events,
+        &AllocationConfig::default(),
+        Some(base + Duration::seconds(180)),
+    );
+    let stream_time = result
+        .stream_times
+        .iter()
+        .find(|time| time.stream_id == stream.id)
+        .expect("missing stream allocation");
+
+    assert!(
+        stream_time.time_delegated_ms > 0,
+        "delegated time should be non-zero"
+    );
+}

@@ -11,6 +11,8 @@ use crate::session::{
     SessionType, extract_project_name, truncate_prompt,
 };
 
+const MAX_TOOL_CALL_TIMESTAMPS: usize = 5000;
+
 fn unix_ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
@@ -154,12 +156,17 @@ fn collect_tool_call_timestamps(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<DateTime<Utc>>, rusqlite::Error> {
-    let mut stmt = match conn.prepare_cached(
-        "SELECT time_created FROM part \
-         WHERE session_id = ? AND json_extract(data, '$.type') = 'tool' \
-         ORDER BY time_created \
-         LIMIT 5000",
-    ) {
+    let mut stmt = match conn.prepare_cached(&format!(
+        "SELECT p.time_created FROM part p \
+         JOIN message m ON p.message_id = m.id \
+         WHERE p.session_id = ?1 AND json_valid(p.data) \
+         AND json_extract(p.data, '$.type') = 'tool' \
+         AND json_valid(m.data) \
+         AND json_extract(m.data, '$.role') = 'assistant' \
+         ORDER BY p.time_created \
+         LIMIT {}",
+        MAX_TOOL_CALL_TIMESTAMPS + 1
+    )) {
         Ok(stmt) => stmt,
         Err(err) => {
             if is_missing_part_table(&err) {
@@ -182,7 +189,35 @@ fn collect_tool_call_timestamps(
         }
     };
 
-    let timestamps = rows.filter_map(|r| r.ok().flatten()).collect();
+    let mut timestamps: Vec<DateTime<Utc>> = rows.filter_map(|r| r.ok().flatten()).collect();
+    let truncated = timestamps.len() > MAX_TOOL_CALL_TIMESTAMPS;
+    if truncated {
+        tracing::warn!(
+            session_id,
+            count = timestamps.len(),
+            "tool call timestamps truncated at {MAX_TOOL_CALL_TIMESTAMPS}"
+        );
+        timestamps.truncate(MAX_TOOL_CALL_TIMESTAMPS);
+
+        if let Ok(last_ms) = conn.query_row(
+            "SELECT p.time_created FROM part p \
+             JOIN message m ON p.message_id = m.id \
+             WHERE p.session_id = ?1 AND json_valid(p.data) \
+             AND json_extract(p.data, '$.type') = 'tool' \
+             AND json_valid(m.data) \
+             AND json_extract(m.data, '$.role') = 'assistant' \
+             ORDER BY p.time_created DESC LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if let Some(last_ts) = DateTime::from_timestamp_millis(last_ms) {
+                if timestamps.last() != Some(&last_ts) {
+                    timestamps.push(last_ts);
+                }
+            }
+        }
+    }
+
     Ok(timestamps)
 }
 
@@ -545,6 +580,115 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let timestamps = collect_tool_call_timestamps(&conn, "ses_missing").unwrap();
         assert!(timestamps.is_empty());
+    }
+
+    #[test]
+    fn test_collect_tool_call_timestamps_filters_non_assistant() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_role",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_message(&db_path, "msg_user", "ses_role", "user", 1_700_000_001_000);
+        insert_part(
+            &db_path,
+            "prt_user_tool",
+            "msg_user",
+            "ses_role",
+            "tool",
+            None,
+            1_700_000_001_000,
+        );
+        insert_message(
+            &db_path,
+            "msg_assistant",
+            "ses_role",
+            "assistant",
+            1_700_000_002_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_assistant_tool",
+            "msg_assistant",
+            "ses_role",
+            "tool",
+            None,
+            1_700_000_002_000,
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let timestamps = collect_tool_call_timestamps(&conn, "ses_role").unwrap();
+
+        assert_eq!(
+            timestamps,
+            vec![unix_ms_to_datetime(1_700_000_002_000).unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_collect_tool_call_timestamps_preserves_last_when_truncated() {
+        const MAX_TOOL_CALLS: usize = 5000;
+
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_many_tools",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_020_000,
+        );
+        insert_message(
+            &db_path,
+            "msg_assistant",
+            "ses_many_tools",
+            "assistant",
+            1_700_000_001_000,
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let data = serde_json::json!({ "type": "tool" }).to_string();
+        let base_ms = 1_700_000_010_000i64;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .unwrap();
+            for offset in 0..=MAX_TOOL_CALLS {
+                let offset_ms = i64::try_from(offset).expect("tool call offset should fit in i64");
+                let created_ms = base_ms + offset_ms;
+                let part_id = format!("prt_tool_{offset}");
+                stmt.execute((
+                    part_id,
+                    "msg_assistant",
+                    "ses_many_tools",
+                    created_ms,
+                    created_ms,
+                    &data,
+                ))
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let timestamps = collect_tool_call_timestamps(&conn, "ses_many_tools").unwrap();
+        let last_offset =
+            i64::try_from(MAX_TOOL_CALLS).expect("tool call offset should fit in i64");
+        let last_expected = unix_ms_to_datetime(base_ms + last_offset).unwrap();
+
+        assert!(
+            timestamps.contains(&last_expected),
+            "last tool call timestamp should be preserved"
+        );
     }
 
     #[test]

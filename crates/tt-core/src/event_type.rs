@@ -38,7 +38,7 @@ impl FromStr for EventType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "agent_session" | "session_start" | "session_end" => Ok(Self::AgentSession),
+            "agent_session" => Ok(Self::AgentSession),
             "agent_tool_use" => Ok(Self::AgentToolUse),
             "user_message" => Ok(Self::UserMessage),
             "tmux_pane_focus" => Ok(Self::TmuxPaneFocus),
@@ -71,16 +71,9 @@ impl<'de> Deserialize<'de> for EventType {
 }
 
 /// Error type for unknown event type strings.
-#[derive(Debug, Clone)]
-pub struct UnknownEventType(String);
-
-impl fmt::Display for UnknownEventType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown event type: {}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownEventType {}
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("unknown event type: {0}")]
+pub struct UnknownEventType(pub String);
 
 #[cfg(test)]
 mod tests {
@@ -108,11 +101,11 @@ mod tests {
 
     #[test]
     fn legacy_aliases_parse() {
-        let session_start: EventType = "session_start".parse().expect("should parse");
-        assert_eq!(session_start, EventType::AgentSession);
+        let session_start: Result<EventType, _> = "session_start".parse();
+        assert!(session_start.is_err());
 
-        let session_end: EventType = "session_end".parse().expect("should parse");
-        assert_eq!(session_end, EventType::AgentSession);
+        let session_end: Result<EventType, _> = "session_end".parse();
+        assert!(session_end.is_err());
     }
 
     #[test]
