@@ -375,7 +375,7 @@ fn test_import_ignores_stream_id() {
     .unwrap();
 
     // Event with stream_id (should be ignored during import)
-    let data_with_stream = r#"{"id":"event-with-stream","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"test","data":{},"stream_id":"some-stream-id"}
+    let data_with_stream = r#"{"id":"event-with-stream","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"tmux_pane_focus","data":{},"stream_id":"some-stream-id"}
 "#;
 
     let mut child = Command::new(tt_binary())

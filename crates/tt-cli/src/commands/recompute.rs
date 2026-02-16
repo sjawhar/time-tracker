@@ -109,7 +109,7 @@ mod tests {
         StoredEvent {
             id: id.to_string(),
             timestamp: ts,
-            event_type: "tmux_pane_focus".to_string(),
+            event_type: tt_core::EventType::TmuxPaneFocus,
             source: "remote.tmux".to_string(),
             schema_version: 1,
             pane_id: Some("%1".to_string()),
@@ -138,7 +138,7 @@ mod tests {
         StoredEvent {
             id: id.to_string(),
             timestamp: ts,
-            event_type: "agent_session".to_string(),
+            event_type: tt_core::EventType::AgentSession,
             source: "remote.agent".to_string(),
             schema_version: 1,
             pane_id: None,
@@ -166,7 +166,7 @@ mod tests {
         StoredEvent {
             id: id.to_string(),
             timestamp: ts,
-            event_type: "agent_tool_use".to_string(),
+            event_type: tt_core::EventType::AgentToolUse,
             source: "remote.agent".to_string(),
             schema_version: 1,
             pane_id: None,

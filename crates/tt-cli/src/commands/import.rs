@@ -238,7 +238,7 @@ mod tests {
         // Verify event was stored correctly
         let events = db.get_events(None, None).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "agent_session");
+        assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
         assert_eq!(events[0].source, "remote.agent");
     }
 
@@ -254,7 +254,7 @@ mod tests {
             let ts = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap()
                 + chrono::Duration::seconds(i as i64);
             let line = format!(
-                r#"{{"id":"batch-{}","timestamp":"{}","source":"test","type":"test","data":{{}}}}"#,
+                r#"{{"id":"batch-{}","timestamp":"{}","source":"test","type":"tmux_pane_focus","data":{{}}}}"#,
                 i,
                 ts.to_rfc3339()
             );
@@ -280,7 +280,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         // Minimal event without optional fields
-        let minimal_event = r#"{"id":"min-1","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"test","data":{}}"#;
+        let minimal_event = r#"{"id":"min-1","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"tmux_pane_focus","data":{}}"#;
         let input = Cursor::new(format!("{minimal_event}\n"));
 
         let result = import_from_reader(&db, input).unwrap();

@@ -350,6 +350,18 @@ use tt_db::StoredEvent;
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     let mut all_sessions = Vec::new();
 
+    let migrated_start = db.conn().execute(
+        "UPDATE events SET type = 'agent_session', action = 'started' WHERE type = 'session_start'",
+        [],
+    )?;
+    let migrated_end = db.conn().execute(
+        "UPDATE events SET type = 'agent_session', action = 'ended' WHERE type = 'session_end'",
+        [],
+    )?;
+    if migrated_start + migrated_end > 0 {
+        tracing::info!(migrated_start, migrated_end, "migrated legacy event types");
+    }
+
     // Claude Code
     let claude_dir = get_claude_projects_dir()?;
     if claude_dir.exists() {
@@ -416,46 +428,56 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
 /// Create events from an agent session.
 fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
     use serde_json::json;
+    use tt_core::EventType;
 
     // Helper to create a session event with common fields
-    let make_event =
-        |id_suffix: &str, timestamp: chrono::DateTime<chrono::Utc>, event_type: &str| StoredEvent {
-            id: format!("{}-{id_suffix}", session.session_id),
-            timestamp,
-            event_type: event_type.to_string(),
-            source: session.source.as_str().to_string(),
-            schema_version: 1,
-            pane_id: None,
-            tmux_session: None,
-            window_index: None,
-            git_project: None,
-            git_workspace: None,
-            status: None,
-            idle_duration_ms: None,
-            action: None,
-            cwd: Some(session.project_path.clone()),
-            session_id: Some(session.session_id.clone()),
-            stream_id: None,
-            assignment_source: None,
-            data: json!({}),
-        };
+    let make_event = |id_suffix: &str,
+                      timestamp: chrono::DateTime<chrono::Utc>,
+                      event_type: EventType| StoredEvent {
+        id: format!("{}-{id_suffix}", session.session_id),
+        timestamp,
+        event_type,
+        source: session.source.as_str().to_string(),
+        schema_version: 1,
+        pane_id: None,
+        tmux_session: None,
+        window_index: None,
+        git_project: None,
+        git_workspace: None,
+        status: None,
+        idle_duration_ms: None,
+        action: None,
+        cwd: Some(session.project_path.clone()),
+        session_id: Some(session.session_id.clone()),
+        stream_id: None,
+        assignment_source: None,
+        data: json!({}),
+    };
 
     let mut events = Vec::new();
 
     // Session start event with extra project_name field
-    let mut start_event = make_event("session_start", session.start_time, "session_start");
+    let mut start_event = make_event("session_start", session.start_time, EventType::AgentSession);
+    start_event.action = Some("started".to_string());
     start_event.data["project_name"] = json!(session.project_name);
     events.push(start_event);
 
     // User message events
     for ts in &session.user_message_timestamps {
         let id_suffix = format!("user_message-{}", ts.timestamp_millis());
-        events.push(make_event(&id_suffix, *ts, "user_message"));
+        events.push(make_event(&id_suffix, *ts, EventType::UserMessage));
+    }
+
+    for ts in &session.tool_call_timestamps {
+        let id_suffix = format!("tool_use-{}", ts.timestamp_millis());
+        events.push(make_event(&id_suffix, *ts, EventType::AgentToolUse));
     }
 
     // Session end event
     if let Some(end_time) = session.end_time {
-        events.push(make_event("session_end", end_time, "session_end"));
+        let mut end_event = make_event("session_end", end_time, EventType::AgentSession);
+        end_event.action = Some("ended".to_string());
+        events.push(end_event);
     }
 
     events
@@ -760,16 +782,18 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
 
         let events = create_session_events(&session);
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "session_start");
+        assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
         assert_eq!(events[0].id, "test-session-123-session_start");
         assert_eq!(events[0].source, "claude");
         assert_eq!(events[0].cwd, Some("/home/user/project".to_string()));
         assert_eq!(events[0].session_id, Some("test-session-123".to_string()));
+        assert_eq!(events[0].action.as_deref(), Some("started"));
     }
 
     #[test]
@@ -793,14 +817,17 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
 
         let events = create_session_events(&session);
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "session_start");
-        assert_eq!(events[1].event_type, "session_end");
+        assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
+        assert_eq!(events[1].event_type, tt_core::EventType::AgentSession);
         assert_eq!(events[1].id, "test-session-456-session_end");
+        assert_eq!(events[0].action.as_deref(), Some("started"));
+        assert_eq!(events[1].action.as_deref(), Some("ended"));
     }
 
     #[test]
@@ -827,16 +854,79 @@ mod tests {
             assistant_message_count: 2,
             tool_call_count: 0,
             user_message_timestamps: vec![ts1, ts2],
+            tool_call_timestamps: Vec::new(),
         };
 
         let events = create_session_events(&session);
 
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].event_type, "session_start");
-        assert_eq!(events[1].event_type, "user_message");
+        assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
+        assert_eq!(events[1].event_type, tt_core::EventType::UserMessage);
         assert_eq!(events[1].timestamp, ts1);
-        assert_eq!(events[2].event_type, "user_message");
+        assert_eq!(events[2].event_type, tt_core::EventType::UserMessage);
         assert_eq!(events[2].timestamp, ts2);
+        assert_eq!(events[0].action.as_deref(), Some("started"));
+    }
+
+    #[test]
+    fn test_create_session_events_delegated_time_allocated() {
+        use chrono::TimeZone;
+        use tt_core::session::{AgentSession, SessionSource};
+        use tt_core::{AllocationConfig, EventType, allocate_time};
+
+        let start_time = Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap();
+        let tool_ts1 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 5, 0).unwrap();
+        let tool_ts2 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 10, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 2, 2, 10, 20, 0).unwrap();
+
+        let session = AgentSession {
+            session_id: "test-session-delegated".to_string(),
+            source: SessionSource::default(),
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::default(),
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time,
+            end_time: Some(end_time),
+            message_count: 2,
+            summary: None,
+            user_prompts: vec!["hello".to_string()],
+            starting_prompt: Some("hello".to_string()),
+            assistant_message_count: 1,
+            tool_call_count: 2,
+            user_message_timestamps: vec![tool_ts1],
+            tool_call_timestamps: vec![tool_ts1, tool_ts2],
+        };
+
+        let mut events = create_session_events(&session);
+
+        assert_eq!(events[0].event_type, EventType::AgentSession);
+        assert_eq!(events[0].action.as_deref(), Some("started"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == EventType::AgentToolUse)
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == EventType::AgentSession && event.action.as_deref() == Some("ended")
+        }));
+
+        let stream_id = "stream-123".to_string();
+        for event in &mut events {
+            event.stream_id = Some(stream_id.clone());
+        }
+
+        events.sort_by_key(|event| event.timestamp);
+
+        let config = AllocationConfig::default();
+        let result = allocate_time(&events, &config, None);
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|stream| stream.stream_id == stream_id)
+            .expect("stream should have allocation results");
+
+        assert!(stream.time_delegated_ms > 0);
     }
 
     #[test]
@@ -860,6 +950,7 @@ mod tests {
             assistant_message_count: 1,
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
         };
 
         let events = create_session_events(&session);
@@ -870,6 +961,7 @@ mod tests {
         assert_eq!(events[1].source, "opencode");
         assert_eq!(events[0].id, "ses_opencode_123-session_start");
         assert_eq!(events[0].session_id, Some("ses_opencode_123".to_string()));
+        assert_eq!(events[0].action.as_deref(), Some("started"));
     }
 
     #[test]
@@ -1135,11 +1227,13 @@ fn test_create_session_events_with_empty_timestamps() {
         assistant_message_count: 0,
         tool_call_count: 0,
         user_message_timestamps: vec![], // Empty timestamps
+        tool_call_timestamps: Vec::new(),
     };
 
     let events = create_session_events(&session);
 
     // Should only have session_start (no user_message events)
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "session_start");
+    assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
+    assert_eq!(events[0].action.as_deref(), Some("started"));
 }
