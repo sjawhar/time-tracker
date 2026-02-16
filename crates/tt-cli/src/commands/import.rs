@@ -6,6 +6,7 @@
 use std::io::{BufRead, BufReader, Read};
 
 use anyhow::{Context, Result};
+use serde_json::json;
 use tt_db::{Database, StoredEvent};
 
 /// Batch size for database inserts.
@@ -47,6 +48,19 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
             continue;
         }
 
+        let line = match rewrite_legacy_session_types(&line, line_num) {
+            Ok(rewritten) => rewritten,
+            Err(err) => {
+                tracing::warn!(
+                    line = line_num + 1,
+                    error = %err,
+                    "malformed JSON, skipping line"
+                );
+                result.malformed += 1;
+                continue;
+            }
+        };
+
         match serde_json::from_str::<StoredEvent>(&line) {
             Ok(mut event) => {
                 // Clear stream_id and assignment_source during import - events will be
@@ -83,6 +97,31 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
     }
 
     Ok(result)
+}
+
+fn rewrite_legacy_session_types(line: &str, line_num: usize) -> Result<String> {
+    if !line.contains("\"session_start\"") && !line.contains("\"session_end\"") {
+        return Ok(line.to_string());
+    }
+
+    let mut value: serde_json::Value = serde_json::from_str(line)
+        .with_context(|| format!("legacy type rewrite failed on line {}", line_num + 1))?;
+    if let Some(obj) = value.as_object_mut() {
+        let type_str = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match type_str {
+            "session_start" => {
+                obj.insert("type".into(), json!("agent_session"));
+                obj.insert("action".into(), json!("started"));
+            }
+            "session_end" => {
+                obj.insert("type".into(), json!("agent_session"));
+                obj.insert("action".into(), json!("ended"));
+            }
+            _ => {}
+        }
+    }
+
+    serde_json::to_string(&value).context("failed to serialize legacy rewrite")
 }
 
 /// Runs the import command, reading from stdin.
@@ -238,8 +277,39 @@ mod tests {
         // Verify event was stored correctly
         let events = db.get_events(None, None).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "agent_session");
+        assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
         assert_eq!(events[0].source, "remote.agent");
+    }
+
+    #[test]
+    fn test_import_legacy_session_types_rewritten() {
+        use tt_core::EventType;
+
+        let db = Database::open_in_memory().unwrap();
+        let input_str = r#"{"id":"legacy-start","timestamp":"2025-01-29T12:00:00Z","source":"remote.agent","type":"session_start","session_id":"sess123"}
+{"id":"legacy-end","timestamp":"2025-01-29T12:05:00Z","source":"remote.agent","type":"session_end","session_id":"sess123"}
+"#;
+        let input = Cursor::new(input_str);
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.malformed, 0);
+
+        let events = db.get_events(None, None).unwrap();
+        let start = events
+            .iter()
+            .find(|event| event.id == "legacy-start")
+            .expect("missing legacy start event");
+        let end = events
+            .iter()
+            .find(|event| event.id == "legacy-end")
+            .expect("missing legacy end event");
+
+        assert_eq!(start.event_type, EventType::AgentSession);
+        assert_eq!(start.action.as_deref(), Some("started"));
+        assert_eq!(end.event_type, EventType::AgentSession);
+        assert_eq!(end.action.as_deref(), Some("ended"));
     }
 
     #[test]
@@ -254,7 +324,7 @@ mod tests {
             let ts = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap()
                 + chrono::Duration::seconds(i as i64);
             let line = format!(
-                r#"{{"id":"batch-{}","timestamp":"{}","source":"test","type":"test","data":{{}}}}"#,
+                r#"{{"id":"batch-{}","timestamp":"{}","source":"test","type":"tmux_pane_focus","data":{{}}}}"#,
                 i,
                 ts.to_rfc3339()
             );
@@ -280,7 +350,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         // Minimal event without optional fields
-        let minimal_event = r#"{"id":"min-1","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"test","data":{}}"#;
+        let minimal_event = r#"{"id":"min-1","timestamp":"2025-01-29T12:00:00Z","source":"test","type":"tmux_pane_focus","data":{}}"#;
         let input = Cursor::new(format!("{minimal_event}\n"));
 
         let result = import_from_reader(&db, input).unwrap();

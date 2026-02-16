@@ -37,7 +37,7 @@ tt-cli ─┬─> tt-core
 | Change time algorithm | `tt-core/src/allocation.rs` | 1366-line algo with extensive tests. See `tt-core/AGENTS.md` |
 | Add DB table/column | `tt-db/src/lib.rs` | Bump `SCHEMA_VERSION`, add to `init()`. No migrations—schema mismatch = fail-fast |
 | Add event type | `tt-db/src/lib.rs` (`StoredEvent`) | Then handle in `allocation.rs` and relevant command |
-| Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Parse JSONL session files from `~/.claude/` and `~/.local/share/opencode/` |
+| Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Claude: parse JSONL session files from `~/.claude/`. OpenCode: query SQLite database via rusqlite |
 | Config options | `tt-cli/src/config.rs` | Figment: defaults → `~/.config/tt/config.toml` → `TT_*` env vars |
 | Snapshot test update | Run `cargo insta review` | 18 snapshots in `tt-cli/src/commands/snapshots/` |
 | Deploy binary | `scripts/deploy-remote.sh` | Builds release, copies via SSH, optionally configures tmux hook |
