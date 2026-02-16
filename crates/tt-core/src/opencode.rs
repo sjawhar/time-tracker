@@ -106,6 +106,7 @@ fn build_agent_session(
 
     let message_stats = collect_message_stats(conn, &session_row.id)?;
     let tool_call_count = count_tool_calls(conn, &session_row.id)?;
+    let tool_call_timestamps = collect_tool_call_timestamps(conn, &session_row.id)?;
     let message_count = message_stats
         .user_message_count
         .saturating_add(message_stats.assistant_message_count);
@@ -145,7 +146,48 @@ fn build_agent_session(
         assistant_message_count: message_stats.assistant_message_count,
         tool_call_count,
         user_message_timestamps: message_stats.user_message_timestamps,
+        tool_call_timestamps,
     })
+}
+
+fn collect_tool_call_timestamps(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<DateTime<Utc>>, rusqlite::Error> {
+    let mut stmt = match conn.prepare_cached(
+        "SELECT time_created FROM part \
+         WHERE session_id = ? AND json_extract(data, '$.type') = 'tool' \
+         ORDER BY time_created \
+         LIMIT 5000",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            if is_missing_part_table(&err) {
+                return Ok(Vec::new());
+            }
+            return Err(err);
+        }
+    };
+
+    let rows = match stmt.query_map([session_id], |row| {
+        let millis: i64 = row.get(0)?;
+        Ok(DateTime::from_timestamp_millis(millis))
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            if is_missing_part_table(&err) {
+                return Ok(Vec::new());
+            }
+            return Err(err);
+        }
+    };
+
+    let timestamps = rows.filter_map(|r| r.ok().flatten()).collect();
+    Ok(timestamps)
+}
+
+fn is_missing_part_table(err: &rusqlite::Error) -> bool {
+    err.to_string().contains("no such table: part")
 }
 
 fn count_tool_calls(conn: &Connection, session_id: &str) -> Result<i32, SessionError> {
@@ -429,6 +471,80 @@ mod tests {
         assert_eq!(session.starting_prompt.as_deref(), Some("hello world"));
         assert_eq!(session.user_message_timestamps.len(), 1);
         assert!(session.end_time.is_some());
+    }
+
+    #[test]
+    fn test_tool_call_timestamps_collected() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_tool",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+
+        insert_message(
+            &db_path,
+            "msg_a1",
+            "ses_tool",
+            "assistant",
+            1_700_000_002_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_a1_tool",
+            "msg_a1",
+            "ses_tool",
+            "tool",
+            None,
+            1_700_000_002_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_a1_text",
+            "msg_a1",
+            "ses_tool",
+            "text",
+            Some("text"),
+            1_700_000_002_000,
+        );
+        insert_message(
+            &db_path,
+            "msg_a2",
+            "ses_tool",
+            "assistant",
+            1_700_000_003_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_a2_tool",
+            "msg_a2",
+            "ses_tool",
+            "tool",
+            None,
+            1_700_000_003_000,
+        );
+
+        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let session = &sessions[0];
+
+        assert_eq!(
+            session.tool_call_timestamps,
+            vec![
+                unix_ms_to_datetime(1_700_000_002_000).unwrap(),
+                unix_ms_to_datetime(1_700_000_003_000).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_tool_call_timestamps_missing_table_returns_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        let timestamps = collect_tool_call_timestamps(&conn, "ses_missing").unwrap();
+        assert!(timestamps.is_empty());
     }
 
     #[test]
