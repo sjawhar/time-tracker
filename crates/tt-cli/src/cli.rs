@@ -117,6 +117,9 @@ pub enum Commands {
         label: Option<String>,
     },
 
+    /// List known remote machines and their sync status.
+    Machines,
+
     /// Sync events from remote machine(s) via SSH.
     ///
     /// Runs `tt export` on each remote via SSH and imports the events
