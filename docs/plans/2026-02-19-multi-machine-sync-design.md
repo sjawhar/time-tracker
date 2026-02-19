@@ -126,10 +126,11 @@ tt sync devbox gpu-server       # sync multiple remotes in sequence
 
 Flow:
 1. SSH to remote, run `tt export --after={last_event_id}` (incremental)
-2. Pipe output into local import logic
-3. On first sync from a new machine, prompt for label: `"New machine a1b2c3d4. Label? [devbox]:"`
-4. Populate/update `machines` table (`last_sync_at`, `last_event_id`)
-5. Run `tt ingest sessions` and `tt recompute` after import
+2. Extract machine UUID from the first event in the output
+3. Pipe output into local import logic
+4. Register machine using SSH alias as label (auto-detected, no interactive prompt)
+5. Update `machines` table (`last_sync_at`, `last_event_id`)
+6. Run `tt ingest sessions` and `tt recompute` after import
 
 New CLI additions:
 - `tt sync <remote>...` — new subcommand

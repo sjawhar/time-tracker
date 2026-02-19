@@ -320,8 +320,10 @@ pub fn init_machine(label: Option<&str>) -> Result<MachineIdentity> {
     init_machine_at(&machine_json_path()?, label)
 }
 
-/// Initializes machine identity at a specific path (for testing).
-fn init_machine_at(path: &Path, label: Option<&str>) -> Result<MachineIdentity> {
+/// Initializes machine identity at a specific path.
+///
+/// `pub(crate)` so tests in other modules (e.g., ingest tests) can use it.
+pub(crate) fn init_machine_at(path: &Path, label: Option<&str>) -> Result<MachineIdentity> {
     let default_label = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -544,163 +546,9 @@ Initializes machine identity (UUID + label) for multi-machine sync."
 
 ---
 
-### Task 7: Prepend machine_id to event IDs in ingest.rs
+### Task 7: Add machine_id to StoredEvent and update schema to v8
 
-**Files:**
-- Modify: `crates/tt-cli/src/commands/ingest.rs:105-131, 265-339`
-
-**Step 1: Write test for machine-prefixed event IDs**
-
-Add to the existing tests in `ingest.rs`:
-
-```rust
-    #[test]
-    fn test_event_id_includes_machine_id() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path().join("data");
-        let machine_path = temp_dir.path().join("machine.json");
-
-        // Create machine identity
-        let identity = crate::machine::init_machine_at_path(&machine_path, Some("test")).unwrap();
-
-        ingest_pane_focus_with_machine(&data_dir, &identity.machine_id, "%1", "main", Some(0), "/home/test").unwrap();
-
-        let events = read_events_from(&data_dir).unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].id.starts_with(&identity.machine_id),
-            "event ID '{}' should start with machine_id '{}'",
-            events[0].id, identity.machine_id);
-    }
-```
-
-**Step 2: Update IngestEvent::pane_focus() to accept machine_id**
-
-Change the `pane_focus` constructor (line 107) to take `machine_id: &str` as the first parameter:
-
-```rust
-impl IngestEvent {
-    /// Creates a new pane focus event with a deterministic ID.
-    pub fn pane_focus(
-        machine_id: &str,
-        pane_id: String,
-        tmux_session: String,
-        window_index: Option<u32>,
-        cwd: String,
-        timestamp: DateTime<Utc>,
-    ) -> Self {
-        let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let id = format!("{machine_id}:remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
-        // ... rest unchanged
-    }
-}
-```
-
-**Step 3: Update ingest_pane_focus_impl and public API**
-
-Add `machine_id: &str` parameter to `ingest_pane_focus_impl()` (line 272) and pass it through to `IngestEvent::pane_focus()`.
-
-Update the public `ingest_pane_focus()` (line 326) to load the machine identity:
-
-```rust
-pub fn ingest_pane_focus(
-    pane_id: &str,
-    session_name: &str,
-    window_index: Option<u32>,
-    cwd: &str,
-) -> Result<bool> {
-    let identity = crate::machine::require_machine_identity()?;
-    ingest_pane_focus_impl(
-        &default_data_dir(),
-        &identity.machine_id,
-        pane_id,
-        session_name,
-        window_index,
-        cwd,
-    )
-}
-```
-
-Also create a test-friendly variant that accepts a data_dir and machine_id.
-
-**Step 4: Fix all existing ingest tests**
-
-Existing tests call `ingest_pane_focus_impl()` directly. Update them to pass a machine_id (use a fixed UUID like `"test-machine-00000000-0000-0000-0000-000000000000"`). Update the expected event ID format in any assertions.
-
-**Step 5: Run tests**
-
-Run: `cargo test -p tt-cli ingest -- -v`
-Expected: PASS
-
-**Step 6: Commit**
-
-```bash
-git add crates/tt-cli/src/commands/ingest.rs
-git commit -m "feat: prepend machine_id to ingest event IDs
-
-Events now include the machine UUID prefix for multi-machine
-deduplication. Requires tt init before first use."
-```
-
----
-
-### Task 8: Prepend machine_id to event IDs in export.rs
-
-**Files:**
-- Modify: `crates/tt-cli/src/commands/export.rs:122-129, 382-460`
-
-**Step 1: Update run() to load machine identity**
-
-Update `run()` (line 123) to load the machine identity and pass it through:
-
-```rust
-pub fn run() -> Result<()> {
-    let identity = crate::machine::require_machine_identity()?;
-    run_impl(
-        &default_data_dir(),
-        &default_claude_dir(),
-        &identity.machine_id,
-        &mut std::io::stdout(),
-    )
-}
-```
-
-**Step 2: Thread machine_id through run_impl and emit functions**
-
-Add `machine_id: &str` parameter to `run_impl()`, `export_claude_events()`, `export_single_claude_log()`, `process_claude_entry()`, and all the `emit_*` functions.
-
-In each `emit_*` function, prepend the machine_id to the event ID. For example, in `emit_session_start()` (line 390):
-
-```rust
-id: format!("{machine_id}:remote.agent:agent_session:{timestamp}:{session_id}:started"),
-```
-
-Same pattern for `emit_user_message()` and `emit_tool_uses()`.
-
-**Step 3: Note about tmux event passthrough**
-
-`export_tmux_events()` passes through events.jsonl lines verbatim. Since Task 7 already makes ingest write machine-prefixed IDs, these events will already have the prefix. No change needed to `export_tmux_events()`.
-
-**Step 4: Fix existing export tests**
-
-Tests call `run_impl()` directly. Update them to pass a test machine_id. Update ID assertions to expect the prefix.
-
-**Step 5: Run tests**
-
-Run: `cargo test -p tt-cli export -- -v`
-Expected: PASS
-
-**Step 6: Commit**
-
-```bash
-git add crates/tt-cli/src/commands/export.rs
-git commit -m "feat: prepend machine_id to export event IDs
-
-Claude session events now include the machine UUID prefix."
-```
-
----
-
-### Task 9: Add machine_id to StoredEvent and update schema to v8
+> **Note:** This task was originally Task 9 but moved earlier because Tasks 8-9 (ingest/export event ID changes) create `StoredEvent` instances that need the `machine_id` field to exist.
 
 **Files:**
 - Modify: `crates/tt-db/src/lib.rs:40, 116-187, 363-444, 470-501`
@@ -794,6 +642,159 @@ git commit -m "feat: schema v8 with machine_id column and machines table
 Breaking schema change - old databases will fail to open.
 Add machine_id to events and agent_sessions tables.
 Add machines table for sync state tracking."
+```
+
+---
+
+### Task 8: Prepend machine_id to event IDs in ingest.rs
+
+**Files:**
+- Modify: `crates/tt-cli/src/commands/ingest.rs:105-131, 265-339`
+
+**Step 1: Write test for machine-prefixed event IDs**
+
+Add to the existing tests in `ingest.rs`:
+
+```rust
+    #[test]
+    fn test_event_id_includes_machine_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+
+        let machine_id = "00000000-0000-0000-0000-000000000001";
+        ingest_pane_focus_impl(&data_dir, machine_id, "%1", "main", Some(0), "/home/test").unwrap();
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].id.starts_with(machine_id),
+            "event ID '{}' should start with machine_id '{}'",
+            events[0].id, machine_id);
+    }
+```
+
+**Step 2: Update IngestEvent::pane_focus() to accept machine_id**
+
+Change the `pane_focus` constructor (line 107) to take `machine_id: &str` as the first parameter:
+
+```rust
+impl IngestEvent {
+    /// Creates a new pane focus event with a deterministic ID.
+    pub fn pane_focus(
+        machine_id: &str,
+        pane_id: String,
+        tmux_session: String,
+        window_index: Option<u32>,
+        cwd: String,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let id = format!("{machine_id}:remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
+        // ... rest unchanged
+    }
+}
+```
+
+**Step 3: Update ingest_pane_focus_impl and public API**
+
+Add `machine_id: &str` parameter to `ingest_pane_focus_impl()` (line 272) and pass it through to `IngestEvent::pane_focus()`.
+
+Update the public `ingest_pane_focus()` (line 326) to load the machine identity:
+
+```rust
+pub fn ingest_pane_focus(
+    pane_id: &str,
+    session_name: &str,
+    window_index: Option<u32>,
+    cwd: &str,
+) -> Result<bool> {
+    let identity = crate::machine::require_machine_identity()?;
+    ingest_pane_focus_impl(
+        &default_data_dir(),
+        &identity.machine_id,
+        pane_id,
+        session_name,
+        window_index,
+        cwd,
+    )
+}
+```
+
+Also create a test-friendly variant that accepts a data_dir and machine_id.
+
+**Step 4: Fix all existing ingest tests**
+
+Existing tests call `ingest_pane_focus_impl()` directly. Update them to pass a machine_id (use a fixed UUID like `"test-machine-00000000-0000-0000-0000-000000000000"`). Update the expected event ID format in any assertions.
+
+**Step 5: Run tests**
+
+Run: `cargo test -p tt-cli ingest -- -v`
+Expected: PASS
+
+**Step 6: Commit**
+
+```bash
+git add crates/tt-cli/src/commands/ingest.rs
+git commit -m "feat: prepend machine_id to ingest event IDs
+
+Events now include the machine UUID prefix for multi-machine
+deduplication. Requires tt init before first use."
+```
+
+---
+
+### Task 9: Prepend machine_id to event IDs in export.rs
+
+**Files:**
+- Modify: `crates/tt-cli/src/commands/export.rs:122-129, 382-460`
+
+**Step 1: Update run() to load machine identity**
+
+Update `run()` (line 123) to load the machine identity and pass it through:
+
+```rust
+pub fn run() -> Result<()> {
+    let identity = crate::machine::require_machine_identity()?;
+    run_impl(
+        &default_data_dir(),
+        &default_claude_dir(),
+        &identity.machine_id,
+        &mut std::io::stdout(),
+    )
+}
+```
+
+**Step 2: Thread machine_id through run_impl and emit functions**
+
+Add `machine_id: &str` parameter to `run_impl()`, `export_claude_events()`, `export_single_claude_log()`, `process_claude_entry()`, and all the `emit_*` functions.
+
+In each `emit_*` function, prepend the machine_id to the event ID. For example, in `emit_session_start()` (line 390):
+
+```rust
+id: format!("{machine_id}:remote.agent:agent_session:{timestamp}:{session_id}:started"),
+```
+
+Same pattern for `emit_user_message()` and `emit_tool_uses()`.
+
+**Step 3: Note about tmux event passthrough**
+
+`export_tmux_events()` passes through events.jsonl lines verbatim. Since Task 8 already makes ingest write machine-prefixed IDs, these events will already have the prefix. No change needed to `export_tmux_events()`.
+
+**Step 4: Fix existing export tests**
+
+Tests call `run_impl()` directly. Update them to pass a test machine_id. Update ID assertions to expect the prefix.
+
+**Step 5: Run tests**
+
+Run: `cargo test -p tt-cli export -- -v`
+Expected: PASS
+
+**Step 6: Commit**
+
+```bash
+git add crates/tt-cli/src/commands/export.rs
+git commit -m "feat: prepend machine_id to export event IDs
+
+Claude session events now include the machine UUID prefix."
 ```
 
 ---
@@ -1047,6 +1048,11 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Extract machine_id from the first line of output before importing.
+    // This avoids a fragile "get latest event" query that could return
+    // the wrong machine_id if multiple syncs run back-to-back.
+    let machine_id = extract_machine_id_from_output(&output.stdout);
+
     // Import the events
     let reader = Cursor::new(output.stdout);
     let result = import::import_from_reader(db, reader)?;
@@ -1056,25 +1062,32 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
         result.inserted, result.duplicates, result.malformed
     );
 
-    // Extract machine_id from first imported event to register/update the machine
-    // The machine_id comes from the event ID prefix
-    if result.inserted > 0 || result.duplicates > 0 {
-        // Get the most recent event to find the machine_id
-        if let Some(machine_id) = find_machine_id_from_remote(db, remote)? {
-            db.upsert_machine(&machine_id, remote)?;
-        }
+    // Register/update the machine and track sync position
+    if let Some(ref mid) = machine_id {
+        // Find the last event ID from this batch for incremental sync tracking.
+        // Query the most recent event with this machine_id.
+        let new_last_id = db.get_latest_event_id_for_machine(mid)?;
+        db.upsert_machine(mid, remote, new_last_id.as_deref())?;
     }
 
     Ok(())
 }
 
-/// Finds the machine_id associated with events from a remote.
-///
-/// Looks at the most recent events that match the remote label pattern.
-fn find_machine_id_from_remote(db: &tt_db::Database, _remote: &str) -> Result<Option<String>> {
-    // For now, look at the most recently inserted event's machine_id
-    // A more robust approach would track this in the sync flow
-    Ok(db.get_latest_machine_id()?)
+/// Extracts the machine UUID from the first line of export output.
+fn extract_machine_id_from_output(stdout: &[u8]) -> Option<String> {
+    let first_line = stdout.split(|&b| b == b'\n').next()?;
+    let first_line = std::str::from_utf8(first_line).ok()?;
+    // Parse JSON to get the id field, then extract UUID prefix
+    let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    let id = value.get("id")?.as_str()?;
+    // UUID v4 is exactly 36 chars
+    if id.len() > 36 && id.as_bytes()[36] == b':' {
+        let candidate = &id[..36];
+        if uuid::Uuid::parse_str(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 ```
 
@@ -1096,19 +1109,21 @@ In `main.rs`, add the dispatch:
 In `crates/tt-db/src/lib.rs`, add methods:
 
 ```rust
-    /// Inserts or updates a machine entry.
+    /// Inserts or updates a machine entry, including sync position.
     pub fn upsert_machine(
         &self,
         machine_id: &str,
         label: &str,
+        last_event_id: Option<&str>,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO machines (machine_id, label, last_sync_at)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO machines (machine_id, label, last_sync_at, last_event_id)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(machine_id) DO UPDATE SET
                 label = excluded.label,
-                last_sync_at = excluded.last_sync_at",
-            params![machine_id, label, format_timestamp(Utc::now())],
+                last_sync_at = excluded.last_sync_at,
+                last_event_id = COALESCE(excluded.last_event_id, machines.last_event_id)",
+            params![machine_id, label, format_timestamp(Utc::now()), last_event_id],
         )?;
         Ok(())
     }
@@ -1125,12 +1140,15 @@ In `crates/tt-db/src/lib.rs`, add methods:
         Ok(result)
     }
 
-    /// Gets the machine_id from the most recently inserted event that has one.
-    pub fn get_latest_machine_id(&self) -> Result<Option<String>, DbError> {
+    /// Gets the most recent event ID for a specific machine.
+    pub fn get_latest_event_id_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<Option<String>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT machine_id FROM events WHERE machine_id IS NOT NULL ORDER BY timestamp DESC LIMIT 1",
+            "SELECT id FROM events WHERE machine_id = ?1 ORDER BY timestamp DESC LIMIT 1",
         )?;
-        let result = stmt.query_row([], |row| row.get(0)).optional()?;
+        let result = stmt.query_row(params![machine_id], |row| row.get(0)).optional()?;
         Ok(result)
     }
 ```
@@ -1222,7 +1240,11 @@ fn export_tmux_events(events_file: &Path, after: Option<&str>, output: &mut dyn 
 }
 ```
 
-**Step 3: Update main.rs dispatch**
+**Step 3: Note about Claude events**
+
+The `--after` flag only filters `export_tmux_events()`. Claude session events exported via `export_claude_events()` are already incremental via the manifest (byte offset tracking). Claude events that have already been exported won't be re-exported regardless of `--after`. This means the `--after` flag and the manifest are complementary — no conflict.
+
+**Step 4: Update main.rs dispatch**
 
 ```rust
         Some(Commands::Export { after }) => {
@@ -1230,12 +1252,12 @@ fn export_tmux_events(events_file: &Path, after: Option<&str>, output: &mut dyn 
         }
 ```
 
-**Step 4: Run tests**
+**Step 5: Run tests**
 
 Run: `cargo test -p tt-cli export -- -v`
 Expected: PASS
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add crates/tt-cli/src/cli.rs crates/tt-cli/src/commands/export.rs crates/tt-cli/src/main.rs
