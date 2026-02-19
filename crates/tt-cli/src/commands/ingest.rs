@@ -632,8 +632,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", Some(0), "/home/test");
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            Some(0),
+            "/home/test",
+        );
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Event was written
@@ -651,25 +657,13 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event should be written
-        let result1 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%1",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Immediate second event for same pane should be debounced
-        let result2 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%1",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(!result2.unwrap()); // Debounced
 
         let events = read_events_from(&data_dir).unwrap();
@@ -682,25 +676,13 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First pane
-        let result1 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%1",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Different pane should not be debounced
-        let result2 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%2",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test");
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -713,28 +695,16 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event
-        let result1 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%1",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Wait for debounce window to expire
         thread::sleep(Duration::from_millis(550));
 
         // Second event should be written
-        let result2 = ingest_pane_focus_impl(
-            &data_dir,
-            TEST_MACHINE_ID,
-            "%1",
-            "main",
-            None,
-            "/home/test",
-        );
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -746,11 +716,25 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "session1", Some(0), "/path/a")
-            .unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "session1",
+            Some(0),
+            "/path/a",
+        )
+        .unwrap();
 
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "session2", None, "/path/b")
-            .unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%2",
+            "session2",
+            None,
+            "/path/b",
+        )
+        .unwrap();
 
         // Read raw file and verify each line is valid JSON
         let content = fs::read_to_string(events_path(&data_dir)).unwrap();
@@ -1027,8 +1011,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join("data");
 
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", Some(0), "/home/test")
-            .unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            Some(0),
+            "/home/test",
+        )
+        .unwrap();
 
         let events = read_events_from(&data_dir).unwrap();
         assert_eq!(events.len(), 1);
@@ -1113,7 +1104,8 @@ fn test_debounce_file_corruption_recovery() {
     fs::write(&debounce_file, "corrupted:data:too:many:colons\ninvalid").unwrap();
 
     // Should handle gracefully and not panic
-    let result = ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+    let result =
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
     assert!(
         result.is_ok(),
         "Should recover from corrupted debounce file"

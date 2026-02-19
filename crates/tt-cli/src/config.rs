@@ -33,13 +33,19 @@ impl Default for Config {
 
 impl Config {
     /// Loads configuration from default locations.
-    #[expect(clippy::result_large_err, reason = "figment::Error is large but only returned at startup")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "figment::Error is large but only returned at startup"
+    )]
     pub fn load() -> Result<Self, figment::Error> {
         Self::load_from(None)
     }
 
     /// Loads configuration, optionally from a specific file.
-    #[expect(clippy::result_large_err, reason = "figment::Error is large but only returned at startup")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "figment::Error is large but only returned at startup"
+    )]
     pub fn load_from(config_path: Option<&Path>) -> Result<Self, figment::Error> {
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
 
