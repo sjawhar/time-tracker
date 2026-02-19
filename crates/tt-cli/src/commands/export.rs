@@ -106,9 +106,8 @@ impl ClaudeManifest {
 
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
+    crate::config::dirs_data_path()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".time-tracker")
 }
 
 /// Returns the default Claude projects directory.
@@ -121,15 +120,24 @@ fn default_claude_dir() -> PathBuf {
 
 /// Runs the export command, outputting all events to stdout.
 pub fn run() -> Result<()> {
+    let data_dir = default_data_dir();
+    let state_dir = crate::config::dirs_state_path()
+        .unwrap_or_else(|| data_dir.clone());
     run_impl(
-        &default_data_dir(),
+        &data_dir,
         &default_claude_dir(),
+        &state_dir,
         &mut std::io::stdout(),
     )
 }
 
 /// Implementation of export that allows injecting paths for testing.
-fn run_impl(data_dir: &Path, claude_dir: &Path, output: &mut dyn Write) -> Result<()> {
+fn run_impl(
+    data_dir: &Path,
+    claude_dir: &Path,
+    state_dir: &Path,
+    output: &mut dyn Write,
+) -> Result<()> {
     // Export tmux events
     let events_file = data_dir.join("events.jsonl");
     if events_file.exists() {
@@ -138,7 +146,7 @@ fn run_impl(data_dir: &Path, claude_dir: &Path, output: &mut dyn Write) -> Resul
 
     // Export Claude events with incremental parsing
     if claude_dir.exists() {
-        let manifest_path = data_dir.join("claude-manifest.json");
+        let manifest_path = state_dir.join("claude-manifest.json");
         export_claude_events(claude_dir, &manifest_path, output)?;
     }
 
@@ -561,7 +569,7 @@ mod tests {
         let (_temp, data_dir, claude_dir) = setup_test_dirs();
         let mut output = Cursor::new(Vec::new());
 
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(&data_dir, &claude_dir, &data_dir, &mut output);
 
         assert!(result.is_ok());
         assert!(output.get_ref().is_empty());
@@ -576,7 +584,7 @@ mod tests {
         fs::write(data_dir.join("events.jsonl"), format!("{event}\n")).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.trim(), event);
@@ -594,7 +602,7 @@ not valid json
         fs::write(data_dir.join("events.jsonl"), content).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.lines().count(), 2); // Only valid lines
@@ -611,7 +619,7 @@ not valid json
         fs::write(data_dir.join("events.jsonl"), content).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.lines().count(), 2);
@@ -633,7 +641,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -663,7 +671,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -691,7 +699,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -717,7 +725,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -746,7 +754,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -770,7 +778,7 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         // No events should be emitted for filtered types
         assert!(output.get_ref().is_empty());
@@ -791,7 +799,7 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -841,10 +849,10 @@ not valid json
 
         // Run on both directories
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir1, &claude_dir1, &mut output1).unwrap();
+        run_impl(&data_dir1, &claude_dir1, &data_dir1, &mut output1).unwrap();
 
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir2, &claude_dir2, &mut output2).unwrap();
+        run_impl(&data_dir2, &claude_dir2, &data_dir2, &mut output2).unwrap();
 
         // Output should be identical (same IDs for same input)
         assert_eq!(output1.into_inner(), output2.into_inner());
@@ -869,7 +877,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -892,7 +900,7 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         // No output because subagents are excluded
         assert!(output.get_ref().is_empty());
@@ -964,7 +972,7 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -995,7 +1003,7 @@ not valid json
         fs::write(&log_path, format!("{entry}\n")).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output).unwrap();
 
         // Manifest should be created
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1086,7 +1094,7 @@ not valid json
 
         // Export should succeed with full re-parse
         let mut output = Cursor::new(Vec::new());
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(&data_dir, &claude_dir, &data_dir, &mut output);
         assert!(
             result.is_ok(),
             "export should succeed despite corrupted manifest"
@@ -1275,7 +1283,7 @@ not valid json
         fs::write(&log_path, "").unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(&data_dir, &claude_dir, &data_dir, &mut output);
 
         assert!(result.is_ok());
         assert!(output.get_ref().is_empty());
