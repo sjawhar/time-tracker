@@ -626,6 +626,7 @@ fn test_delegated_time_from_agent_session_events() {
                 timestamp,
                 event_type,
                 source: source.clone(),
+                machine_id: None,
                 schema_version: 1,
                 pane_id: None,
                 tmux_session: None,

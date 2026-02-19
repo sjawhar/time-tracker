@@ -431,6 +431,7 @@ fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
         timestamp,
         event_type,
         source: session.source.as_str().to_string(),
+        machine_id: None,
         schema_version: 1,
         pane_id: None,
         tmux_session: None,
