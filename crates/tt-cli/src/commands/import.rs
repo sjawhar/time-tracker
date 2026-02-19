@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result};
 use serde_json::json;
 use tt_db::{Database, StoredEvent};
+use uuid::Uuid;
 
 /// Batch size for database inserts.
 const BATCH_SIZE: usize = 1000;
@@ -70,6 +71,11 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
                 event.stream_id = None;
                 event.assignment_source = None;
 
+                // Extract machine_id from event ID prefix (UUID before first colon-separated source)
+                if event.machine_id.is_none() {
+                    event.machine_id = extract_machine_id(&event.id);
+                }
+
                 result.total_read += 1;
                 batch.push(event);
 
@@ -122,6 +128,21 @@ fn rewrite_legacy_session_types(line: &str, line_num: usize) -> Result<String> {
     }
 
     serde_json::to_string(&value).context("failed to serialize legacy rewrite")
+}
+
+/// Extracts the machine UUID prefix from an event ID.
+///
+/// Event IDs are formatted as `{machine_uuid}:{source}:{type}:{timestamp}:{discriminator}`.
+/// Returns `None` if the ID doesn't start with a valid UUID.
+fn extract_machine_id(event_id: &str) -> Option<String> {
+    // UUID v4 is exactly 36 chars: 8-4-4-4-12
+    if event_id.len() > 36 && event_id.as_bytes()[36] == b':' {
+        let candidate = &event_id[..36];
+        if Uuid::parse_str(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 /// Runs the import command, reading from stdin.
@@ -378,5 +399,52 @@ mod tests {
         assert_eq!(events[0].schema_version, 2);
         assert_eq!(events[0].cwd, Some("/home/user/project".to_string()));
         assert_eq!(events[0].session_id, Some("sess123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_machine_id_valid() {
+        let id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1";
+        assert_eq!(
+            extract_machine_id(id),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_machine_id_no_uuid() {
+        let id = "remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1";
+        assert_eq!(extract_machine_id(id), None);
+    }
+
+    #[test]
+    fn test_extract_machine_id_invalid_uuid() {
+        let id = "not-a-valid-uuid-at-all-but-36chars:remote.tmux:foo";
+        assert_eq!(extract_machine_id(id), None);
+    }
+
+    #[test]
+    fn test_import_populates_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let event = r#"{"id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1","timestamp":"2025-01-29T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}"#;
+        let input = Cursor::new(format!("{event}\n"));
+        let result = import_from_reader(&db, input).unwrap();
+        assert_eq!(result.inserted, 1);
+
+        // Verify machine_id was extracted and stored
+        let events = db
+            .get_events_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].machine_id.as_deref(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
     }
 }
