@@ -1021,6 +1021,23 @@ mod tests {
     }
 
     #[test]
+    fn test_event_id_includes_machine_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", Some(0), "/home/test")
+            .unwrap();
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].id.starts_with(TEST_MACHINE_ID),
+            "event ID '{}' should start with machine_id",
+            events[0].id
+        );
+    }
+
+    #[test]
     fn test_get_claude_projects_dir() {
         if std::env::var("HOME").is_ok() {
             let path = get_claude_projects_dir().unwrap();
@@ -1239,7 +1256,8 @@ fn test_debounce_with_special_pane_ids() {
     ];
 
     for pane_id in special_panes {
-        let result = ingest_pane_focus_impl(&data_dir, pane_id, "main", None, "/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, pane_id, "main", None, "/test");
         assert!(result.is_ok(), "Should handle special pane ID: {pane_id}");
     }
 
@@ -1263,7 +1281,7 @@ fn test_rotation_preserves_old_content() {
     fs::write(&events_file, &large_content).unwrap();
 
     // Ingest should rotate
-    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/test").unwrap();
 
     // Verify old content is in rotated file
     let rotated = rotated_events_path(&data_dir);

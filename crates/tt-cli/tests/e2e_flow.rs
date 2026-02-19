@@ -11,10 +11,26 @@ fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
 
+/// Initialize machine identity in the given temp directory.
+/// Required before any `ingest` command.
+fn init_machine(temp: &std::path::Path) {
+    let output = Command::new(tt_binary())
+        .env("HOME", temp)
+        .arg("init")
+        .output()
+        .expect("failed to run tt init");
+    assert!(
+        output.status.success(),
+        "tt init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Test debouncing works correctly for rapid pane focus events.
 #[test]
 fn test_ingest_debouncing() {
     let temp = TempDir::new().unwrap();
+    init_machine(temp.path());
     let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for the same pane (within debounce window)
@@ -49,6 +65,7 @@ fn test_ingest_debouncing() {
 #[test]
 fn test_ingest_different_panes_not_debounced() {
     let temp = TempDir::new().unwrap();
+    init_machine(temp.path());
     let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for different panes
@@ -82,6 +99,13 @@ fn test_ingest_different_panes_not_debounced() {
 #[test]
 fn test_export_incremental() {
     let temp = TempDir::new().unwrap();
+
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .arg("init")
+        .output()
+        .unwrap();
 
     // First ingest
     let _ = Command::new(tt_binary())
@@ -264,6 +288,13 @@ fn test_export_empty_events_file() {
     let data_dir = temp.path().join(".local/share/tt");
     std::fs::create_dir_all(&data_dir).unwrap();
 
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .arg("init")
+        .output()
+        .unwrap();
+
     // Create empty events.jsonl
     std::fs::write(data_dir.join("events.jsonl"), "").unwrap();
 
@@ -319,6 +350,13 @@ fn test_export_large_number_of_events() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
+
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .arg("init")
+        .output()
+        .unwrap();
 
     // Create many events rapidly (should be debounced)
     for i in 0..100 {
@@ -411,6 +449,7 @@ fn test_concurrent_ingest_no_data_loss() {
     use tempfile::TempDir;
 
     let temp = Arc::new(TempDir::new().unwrap());
+    init_machine(temp.path());
     let data_dir = temp.path().join(".local/share/tt");
 
     // Spawn multiple threads trying to ingest simultaneously
@@ -463,6 +502,7 @@ fn test_readonly_events_file_error_handling() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
+    init_machine(temp.path());
     let data_dir = temp.path().join(".local/share/tt");
     fs::create_dir_all(&data_dir).unwrap();
 
