@@ -100,6 +100,13 @@ Sync everywhere except future `tt-llm` (which would use tokio for HTTP). CLI has
 
 Figment layered loading: compiled defaults → `~/.config/tt/config.toml` → `TT_*` env vars. Currently only `database_path` is configurable.
 
+XDG directory layout:
+```
+Config: ~/.config/tt/config.toml
+Data:   ~/.local/share/tt/ (tt.db, events.jsonl, machine.json)
+State:  ~/.local/state/tt/ (hook.log, claude-manifest.json)
+```
+
 ## Anti-Patterns
 
 - **No migrations**: Schema version mismatch = hard error. DB must be recreated on schema change.
@@ -117,3 +124,5 @@ Figment layered loading: compiled defaults → `~/.config/tt/config.toml` → `T
 | `AllocationConfig` | tt-core | Tunables: attention_window (1min), agent_timeout (30min) |
 | `AgentSession` | tt-core | Parsed Claude/OpenCode session metadata |
 | `Config` | tt-cli | App config (database_path) |
+| `MachineIdentity` | tt-cli | Persistent UUID + label per machine |
+| `Machine` | tt-db | Known remote machine with sync state |
