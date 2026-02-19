@@ -57,6 +57,8 @@ pub struct EventExport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_id: Option<String>,
 }
 
@@ -126,6 +128,7 @@ fn export_events(
             session_id: e.session_id,
             tmux_session: e.tmux_session,
             pane_id: e.pane_id,
+            machine_id: e.machine_id,
             stream_id: e.stream_id,
         })
         .collect())
@@ -421,6 +424,7 @@ mod tests {
                 session_id: None,
                 tmux_session: Some("main".to_string()),
                 pane_id: Some("%0".to_string()),
+                machine_id: None,
                 stream_id: None,
             }]),
             agents: None,
@@ -449,6 +453,7 @@ mod tests {
             session_id: None,
             tmux_session: None,
             pane_id: None,
+            machine_id: None,
             stream_id: None,
         };
 
@@ -458,6 +463,7 @@ mod tests {
         assert!(!json.contains("\"session_id\""));
         assert!(!json.contains("\"tmux_session\""));
         assert!(!json.contains("\"pane_id\""));
+        assert!(!json.contains("\"machine_id\""));
         assert!(!json.contains("\"stream_id\""));
     }
 

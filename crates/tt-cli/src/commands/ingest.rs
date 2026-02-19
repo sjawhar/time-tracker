@@ -105,6 +105,7 @@ fn get_git_identity(cwd: &std::path::Path) -> Option<ProjectIdentity> {
 impl IngestEvent {
     /// Creates a new pane focus event with a deterministic ID.
     pub fn pane_focus(
+        machine_id: &str,
         pane_id: String,
         tmux_session: String,
         window_index: Option<u32>,
@@ -112,7 +113,7 @@ impl IngestEvent {
         timestamp: DateTime<Utc>,
     ) -> Self {
         let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let id = format!("remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
+        let id = format!("{machine_id}:remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
 
         let git_identity = get_git_identity(Path::new(&cwd));
 
@@ -269,6 +270,7 @@ fn append_event(data_dir: &Path, event: &IngestEvent) -> Result<()> {
 /// 4. If not debounced, writes the event and updates debounce state
 fn ingest_pane_focus_impl(
     data_dir: &Path,
+    machine_id: &str,
     pane_id: &str,
     session_name: &str,
     window_index: Option<u32>,
@@ -305,6 +307,7 @@ fn ingest_pane_focus_impl(
 
     // Create and write event
     let event = IngestEvent::pane_focus(
+        machine_id,
         pane_id.to_string(),
         session_name.to_string(),
         window_index,
@@ -327,8 +330,10 @@ pub fn ingest_pane_focus(
     window_index: Option<u32>,
     cwd: &str,
 ) -> Result<bool> {
+    let identity = crate::machine::require_machine_identity()?;
     ingest_pane_focus_impl(
         &default_data_dir(),
+        &identity.machine_id,
         pane_id,
         session_name,
         window_index,
@@ -517,6 +522,9 @@ fn read_events_from(data_dir: &Path) -> Result<Vec<IngestEvent>> {
 }
 
 #[cfg(test)]
+const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
@@ -527,7 +535,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "", "main", None, "/home/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "", "main", None, "/home/test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pane_id"));
     }
@@ -537,7 +546,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "%1", "", None, "/home/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "", None, "/home/test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_name"));
     }
@@ -549,6 +559,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             Some(1),
@@ -567,6 +578,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event1 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -575,6 +587,7 @@ mod tests {
         );
 
         let event2 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -592,6 +605,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event1 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -600,6 +614,7 @@ mod tests {
         );
 
         let event2 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%4".to_string(), // Different pane
             "dev".to_string(),
             None,
@@ -615,7 +630,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "%1", "main", Some(0), "/home/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", Some(0), "/home/test");
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Event was written
@@ -633,11 +649,25 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event should be written
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(result1.unwrap());
 
         // Immediate second event for same pane should be debounced
-        let result2 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(!result2.unwrap()); // Debounced
 
         let events = read_events_from(&data_dir).unwrap();
@@ -650,11 +680,25 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First pane
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(result1.unwrap());
 
         // Different pane should not be debounced
-        let result2 = ingest_pane_focus_impl(&data_dir, "%2", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%2",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -667,14 +711,28 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(result1.unwrap());
 
         // Wait for debounce window to expire
         thread::sleep(Duration::from_millis(550));
 
         // Second event should be written
-        let result2 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+        );
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -686,9 +744,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        ingest_pane_focus_impl(&data_dir, "%1", "session1", Some(0), "/path/a").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "session1", Some(0), "/path/a")
+            .unwrap();
 
-        ingest_pane_focus_impl(&data_dir, "%2", "session2", None, "/path/b").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "session2", None, "/path/b")
+            .unwrap();
 
         // Read raw file and verify each line is valid JSON
         let content = fs::read_to_string(events_path(&data_dir)).unwrap();
@@ -721,7 +781,8 @@ mod tests {
         fs::write(&events_file, &large_content).unwrap();
 
         // Ingest should rotate the file
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
+            .unwrap();
 
         // Old file should be rotated
         let rotated = rotated_events_path(&data_dir);
@@ -748,7 +809,8 @@ mod tests {
         fs::write(&events_file, "small content").unwrap();
 
         // Ingest should not rotate
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
+            .unwrap();
 
         // No rotated file should exist
         let rotated = rotated_events_path(&data_dir);
@@ -989,6 +1051,7 @@ fn test_concurrent_ingests_during_rotation() {
         let handle = thread::spawn(move || {
             ingest_pane_focus_impl(
                 &data_dir_clone,
+                TEST_MACHINE_ID,
                 &format!("%{i}"),
                 "main",
                 None,
@@ -1031,7 +1094,7 @@ fn test_debounce_file_corruption_recovery() {
     fs::write(&debounce_file, "corrupted:data:too:many:colons\ninvalid").unwrap();
 
     // Should handle gracefully and not panic
-    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+    let result = ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
     assert!(
         result.is_ok(),
         "Should recover from corrupted debounce file"
@@ -1052,8 +1115,14 @@ fn test_git_identity_extraction_from_jj_directory() {
     fs::create_dir_all(&cwd_with_jj).unwrap();
     fs::create_dir_all(cwd_with_jj.join(".jj")).unwrap();
 
-    let result =
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_with_jj.to_str().unwrap());
+    let result = ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        cwd_with_jj.to_str().unwrap(),
+    );
 
     // Should succeed
     assert!(result.is_ok(), "Ingest should succeed");
@@ -1074,7 +1143,14 @@ fn test_no_jj_directory_returns_no_identity() {
     let cwd_no_jj = temp_dir.path().join("regular-dir");
     fs::create_dir_all(&cwd_no_jj).unwrap();
 
-    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_no_jj.to_str().unwrap());
+    let result = ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        cwd_no_jj.to_str().unwrap(),
+    );
 
     assert!(result.is_ok(), "Ingest should succeed");
 
@@ -1136,11 +1212,11 @@ fn test_lock_file_cleanup() {
     let data_dir = temp_dir.path().join(".time-tracker");
 
     // First ingest
-    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test").unwrap();
 
     // Lock should be released, second ingest should succeed immediately
     let start = std::time::Instant::now();
-    ingest_pane_focus_impl(&data_dir, "%2", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test").unwrap();
     let duration = start.elapsed();
 
     // Should complete quickly (not waiting on lock)
