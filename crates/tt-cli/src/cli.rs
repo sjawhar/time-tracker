@@ -39,7 +39,11 @@ pub enum Commands {
     ///
     /// Reads events from `~/.local/share/tt/events.jsonl` and parses Claude Code
     /// session logs, outputting combined events as JSONL to stdout.
-    Export,
+    Export {
+        /// Only export events after this event ID (for incremental sync).
+        #[arg(long)]
+        after: Option<String>,
+    },
 
     /// Import events from stdin into local `SQLite` database.
     ///
