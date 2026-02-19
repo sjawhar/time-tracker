@@ -1039,7 +1039,7 @@ not valid json
 
         // First export - full parse
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output1).unwrap();
         let output1_str = String::from_utf8(output1.into_inner()).unwrap();
         let first_count = output1_str.lines().count();
 
@@ -1050,7 +1050,7 @@ not valid json
 
         // Second export - should only parse new bytes
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output2).unwrap();
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         let second_count = output2_str.lines().count();
 
@@ -1119,7 +1119,7 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output1).unwrap();
 
         // Record the offset
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1140,7 +1140,7 @@ not valid json
 
         // Second export should restart from 0
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output2).unwrap();
 
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         // Should have session_start + user_message = 2 (full re-parse from start)
@@ -1168,7 +1168,7 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output1).unwrap();
 
         // Verify manifest has the file
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1181,7 +1181,7 @@ not valid json
 
         // Second export
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output2).unwrap();
 
         // Manifest should no longer contain the deleted file
         let manifest: ClaudeManifest =
@@ -1209,7 +1209,7 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output1).unwrap();
         let output1_str = String::from_utf8(output1.into_inner()).unwrap();
         // 2 sessions x (session_start + user_message) = 4 events
         assert_eq!(output1_str.lines().count(), 4);
@@ -1232,7 +1232,7 @@ not valid json
 
         // Second export
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output2).unwrap();
 
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         // session_start (re-emitted for sess1) + user_message = 2 events
@@ -1261,11 +1261,11 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output1).unwrap();
 
         // Second export without any changes
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(&data_dir, &claude_dir, &data_dir, &mut output2).unwrap();
 
         // Should have no output (no new content)
         assert!(output2.get_ref().is_empty());
