@@ -4,6 +4,7 @@ pub mod context;
 pub mod export;
 pub mod import;
 pub mod ingest;
+pub mod init;
 pub mod recompute;
 pub mod report;
 pub mod status;

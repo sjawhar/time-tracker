@@ -103,6 +103,16 @@ pub enum Commands {
     #[command(subcommand)]
     Streams(StreamsAction),
 
+    /// Initialize machine identity for multi-machine sync.
+    ///
+    /// Generates a persistent UUID for this machine, stored in
+    /// `~/.local/share/tt/machine.json`. Idempotent — safe to run again.
+    Init {
+        /// Human-friendly label for this machine (defaults to hostname).
+        #[arg(long)]
+        label: Option<String>,
+    },
+
     /// Output context for stream inference (JSON).
     ///
     /// Outputs JSON containing events, agents, streams, and gaps for a time range.
