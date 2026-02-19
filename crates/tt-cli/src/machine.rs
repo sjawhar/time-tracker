@@ -20,8 +20,7 @@ pub struct MachineIdentity {
 
 /// Returns the path to machine.json in the XDG data directory.
 pub fn machine_json_path() -> Result<PathBuf> {
-    let data_dir =
-        crate::config::dirs_data_path().context("could not determine data directory")?;
+    let data_dir = crate::config::dirs_data_path().context("could not determine data directory")?;
     Ok(data_dir.join("machine.json"))
 }
 
