@@ -139,9 +139,7 @@ const MAX_EVENTS_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".time-tracker")
+    crate::config::dirs_data_path().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Returns the path to the events file within the given data directory.

@@ -15,7 +15,7 @@ fn tt_binary() -> String {
 #[test]
 fn test_ingest_debouncing() {
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for the same pane (within debounce window)
     for _ in 0..5 {
@@ -49,7 +49,7 @@ fn test_ingest_debouncing() {
 #[test]
 fn test_ingest_different_panes_not_debounced() {
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for different panes
     for pane in ["%1", "%2", "%3"] {
@@ -261,7 +261,7 @@ fn test_export_empty_events_file() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Create empty events.jsonl
@@ -411,7 +411,7 @@ fn test_concurrent_ingest_no_data_loss() {
     use tempfile::TempDir;
 
     let temp = Arc::new(TempDir::new().unwrap());
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Spawn multiple threads trying to ingest simultaneously
     let mut handles = vec![];
@@ -463,7 +463,7 @@ fn test_readonly_events_file_error_handling() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
     fs::create_dir_all(&data_dir).unwrap();
 
     // Create events file and make it read-only
