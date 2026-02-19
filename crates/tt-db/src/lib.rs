@@ -32,7 +32,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1263,6 +1263,58 @@ impl Database {
         }
 
         Ok(statuses)
+    }
+
+    /// Inserts or updates a machine entry, including sync position.
+    pub fn upsert_machine(
+        &self,
+        machine_id: &str,
+        label: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO machines (machine_id, label, last_sync_at, last_event_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(machine_id) DO UPDATE SET
+                label = excluded.label,
+                last_sync_at = excluded.last_sync_at,
+                last_event_id = COALESCE(excluded.last_event_id, machines.last_event_id)",
+            params![
+                machine_id,
+                label,
+                format_timestamp(Utc::now()),
+                last_event_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets the last event ID synced from a machine identified by label.
+    pub fn get_machine_last_event_id_by_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_event_id FROM machines WHERE label = ?1")?;
+        let result = stmt
+            .query_row(params![label], |row| row.get(0))
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Gets the most recent event ID for a specific machine.
+    pub fn get_latest_event_id_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM events WHERE machine_id = ?1 ORDER BY timestamp DESC LIMIT 1",
+        )?;
+        let result = stmt
+            .query_row(params![machine_id], |row| row.get(0))
+            .optional()?;
+        Ok(result)
     }
 }
 

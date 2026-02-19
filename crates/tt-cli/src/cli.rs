@@ -113,6 +113,17 @@ pub enum Commands {
         label: Option<String>,
     },
 
+    /// Sync events from remote machine(s) via SSH.
+    ///
+    /// Runs `tt export` on each remote via SSH and imports the events
+    /// into the local database. Tracks sync position per remote for
+    /// incremental pulls.
+    Sync {
+        /// Remote host(s) to sync from (SSH alias or user@host).
+        #[arg(required = true)]
+        remotes: Vec<String>,
+    },
+
     /// Output context for stream inference (JSON).
     ///
     /// Outputs JSON containing events, agents, streams, and gaps for a time range.

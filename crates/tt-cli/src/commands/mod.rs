@@ -9,4 +9,5 @@ pub mod recompute;
 pub mod report;
 pub mod status;
 pub mod streams;
+pub mod sync;
 pub mod tag;
