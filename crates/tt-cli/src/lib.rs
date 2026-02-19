@@ -7,4 +7,4 @@ pub mod commands;
 mod config;
 
 pub use cli::{Cli, Commands, IngestEvent, StreamsAction};
-pub use config::Config;
+pub use config::{Config, dirs_data_path, dirs_state_path};
