@@ -157,7 +157,8 @@ fn run_impl(
 }
 
 /// Exports tmux events from events.jsonl, passing through valid lines.
-/// When `after` is provided, only events after the line containing that ID are exported.
+/// When `after` is provided, exports events strictly after the matching event
+/// (the marker event itself is excluded).
 fn export_tmux_events(
     events_file: &Path,
     after: Option<&str>,
@@ -183,10 +184,15 @@ fn export_tmux_events(
 
         if !past_marker {
             if let Some(after_id) = after {
-                if line.contains(after_id) {
-                    past_marker = true;
+                // Parse the id field specifically rather than substring matching
+                // to avoid false matches in cwd or data fields.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("id").and_then(serde_json::Value::as_str) == Some(after_id) {
+                        past_marker = true;
+                    }
                 }
             }
+            // Skip the marker event itself and everything before it
             continue;
         }
 

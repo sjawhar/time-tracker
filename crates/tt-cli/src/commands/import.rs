@@ -8,7 +8,8 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result};
 use serde_json::json;
 use tt_db::{Database, StoredEvent};
-use uuid::Uuid;
+
+use crate::machine::extract_machine_id;
 
 /// Batch size for database inserts.
 const BATCH_SIZE: usize = 1000;
@@ -128,21 +129,6 @@ fn rewrite_legacy_session_types(line: &str, line_num: usize) -> Result<String> {
     }
 
     serde_json::to_string(&value).context("failed to serialize legacy rewrite")
-}
-
-/// Extracts the machine UUID prefix from an event ID.
-///
-/// Event IDs are formatted as `{machine_uuid}:{source}:{type}:{timestamp}:{discriminator}`.
-/// Returns `None` if the ID doesn't start with a valid UUID.
-fn extract_machine_id(event_id: &str) -> Option<String> {
-    // UUID v4 is exactly 36 chars: 8-4-4-4-12
-    if event_id.len() > 36 && event_id.as_bytes()[36] == b':' {
-        let candidate = &event_id[..36];
-        if Uuid::parse_str(candidate).is_ok() {
-            return Some(candidate.to_string());
-        }
-    }
-    None
 }
 
 /// Runs the import command, reading from stdin.
@@ -340,7 +326,10 @@ mod tests {
         // Generate more than BATCH_SIZE events
         let num_events = BATCH_SIZE + 500;
         let mut input_str = String::new();
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "test assertion where overflow is not possible"
+        )]
         for i in 0..num_events {
             let ts = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap()
                 + chrono::Duration::seconds(i as i64);

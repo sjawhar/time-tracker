@@ -88,6 +88,21 @@ pub(crate) fn init_machine_at(path: &Path, label: Option<&str>) -> Result<Machin
     Ok(identity)
 }
 
+/// Extracts the machine UUID prefix from an event ID.
+///
+/// Event IDs are formatted as `{machine_uuid}:{source}:{type}:{timestamp}:{discriminator}`.
+/// Returns `None` if the ID doesn't start with a valid UUID.
+pub fn extract_machine_id(event_id: &str) -> Option<String> {
+    // UUID v4 is exactly 36 chars: 8-4-4-4-12
+    if event_id.len() > 36 && event_id.as_bytes()[36] == b':' {
+        let candidate = &event_id[..36];
+        if Uuid::parse_str(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 /// Writes machine identity to a specific path.
 fn save_to(path: &Path, identity: &MachineIdentity) -> Result<()> {
     if let Some(parent) = path.parent() {

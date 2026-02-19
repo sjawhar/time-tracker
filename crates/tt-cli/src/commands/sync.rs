@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::commands::{import, ingest, recompute};
+use crate::machine::extract_machine_id;
 
 /// Runs the sync command for one or more remotes.
 pub fn run(db: &tt_db::Database, remotes: &[String]) -> Result<()> {
@@ -30,7 +31,15 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
 
     let mut export_cmd = String::from("tt export");
     if let Some(ref last_id) = last_event_id {
-        let _ = write!(export_cmd, " --after {last_id}");
+        // Validate UUID prefix format before using in SSH command to prevent injection
+        if last_id.len() > 36
+            && last_id.as_bytes()[36] == b':'
+            && uuid::Uuid::parse_str(&last_id[..36]).is_ok()
+        {
+            let _ = write!(export_cmd, " --after {last_id}");
+        } else {
+            tracing::warn!(event_id = %last_id, "invalid last_event_id format, skipping --after");
+        }
     }
 
     let output = Command::new("ssh")
@@ -62,6 +71,11 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
     if let Some(ref mid) = machine_id {
         let new_last_id = db.get_latest_event_id_for_machine(mid)?;
         db.upsert_machine(mid, remote, new_last_id.as_deref())?;
+    } else {
+        tracing::warn!(
+            remote = remote,
+            "could not extract machine_id from remote output — sync position will not be tracked"
+        );
     }
 
     Ok(())
@@ -73,11 +87,5 @@ fn extract_machine_id_from_output(stdout: &[u8]) -> Option<String> {
     let first_line = std::str::from_utf8(first_line).ok()?;
     let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
     let id = value.get("id")?.as_str()?;
-    if id.len() > 36 && id.as_bytes()[36] == b':' {
-        let candidate = &id[..36];
-        if uuid::Uuid::parse_str(candidate).is_ok() {
-            return Some(candidate.to_string());
-        }
-    }
-    None
+    extract_machine_id(id)
 }
