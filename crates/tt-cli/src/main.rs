@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{context, export, import, ingest, recompute, report, status, streams, tag};
+use tt_cli::commands::{context, export, import, ingest, init, recompute, report, status, streams, tag};
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
 /// Load config and open database, ensuring the parent directory exists.
@@ -105,6 +105,9 @@ fn main() -> Result<()> {
                 StreamsAction::List { json } => streams::run(&db, *json)?,
                 StreamsAction::Create { name } => streams::create(&db, name.clone())?,
             }
+        }
+        Some(Commands::Init { label }) => {
+            init::run(label.as_deref())?;
         }
         Some(Commands::Context {
             events,
