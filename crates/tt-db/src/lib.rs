@@ -108,6 +108,15 @@ pub struct SourceStatus {
     pub last_timestamp: DateTime<Utc>,
 }
 
+/// A known remote machine.
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub machine_id: String,
+    pub label: String,
+    pub last_sync_at: Option<String>,
+    pub last_event_id: Option<String>,
+}
+
 /// An event stored in the database.
 ///
 /// This type represents both events being inserted and events being read.
@@ -1287,6 +1296,24 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Lists all known machines.
+    pub fn list_machines(&self) -> Result<Vec<Machine>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT machine_id, label, last_sync_at, last_event_id FROM machines ORDER BY label",
+        )?;
+        let machines = stmt
+            .query_map([], |row| {
+                Ok(Machine {
+                    machine_id: row.get(0)?,
+                    label: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    last_sync_at: row.get(2)?,
+                    last_event_id: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(machines)
     }
 
     /// Gets the last event ID synced from a machine identified by label.

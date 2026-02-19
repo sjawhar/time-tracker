@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{context, export, import, ingest, init, recompute, report, status, streams, sync, tag};
+use tt_cli::commands::{context, export, import, ingest, init, machines, recompute, report, status, streams, sync, tag};
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
 /// Load config and open database, ensuring the parent directory exists.
@@ -108,6 +108,10 @@ fn main() -> Result<()> {
         }
         Some(Commands::Init { label }) => {
             init::run(label.as_deref())?;
+        }
+        Some(Commands::Machines) => {
+            let (db, _config) = open_database(cli.config.as_deref())?;
+            machines::run(&db)?;
         }
         Some(Commands::Sync { remotes }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;

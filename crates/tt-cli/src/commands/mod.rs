@@ -5,6 +5,7 @@ pub mod export;
 pub mod import;
 pub mod ingest;
 pub mod init;
+pub mod machines;
 pub mod recompute;
 pub mod report;
 pub mod status;
