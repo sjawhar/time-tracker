@@ -351,6 +351,8 @@ use tt_db::StoredEvent;
 /// Scans Claude Code session directories and the `OpenCode` `SQLite`
 /// database, then upserts discovered sessions into the database.
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
+    let machine_id = crate::machine::load_machine_identity()?.map(|m| m.machine_id);
+
     let mut all_sessions = Vec::new();
 
     let (migrated_start, migrated_end) = db
@@ -390,7 +392,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         db.upsert_agent_session(session)
             .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
-        let events = create_session_events(session);
+        let events = create_session_events(session, machine_id.as_deref());
         event_count += events.len();
         db.insert_events(&events).with_context(|| {
             format!("failed to insert events for session {}", session.session_id)
@@ -424,7 +426,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
 }
 
 /// Create events from an agent session.
-fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
+fn create_session_events(session: &AgentSession, machine_id: Option<&str>) -> Vec<StoredEvent> {
     use serde_json::json;
     use tt_core::EventType;
 
@@ -436,7 +438,7 @@ fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
         timestamp,
         event_type,
         source: session.source.as_str().to_string(),
-        machine_id: None,
+        machine_id: machine_id.map(String::from),
         schema_version: 1,
         pane_id: None,
         tmux_session: None,
@@ -841,7 +843,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -876,7 +878,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -913,7 +915,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -954,7 +956,7 @@ mod tests {
             tool_call_timestamps: vec![tool_ts1, tool_ts2],
         };
 
-        let mut events = create_session_events(&session);
+        let mut events = create_session_events(&session, None);
 
         assert_eq!(events[0].event_type, EventType::AgentSession);
         assert_eq!(events[0].action.as_deref(), Some("started"));
@@ -1009,7 +1011,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 2);
         // Events should have "opencode" as source, not "claude"
@@ -1318,7 +1320,7 @@ fn test_create_session_events_with_empty_timestamps() {
         tool_call_timestamps: Vec::new(),
     };
 
-    let events = create_session_events(&session);
+    let events = create_session_events(&session, None);
 
     // Should only have session_start (no user_message events)
     assert_eq!(events.len(), 1);
