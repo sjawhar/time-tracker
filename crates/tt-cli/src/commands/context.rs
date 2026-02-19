@@ -352,6 +352,7 @@ mod tests {
             timestamp,
             event_type,
             source: source.to_string(),
+            machine_id: None,
             schema_version: 1,
             pane_id: None,
             tmux_session: None,
