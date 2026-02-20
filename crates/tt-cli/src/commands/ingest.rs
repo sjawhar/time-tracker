@@ -363,7 +363,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     }
 
     // Claude Code
-    let claude_dir = get_claude_projects_dir()?;
+    let claude_dir = get_claude_projects_dir();
     if claude_dir.exists() {
         println!("Scanning Claude Code sessions...");
         let claude_sessions =
@@ -491,8 +491,15 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 /// Get the Claude Code projects directory path.
-fn get_claude_projects_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join("projects"))
+///
+/// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
+fn get_claude_projects_dir() -> PathBuf {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .map_or_else(
+            |_| home_dir().unwrap_or_default().join(".claude"),
+            PathBuf::from,
+        )
+        .join("projects")
 }
 
 /// Get the `OpenCode` database path.
@@ -1033,7 +1040,7 @@ mod tests {
     #[test]
     fn test_get_claude_projects_dir() {
         if std::env::var("HOME").is_ok() {
-            let path = get_claude_projects_dir().unwrap();
+            let path = get_claude_projects_dir();
             assert!(path.ends_with("projects"));
             assert!(path.to_string_lossy().contains(".claude"));
         }

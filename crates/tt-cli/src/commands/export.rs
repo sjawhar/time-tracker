@@ -110,10 +110,19 @@ fn default_data_dir() -> PathBuf {
 }
 
 /// Returns the default Claude projects directory.
+/// Returns the default Claude projects directory.
+///
+/// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
 fn default_claude_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .map_or_else(
+            |_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".claude")
+            },
+            PathBuf::from,
+        )
         .join("projects")
 }
 

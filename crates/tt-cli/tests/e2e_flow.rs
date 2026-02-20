@@ -103,6 +103,7 @@ fn test_export_incremental() {
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
         .unwrap();
@@ -110,6 +111,7 @@ fn test_export_incremental() {
     // First ingest
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
         .arg("--pane")
@@ -124,6 +126,7 @@ fn test_export_incremental() {
     // First export
     let output1 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -138,6 +141,7 @@ fn test_export_incremental() {
     // Second export without new events
     let output2 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -156,6 +160,7 @@ fn test_export_incremental() {
     std::thread::sleep(std::time::Duration::from_millis(600));
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
         .arg("--pane")
@@ -170,6 +175,7 @@ fn test_export_incremental() {
     // Third export should have both events
     let output3 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -291,6 +297,7 @@ fn test_export_empty_events_file() {
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
         .unwrap();
@@ -300,6 +307,7 @@ fn test_export_empty_events_file() {
 
     let output = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -354,6 +362,7 @@ fn test_export_large_number_of_events() {
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
         .unwrap();
@@ -367,6 +376,7 @@ fn test_export_large_number_of_events() {
 
         let _ = Command::new(tt_binary())
             .env("HOME", temp.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
             .arg("ingest")
             .arg("pane-focus")
             .arg("--pane")
@@ -381,6 +391,7 @@ fn test_export_large_number_of_events() {
 
     let output = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
