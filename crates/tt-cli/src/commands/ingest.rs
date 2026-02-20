@@ -422,7 +422,94 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         println!("  ... and {} more projects", project_list.len() - 10);
     }
 
+    // Auto-assign unassigned events to existing streams based on cwd matching.
+    let assigned =
+        auto_assign_events_to_streams(db).context("failed to auto-assign events to streams")?;
+    if assigned > 0 {
+        println!("Auto-assigned {assigned} events to streams (by cwd)");
+    }
+
     Ok(())
+}
+
+/// Extracts the relative project path by stripping the home directory prefix.
+///
+/// `/home/sami/time-tracker/default` → `time-tracker/default`
+/// `/home/ubuntu/agent-c/taiga`      → `agent-c/taiga`
+fn project_suffix(cwd: &str) -> Option<&str> {
+    let path = cwd.strip_prefix("/home/")?;
+    // Skip the username component
+    let after_user = path.find('/')? + 1;
+    let suffix = &path[after_user..];
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix)
+    }
+}
+
+/// Auto-assign unassigned events to existing streams based on `cwd` matching.
+///
+/// First tries exact `cwd` match, then falls back to matching by project suffix
+/// (path after `/home/<user>/`). This handles multi-machine setups where the
+/// same project lives under different home directories.
+///
+/// Returns the number of newly assigned events.
+fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
+    use std::collections::HashMap;
+
+    // Build cwd → stream_id and suffix → stream_id mappings from assigned events.
+    let streams = db.get_streams().context("failed to get streams")?;
+    let mut cwd_to_stream: HashMap<String, String> = HashMap::new();
+    let mut suffix_to_stream: HashMap<String, String> = HashMap::new();
+
+    for stream in &streams {
+        let events = db
+            .get_events_by_stream(&stream.id)
+            .context("failed to get events for stream")?;
+        for event in &events {
+            if let Some(cwd) = &event.cwd {
+                cwd_to_stream
+                    .entry(cwd.clone())
+                    .or_insert_with(|| stream.id.clone());
+                if let Some(suffix) = project_suffix(cwd) {
+                    suffix_to_stream
+                        .entry(suffix.to_string())
+                        .or_insert_with(|| stream.id.clone());
+                }
+            }
+        }
+    }
+
+    if cwd_to_stream.is_empty() && suffix_to_stream.is_empty() {
+        return Ok(0);
+    }
+
+    // Find unassigned events whose cwd matches an existing stream.
+    let unassigned = db
+        .get_events_without_stream()
+        .context("failed to get unassigned events")?;
+
+    let assignments: Vec<(String, String)> = unassigned
+        .iter()
+        .filter_map(|event| {
+            let cwd = event.cwd.as_ref()?;
+            // Try exact match first, then suffix match
+            let stream_id = cwd_to_stream
+                .get(cwd.as_str())
+                .or_else(|| project_suffix(cwd).and_then(|suffix| suffix_to_stream.get(suffix)))?;
+            Some((event.id.clone(), stream_id.clone()))
+        })
+        .collect();
+
+    if assignments.is_empty() {
+        return Ok(0);
+    }
+
+    let count = db
+        .assign_events_to_stream(&assignments, "auto")
+        .context("failed to assign events to streams")?;
+    Ok(count)
 }
 
 /// Create events from an agent session.

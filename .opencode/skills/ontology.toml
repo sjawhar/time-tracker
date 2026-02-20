@@ -11,23 +11,15 @@
 # These map to git repositories, directories, or logical projects.
 # Add your own projects as needed.
 names = [
-  "time-tracker",
-  "pivot",
+  "monty",
+  "taiga",
+  "tasks",
   "legion",
-  "dotfiles",
-  "3pra",
-  "capabilities",
-  "data_pipeline",
-  "hiring",
-  "human_uplift",
-  "infra",
-  "inspect_action",
-  "managing",
-  "middleman",
-  "monitorability",
-  "org",
-  "tasks_agents",
-  "vivaria",
+  "eval-pipeline",
+  "pivot",
+  "hawk",
+  "time-tracker",
+  "other",
 ]
 
 [activities]

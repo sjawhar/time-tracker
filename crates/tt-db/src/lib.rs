@@ -763,6 +763,18 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Deletes all events from a specific machine.
+    ///
+    /// Used to force a clean re-import when the export format changes.
+    /// Returns the number of events deleted.
+    pub fn delete_events_by_machine(&self, machine_id: &str) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "DELETE FROM events WHERE machine_id = ?1",
+            params![machine_id],
+        )?;
+        Ok(count as u64)
+    }
+
     /// Deletes streams that have no events assigned to them.
     ///
     /// Returns the number of streams deleted.
@@ -1324,10 +1336,10 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare("SELECT last_event_id FROM machines WHERE label = ?1")?;
-        let result = stmt
+        let result: Option<Option<String>> = stmt
             .query_row(params![label], |row| row.get(0))
             .optional()?;
-        Ok(result)
+        Ok(result.flatten())
     }
 
     /// Gets the most recent event ID for a specific machine.

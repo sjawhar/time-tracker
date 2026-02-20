@@ -995,6 +995,7 @@ dependencies = [
  "iana-time-zone",
  "insta",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,7 +1,7 @@
 //! Export command for syncing events to local machine.
 //!
-//! This module reads events from both `events.jsonl` (tmux events) and
-//! Claude Code session logs, outputting a combined JSONL stream to stdout.
+//! This module reads events from `events.jsonl` (tmux events), Claude Code
+//! session logs, and `OpenCode` sessions, outputting a combined JSONL stream.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -9,10 +9,15 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Event output format matching the data model spec.
+///
+/// Uses `#[serde(flatten)]` on `data` so that fields like `cwd`, `session_id`,
+/// and `action` are emitted at the top level — matching what `StoredEvent`
+/// expects during import.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportEvent {
     pub id: String,
@@ -20,6 +25,7 @@ pub struct ExportEvent {
     pub source: String,
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(flatten)]
     pub data: Value,
 }
 
@@ -40,6 +46,8 @@ pub struct UserMessageData {
     pub session_id: String,
     pub length: usize,
     pub has_image: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Data for `agent_tool_use` events.
@@ -50,6 +58,8 @@ pub struct AgentToolUseData {
     pub tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Manifest tracking byte offsets for incremental Claude log parsing.
@@ -126,6 +136,12 @@ fn default_claude_dir() -> PathBuf {
         .join("projects")
 }
 
+fn default_opencode_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/share/opencode/opencode.db")
+}
+
 /// Runs the export command, outputting all events to stdout.
 pub fn run(after: Option<&str>) -> Result<()> {
     let identity = crate::machine::require_machine_identity()?;
@@ -135,6 +151,7 @@ pub fn run(after: Option<&str>) -> Result<()> {
         &data_dir,
         &default_claude_dir(),
         &state_dir,
+        Some(&default_opencode_db_path()),
         &identity.machine_id,
         after,
         &mut std::io::stdout(),
@@ -146,6 +163,7 @@ fn run_impl(
     data_dir: &Path,
     claude_dir: &Path,
     state_dir: &Path,
+    opencode_db: Option<&Path>,
     machine_id: &str,
     after: Option<&str>,
     output: &mut dyn Write,
@@ -160,6 +178,12 @@ fn run_impl(
     if claude_dir.exists() {
         let manifest_path = state_dir.join("claude-manifest.json");
         export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
+    }
+
+    if let Some(oc_db) = opencode_db {
+        if oc_db.exists() {
+            export_opencode_events(oc_db, machine_id, output)?;
+        }
     }
 
     Ok(())
@@ -272,8 +296,9 @@ fn export_claude_events(
     let logs = discover_claude_logs(claude_dir)?;
     let mut manifest = ClaudeManifest::load(manifest_path);
 
-    // Track seen sessions across ALL files to avoid duplicate session start events
-    let mut seen_sessions: HashSet<String> = HashSet::new();
+    // Track seen sessions across ALL files to avoid duplicate session start events.
+    // Maps session_id → cwd so cwd is propagated to all events in the session.
+    let mut seen_sessions: HashMap<String, Option<String>> = HashMap::new();
     // Track which files we've processed (to clean up deleted files from manifest)
     let mut processed_files: HashSet<PathBuf> = HashSet::new();
 
@@ -311,6 +336,115 @@ fn export_claude_events(
     Ok(())
 }
 
+fn export_opencode_events(
+    opencode_db: &Path,
+    machine_id: &str,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let sessions = tt_core::opencode::scan_opencode_sessions(opencode_db).with_context(|| {
+        format!(
+            "failed to scan OpenCode sessions from {}",
+            opencode_db.display()
+        )
+    })?;
+
+    for session in sessions {
+        let start_ts = session
+            .start_time
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let start_event = ExportEvent {
+            id: format!(
+                "{machine_id}:remote.agent:agent_session:{start_ts}:{}:started",
+                session.session_id
+            ),
+            timestamp: start_ts,
+            source: "remote.agent".to_string(),
+            event_type: "agent_session".to_string(),
+            data: serde_json::to_value(AgentSessionData {
+                action: "started".to_string(),
+                agent: "opencode".to_string(),
+                session_id: session.session_id.clone(),
+                cwd: Some(session.project_path.clone()),
+            })?,
+        };
+        writeln!(output, "{}", serde_json::to_string(&start_event)?)?;
+
+        let mut user_ids_seen: HashMap<String, usize> = HashMap::new();
+        for user_ts in &session.user_message_timestamps {
+            let timestamp = user_ts.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let base_id = format!(
+                "{machine_id}:remote.agent:user_message:{timestamp}:{}",
+                session.session_id
+            );
+            let counter = user_ids_seen.entry(base_id.clone()).or_insert(0);
+            let id = if *counter == 0 {
+                base_id
+            } else {
+                format!("{base_id}:{counter}")
+            };
+            *counter += 1;
+
+            let event = ExportEvent {
+                id,
+                timestamp,
+                source: "remote.agent".to_string(),
+                event_type: "user_message".to_string(),
+                data: serde_json::to_value(UserMessageData {
+                    agent: "opencode".to_string(),
+                    session_id: session.session_id.clone(),
+                    length: 0,
+                    has_image: false,
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&event)?)?;
+        }
+
+        for (index, tool_ts) in session.tool_call_timestamps.iter().enumerate() {
+            let timestamp = tool_ts.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let event = ExportEvent {
+                id: format!(
+                    "{machine_id}:remote.agent:agent_tool_use:{timestamp}:{}:{index}",
+                    session.session_id
+                ),
+                timestamp,
+                source: "remote.agent".to_string(),
+                event_type: "agent_tool_use".to_string(),
+                data: serde_json::to_value(AgentToolUseData {
+                    agent: "opencode".to_string(),
+                    session_id: session.session_id.clone(),
+                    tool: "unknown".to_string(),
+                    file: None,
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&event)?)?;
+        }
+
+        if let Some(end_time) = session.end_time {
+            let end_ts = end_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let end_event = ExportEvent {
+                id: format!(
+                    "{machine_id}:remote.agent:agent_session:{end_ts}:{}:ended",
+                    session.session_id
+                ),
+                timestamp: end_ts,
+                source: "remote.agent".to_string(),
+                event_type: "agent_session".to_string(),
+                data: serde_json::to_value(AgentSessionData {
+                    action: "ended".to_string(),
+                    agent: "opencode".to_string(),
+                    session_id: session.session_id.clone(),
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Entry types to filter out (not events).
 const FILTERED_TYPES: &[&str] = &["progress", "file-history-snapshot", "summary", "system"];
 
@@ -318,7 +452,7 @@ const FILTERED_TYPES: &[&str] = &["progress", "file-history-snapshot", "summary"
 /// Returns the byte offset after the last successfully parsed line.
 fn export_single_claude_log(
     log_path: &Path,
-    seen_sessions: &mut HashSet<String>,
+    seen_sessions: &mut HashMap<String, Option<String>>,
     machine_id: &str,
     output: &mut dyn Write,
     start_offset: u64,
@@ -387,9 +521,12 @@ fn export_single_claude_log(
 }
 
 /// Processes a single Claude log entry and emits events.
+///
+/// `seen_sessions` maps session ID → cwd so that `cwd` discovered from the
+/// first entry (session start) is propagated to all subsequent events.
 fn process_claude_entry(
     entry: &Value,
-    seen_sessions: &mut HashSet<String>,
+    seen_sessions: &mut HashMap<String, Option<String>>,
     machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
@@ -409,20 +546,39 @@ fn process_claude_entry(
         return Ok(());
     };
 
-    // Get cwd if available
-    let cwd = entry.get("cwd").and_then(Value::as_str).map(String::from);
+    // Get cwd: prefer the entry's own cwd, fall back to the session's stored cwd
+    let entry_cwd = entry.get("cwd").and_then(Value::as_str).map(String::from);
+    let session_cwd = seen_sessions.get(session_id).and_then(Clone::clone);
+    let cwd = entry_cwd.or(session_cwd);
 
     // Emit session start event (first time we see this session)
-    // Check contains() first to avoid allocation when session already seen
-    if !seen_sessions.contains(session_id) {
+    if !seen_sessions.contains_key(session_id) {
         emit_session_start(session_id, timestamp, cwd.as_deref(), machine_id, output)?;
-        seen_sessions.insert(session_id.to_string());
+        seen_sessions.insert(session_id.to_string(), cwd.clone());
     }
 
     // Process based on entry type
     match entry_type {
-        "user" => emit_user_message(entry, session_id, timestamp, machine_id, output)?,
-        "assistant" => emit_tool_uses(entry, session_id, timestamp, machine_id, output)?,
+        "user" => {
+            emit_user_message(
+                entry,
+                session_id,
+                timestamp,
+                cwd.as_deref(),
+                machine_id,
+                output,
+            )?;
+        }
+        "assistant" => {
+            emit_tool_uses(
+                entry,
+                session_id,
+                timestamp,
+                cwd.as_deref(),
+                machine_id,
+                output,
+            )?;
+        }
         _ => {}
     }
 
@@ -459,6 +615,7 @@ fn emit_user_message(
     entry: &Value,
     session_id: &str,
     timestamp: &str,
+    cwd: Option<&str>,
     machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
@@ -487,6 +644,7 @@ fn emit_user_message(
             session_id: session_id.to_string(),
             length,
             has_image,
+            cwd: cwd.map(String::from),
         })?,
     };
     let json = serde_json::to_string(&event)?;
@@ -499,6 +657,7 @@ fn emit_tool_uses(
     entry: &Value,
     session_id: &str,
     timestamp: &str,
+    cwd: Option<&str>,
     machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
@@ -533,6 +692,7 @@ fn emit_tool_uses(
                 session_id: session_id.to_string(),
                 tool: tool_name.to_string(),
                 file,
+                cwd: cwd.map(String::from),
             })?,
         };
         let json = serde_json::to_string(&event)?;
@@ -597,7 +757,10 @@ fn extract_file(tool: &str, input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{SecondsFormat, TimeZone, Utc};
+    use rusqlite::Connection;
     use std::io::Cursor;
+    use std::path::Path;
     use tempfile::TempDir;
 
     const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
@@ -611,6 +774,106 @@ mod tests {
         (temp, data_dir, claude_dir)
     }
 
+    fn create_test_opencode_db(base_dir: &Path) -> PathBuf {
+        let db_path = base_dir.join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL DEFAULT '',
+                parent_id TEXT,
+                slug TEXT NOT NULL DEFAULT '',
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX message_session_idx ON message(session_id);
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX part_message_idx ON part(message_id);
+            CREATE INDEX part_session_idx ON part(session_id);",
+        )
+        .unwrap();
+        db_path
+    }
+
+    fn insert_opencode_session(
+        db_path: &Path,
+        id: &str,
+        directory: &str,
+        created_ms: i64,
+        updated_ms: i64,
+    ) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4)",
+            (id, directory, created_ms, updated_ms),
+        )
+        .unwrap();
+    }
+
+    fn insert_opencode_message(
+        db_path: &Path,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        created_ms: i64,
+    ) {
+        let conn = Connection::open(db_path).unwrap();
+        let data = serde_json::json!({ "role": role }).to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (id, session_id, created_ms, created_ms, data),
+        )
+        .unwrap();
+    }
+
+    fn insert_opencode_part(
+        db_path: &Path,
+        id: &str,
+        message_id: &str,
+        session_id: &str,
+        part_type: &str,
+        text: Option<&str>,
+        created_ms: i64,
+    ) {
+        let conn = Connection::open(db_path).unwrap();
+        let mut data = serde_json::json!({ "type": part_type });
+        if let Some(value) = text {
+            data["text"] = serde_json::Value::String(value.to_string());
+        }
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                id,
+                message_id,
+                session_id,
+                created_ms,
+                created_ms,
+                data.to_string(),
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_empty_data_directory() {
         let (_temp, data_dir, claude_dir) = setup_test_dirs();
@@ -620,6 +883,7 @@ mod tests {
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -642,6 +906,7 @@ mod tests {
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -668,6 +933,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -693,6 +959,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -723,6 +990,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -738,8 +1006,8 @@ not valid json
         // First event should be session start
         let session_event: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(session_event["type"], "agent_session");
-        assert_eq!(session_event["data"]["action"], "started");
-        assert_eq!(session_event["data"]["session_id"], "sess123");
+        assert_eq!(session_event["action"], "started");
+        assert_eq!(session_event["session_id"], "sess123");
     }
 
     #[test]
@@ -761,6 +1029,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -773,8 +1042,8 @@ not valid json
         // Second event should be user message
         let user_event: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(user_event["type"], "user_message");
-        assert_eq!(user_event["data"]["length"], 11); // "hello world".len()
-        assert_eq!(user_event["data"]["has_image"], false);
+        assert_eq!(user_event["length"], 11); // "hello world".len()
+        assert_eq!(user_event["has_image"], false);
     }
 
     #[test]
@@ -797,6 +1066,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -831,6 +1101,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -845,8 +1116,8 @@ not valid json
 
         let tool_event: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(tool_event["type"], "agent_tool_use");
-        assert_eq!(tool_event["data"]["tool"], "Read");
-        assert_eq!(tool_event["data"]["file"], "/home/user/file.rs");
+        assert_eq!(tool_event["tool"], "Read");
+        assert_eq!(tool_event["file"], "/home/user/file.rs");
     }
 
     #[test]
@@ -868,6 +1139,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -900,6 +1172,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -929,6 +1202,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -987,6 +1261,7 @@ not valid json
             &data_dir1,
             &claude_dir1,
             &data_dir1,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -998,6 +1273,7 @@ not valid json
             &data_dir2,
             &claude_dir2,
             &data_dir2,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1031,6 +1307,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1041,6 +1318,266 @@ not valid json
 
         // tmux event + session start + user message
         assert_eq!(output_str.lines().count(), 3);
+    }
+
+    #[test]
+    fn test_opencode_export_empty_db() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+        let mut output = Cursor::new(Vec::new());
+
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        assert!(output.get_ref().is_empty());
+    }
+
+    #[test]
+    fn test_opencode_export_session_events() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_oc_1",
+            "/home/user/project-a",
+            1_700_000_000_000,
+            1_700_000_070_000,
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_oc_1",
+            "user",
+            1_700_000_010_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_oc_1",
+            "text",
+            Some("hello"),
+            1_700_000_010_000,
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m2",
+            "ses_oc_1",
+            "assistant",
+            1_700_000_020_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p2",
+            "m2",
+            "ses_oc_1",
+            "tool",
+            None,
+            1_700_000_020_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p3",
+            "m2",
+            "ses_oc_1",
+            "tool",
+            None,
+            1_700_000_020_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let events: Vec<Value> = output_str
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 5);
+
+        assert_eq!(events[0]["type"], "agent_session");
+        assert_eq!(events[0]["action"], "started");
+        assert_eq!(events[0]["agent"], "opencode");
+        assert_eq!(events[0]["session_id"], "ses_oc_1");
+        assert_eq!(events[0]["cwd"], "/home/user/project-a");
+
+        assert_eq!(events[1]["type"], "user_message");
+        assert_eq!(events[1]["agent"], "opencode");
+        assert_eq!(events[1]["session_id"], "ses_oc_1");
+        assert_eq!(events[1]["length"], 0);
+        assert_eq!(events[1]["has_image"], false);
+
+        assert_eq!(events[2]["type"], "agent_tool_use");
+        assert_eq!(events[2]["agent"], "opencode");
+        assert_eq!(events[2]["tool"], "unknown");
+        assert!(events[2]["file"].is_null());
+        assert_eq!(events[3]["type"], "agent_tool_use");
+
+        assert_eq!(events[4]["type"], "agent_session");
+        assert_eq!(events[4]["action"], "ended");
+        assert_eq!(events[4]["agent"], "opencode");
+
+        let ts = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap()
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        assert_eq!(
+            events[0]["id"],
+            format!("{TEST_MACHINE_ID}:remote.agent:agent_session:{ts}:ses_oc_1:started")
+        );
+    }
+
+    #[test]
+    fn test_opencode_export_deterministic_ids() {
+        let temp1 = TempDir::new().unwrap();
+        let data_dir1 = temp1.path().join(".time-tracker");
+        let claude_dir1 = temp1.path().join(".claude").join("projects");
+        fs::create_dir_all(&data_dir1).unwrap();
+        fs::create_dir_all(&claude_dir1).unwrap();
+        let opencode_db1 = create_test_opencode_db(data_dir1.as_path());
+
+        let temp2 = TempDir::new().unwrap();
+        let data_dir2 = temp2.path().join(".time-tracker");
+        let claude_dir2 = temp2.path().join(".claude").join("projects");
+        fs::create_dir_all(&data_dir2).unwrap();
+        fs::create_dir_all(&claude_dir2).unwrap();
+        let opencode_db2 = create_test_opencode_db(data_dir2.as_path());
+
+        for db_path in [opencode_db1.as_path(), opencode_db2.as_path()] {
+            insert_opencode_session(
+                db_path,
+                "ses_same",
+                "/home/user/project-b",
+                1_700_000_000_000,
+                1_700_000_060_000,
+            );
+            insert_opencode_message(db_path, "m1", "ses_same", "user", 1_700_000_005_000);
+            insert_opencode_part(
+                db_path,
+                "p1",
+                "m1",
+                "ses_same",
+                "text",
+                Some("hello"),
+                1_700_000_005_000,
+            );
+            insert_opencode_message(db_path, "m2", "ses_same", "assistant", 1_700_000_020_000);
+            insert_opencode_part(
+                db_path,
+                "p2",
+                "m2",
+                "ses_same",
+                "tool",
+                None,
+                1_700_000_020_000,
+            );
+        }
+
+        let mut output1 = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir1,
+            &claude_dir1,
+            &data_dir1,
+            Some(opencode_db1.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
+
+        let mut output2 = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir2,
+            &claude_dir2,
+            &data_dir2,
+            Some(opencode_db2.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
+
+        assert_eq!(output1.into_inner(), output2.into_inner());
+    }
+
+    #[test]
+    fn test_opencode_combined_with_tmux_and_claude() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        let tmux_event = r#"{"id":"tmux1","timestamp":"2025-01-29T11:00:00Z","source":"remote.tmux","type":"tmux_pane_focus","data":{}}"#;
+        fs::write(data_dir.join("events.jsonl"), format!("{tmux_event}\n")).unwrap();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let claude_entry = r#"{"type":"user","sessionId":"sess123","timestamp":"2025-01-29T12:00:00Z","message":{"content":"hi"}}"#;
+        fs::write(
+            project_dir.join("session.jsonl"),
+            format!("{claude_entry}\n"),
+        )
+        .unwrap();
+
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_oc_combined",
+            "/home/user/project-c",
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_oc_combined",
+            "user",
+            1_700_000_005_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_oc_combined",
+            "text",
+            Some("hello"),
+            1_700_000_005_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        assert_eq!(output_str.lines().count(), 6);
+        assert!(output_str.contains("\"source\":\"remote.tmux\""));
+        assert!(output_str.contains("\"agent\":\"claude-code\""));
+        assert!(output_str.contains("\"agent\":\"opencode\""));
     }
 
     #[test]
@@ -1062,6 +1599,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1142,6 +1680,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1181,6 +1720,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1225,6 +1765,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -1244,6 +1785,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1296,6 +1838,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1328,6 +1871,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -1357,6 +1901,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1373,7 +1918,7 @@ not valid json
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         let session_event = &events[0];
-        assert_eq!(session_event["data"]["session_id"], "sess2");
+        assert_eq!(session_event["session_id"], "sess2");
     }
 
     #[test]
@@ -1393,6 +1938,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -1414,6 +1960,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1450,6 +1997,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -1481,6 +2029,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1497,8 +2046,8 @@ not valid json
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(events[0]["data"]["session_id"], "sess1");
-        assert_eq!(events[1]["data"]["session_id"], "sess1");
+        assert_eq!(events[0]["session_id"], "sess1");
+        assert_eq!(events[1]["session_id"], "sess1");
     }
 
     #[test]
@@ -1518,6 +2067,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output1,
@@ -1530,6 +2080,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output2,
@@ -1556,6 +2107,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             TEST_MACHINE_ID,
             None,
             &mut output,
@@ -1632,6 +2184,7 @@ not valid json
             &data_dir,
             &temp.path().join(".claude/projects"),
             &state_dir,
+            None,
             TEST_MACHINE_ID,
             Some(&after_id),
             &mut output,

@@ -35,12 +35,12 @@ Computes direct (human focus) and delegated (agent) time per stream.
 - AFK with `idle_duration_ms` retroactively subtracts idle time (capped at attention_window)
 - Agent sessions without tool_use events get zero delegated time
 - Agent timeout: no tool_use for `agent_timeout_ms` → session ends at last tool_use
-- `user_message` events reset the attention window (like scroll)
+- `user_message` events establish focus on their stream (like `tmux_pane_focus`) — sending a message to an agent counts as direct work
 - Focus hierarchy: terminal uses tmux stream, browser uses browser stream
 
 ### Testing
 
-`TestEvent` struct with builder methods: `tmux_focus()`, `afk_change()`, `agent_session()`, `agent_tool_use()`, `user_message()`, `window_focus()`, `browser_tab()`. 30+ test cases cover edge cases (gaps, capping, concurrent agents, AFK retroactive).
+`TestEvent` struct with builder methods: `tmux_focus()`, `afk_change()`, `agent_session()`, `agent_tool_use()`, `user_message()`, `window_focus()`, `browser_tab()`. 34 test cases cover edge cases (gaps, capping, concurrent agents, AFK retroactive, user message focus).
 
 ## Session Scanning (`session.rs` + `opencode.rs`)
 
