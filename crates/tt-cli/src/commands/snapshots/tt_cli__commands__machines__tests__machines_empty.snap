@@ -1,0 +1,6 @@
+---
+source: crates/tt-cli/src/commands/machines.rs
+assertion_line: 54
+expression: output
+---
+No machines registered yet. Run 'tt sync <remote>' to import from a remote.

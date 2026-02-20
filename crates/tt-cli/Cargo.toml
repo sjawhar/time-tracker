@@ -28,6 +28,7 @@ dirs.workspace = true
 fs2 = "0.4"
 regex = "1.11"
 uuid.workspace = true
+hostname.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

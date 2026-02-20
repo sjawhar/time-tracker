@@ -106,49 +106,76 @@ impl ClaudeManifest {
 
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".time-tracker")
+    crate::config::dirs_data_path().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Returns the default Claude projects directory.
+/// Returns the default Claude projects directory.
+///
+/// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
 fn default_claude_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .map_or_else(
+            |_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".claude")
+            },
+            PathBuf::from,
+        )
         .join("projects")
 }
 
 /// Runs the export command, outputting all events to stdout.
-pub fn run() -> Result<()> {
+pub fn run(after: Option<&str>) -> Result<()> {
+    let identity = crate::machine::require_machine_identity()?;
+    let data_dir = default_data_dir();
+    let state_dir = crate::config::dirs_state_path().unwrap_or_else(|| data_dir.clone());
     run_impl(
-        &default_data_dir(),
+        &data_dir,
         &default_claude_dir(),
+        &state_dir,
+        &identity.machine_id,
+        after,
         &mut std::io::stdout(),
     )
 }
 
 /// Implementation of export that allows injecting paths for testing.
-fn run_impl(data_dir: &Path, claude_dir: &Path, output: &mut dyn Write) -> Result<()> {
+fn run_impl(
+    data_dir: &Path,
+    claude_dir: &Path,
+    state_dir: &Path,
+    machine_id: &str,
+    after: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<()> {
     // Export tmux events
     let events_file = data_dir.join("events.jsonl");
     if events_file.exists() {
-        export_tmux_events(&events_file, output)?;
+        export_tmux_events(&events_file, after, output)?;
     }
 
     // Export Claude events with incremental parsing
     if claude_dir.exists() {
-        let manifest_path = data_dir.join("claude-manifest.json");
-        export_claude_events(claude_dir, &manifest_path, output)?;
+        let manifest_path = state_dir.join("claude-manifest.json");
+        export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
     }
 
     Ok(())
 }
 
 /// Exports tmux events from events.jsonl, passing through valid lines.
-fn export_tmux_events(events_file: &Path, output: &mut dyn Write) -> Result<()> {
+/// When `after` is provided, exports events strictly after the matching event
+/// (the marker event itself is excluded).
+fn export_tmux_events(
+    events_file: &Path,
+    after: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<()> {
     let file = File::open(events_file).context("failed to open events.jsonl")?;
     let reader = BufReader::new(file);
+    let mut past_marker = after.is_none();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = match line {
@@ -161,6 +188,20 @@ fn export_tmux_events(events_file: &Path, output: &mut dyn Write) -> Result<()> 
 
         // Skip empty lines
         if line.trim().is_empty() {
+            continue;
+        }
+
+        if !past_marker {
+            if let Some(after_id) = after {
+                // Parse the id field specifically rather than substring matching
+                // to avoid false matches in cwd or data fields.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("id").and_then(serde_json::Value::as_str) == Some(after_id) {
+                        past_marker = true;
+                    }
+                }
+            }
+            // Skip the marker event itself and everything before it
             continue;
         }
 
@@ -225,6 +266,7 @@ fn discover_claude_logs(claude_dir: &Path) -> Result<Vec<PathBuf>> {
 fn export_claude_events(
     claude_dir: &Path,
     manifest_path: &Path,
+    machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
     let logs = discover_claude_logs(claude_dir)?;
@@ -237,7 +279,13 @@ fn export_claude_events(
 
     for log_path in logs {
         let start_offset = manifest.sessions.get(&log_path).copied().unwrap_or(0);
-        match export_single_claude_log(&log_path, &mut seen_sessions, output, start_offset) {
+        match export_single_claude_log(
+            &log_path,
+            &mut seen_sessions,
+            machine_id,
+            output,
+            start_offset,
+        ) {
             Ok(final_offset) => {
                 manifest.sessions.insert(log_path.clone(), final_offset);
                 processed_files.insert(log_path);
@@ -271,6 +319,7 @@ const FILTERED_TYPES: &[&str] = &["progress", "file-history-snapshot", "summary"
 fn export_single_claude_log(
     log_path: &Path,
     seen_sessions: &mut HashSet<String>,
+    machine_id: &str,
     output: &mut dyn Write,
     start_offset: u64,
 ) -> Result<u64> {
@@ -324,7 +373,7 @@ fn export_single_claude_log(
                     }
                 };
 
-                process_claude_entry(&entry, seen_sessions, output)?;
+                process_claude_entry(&entry, seen_sessions, machine_id, output)?;
                 last_good_position = current_position;
             }
             Err(e) => {
@@ -341,6 +390,7 @@ fn export_single_claude_log(
 fn process_claude_entry(
     entry: &Value,
     seen_sessions: &mut HashSet<String>,
+    machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
     // Extract session ID - required for all events
@@ -365,14 +415,14 @@ fn process_claude_entry(
     // Emit session start event (first time we see this session)
     // Check contains() first to avoid allocation when session already seen
     if !seen_sessions.contains(session_id) {
-        emit_session_start(session_id, timestamp, cwd.as_deref(), output)?;
+        emit_session_start(session_id, timestamp, cwd.as_deref(), machine_id, output)?;
         seen_sessions.insert(session_id.to_string());
     }
 
     // Process based on entry type
     match entry_type {
-        "user" => emit_user_message(entry, session_id, timestamp, output)?,
-        "assistant" => emit_tool_uses(entry, session_id, timestamp, output)?,
+        "user" => emit_user_message(entry, session_id, timestamp, machine_id, output)?,
+        "assistant" => emit_tool_uses(entry, session_id, timestamp, machine_id, output)?,
         _ => {}
     }
 
@@ -384,10 +434,11 @@ fn emit_session_start(
     session_id: &str,
     timestamp: &str,
     cwd: Option<&str>,
+    machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
     let event = ExportEvent {
-        id: format!("remote.agent:agent_session:{timestamp}:{session_id}:started"),
+        id: format!("{machine_id}:remote.agent:agent_session:{timestamp}:{session_id}:started"),
         timestamp: timestamp.to_string(),
         source: "remote.agent".to_string(),
         event_type: "agent_session".to_string(),
@@ -408,6 +459,7 @@ fn emit_user_message(
     entry: &Value,
     session_id: &str,
     timestamp: &str,
+    machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
     // Check if this is a tool_result message (filter those out)
@@ -421,7 +473,7 @@ fn emit_user_message(
 
     let event = ExportEvent {
         id: format!(
-            "remote.agent:user_message:{timestamp}:{}",
+            "{machine_id}:remote.agent:user_message:{timestamp}:{}",
             entry
                 .get("uuid")
                 .and_then(Value::as_str)
@@ -447,6 +499,7 @@ fn emit_tool_uses(
     entry: &Value,
     session_id: &str,
     timestamp: &str,
+    machine_id: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
     let Some(content) = entry
@@ -471,7 +524,7 @@ fn emit_tool_uses(
         let file = extract_file(tool_name, &input);
 
         let event = ExportEvent {
-            id: format!("remote.agent:agent_tool_use:{timestamp}:{tool_id}"),
+            id: format!("{machine_id}:remote.agent:agent_tool_use:{timestamp}:{tool_id}"),
             timestamp: timestamp.to_string(),
             source: "remote.agent".to_string(),
             event_type: "agent_tool_use".to_string(),
@@ -547,6 +600,8 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
 
+    const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
     fn setup_test_dirs() -> (TempDir, PathBuf, PathBuf) {
         let temp = TempDir::new().unwrap();
         let data_dir = temp.path().join(".time-tracker");
@@ -561,7 +616,14 @@ mod tests {
         let (_temp, data_dir, claude_dir) = setup_test_dirs();
         let mut output = Cursor::new(Vec::new());
 
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        );
 
         assert!(result.is_ok());
         assert!(output.get_ref().is_empty());
@@ -576,7 +638,15 @@ mod tests {
         fs::write(data_dir.join("events.jsonl"), format!("{event}\n")).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.trim(), event);
@@ -594,7 +664,15 @@ not valid json
         fs::write(data_dir.join("events.jsonl"), content).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.lines().count(), 2); // Only valid lines
@@ -611,7 +689,15 @@ not valid json
         fs::write(data_dir.join("events.jsonl"), content).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         assert_eq!(output_str.lines().count(), 2);
@@ -633,7 +719,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -663,7 +757,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -691,7 +793,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -717,7 +827,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -746,7 +864,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -770,7 +896,15 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         // No events should be emitted for filtered types
         assert!(output.get_ref().is_empty());
@@ -791,7 +925,15 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
@@ -841,10 +983,26 @@ not valid json
 
         // Run on both directories
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir1, &claude_dir1, &mut output1).unwrap();
+        run_impl(
+            &data_dir1,
+            &claude_dir1,
+            &data_dir1,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
 
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir2, &claude_dir2, &mut output2).unwrap();
+        run_impl(
+            &data_dir2,
+            &claude_dir2,
+            &data_dir2,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
 
         // Output should be identical (same IDs for same input)
         assert_eq!(output1.into_inner(), output2.into_inner());
@@ -869,7 +1027,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -892,7 +1058,15 @@ not valid json
         .unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         // No output because subagents are excluded
         assert!(output.get_ref().is_empty());
@@ -964,7 +1138,15 @@ not valid json
         fs::write(project_dir.join("session.jsonl"), entries).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
 
@@ -995,7 +1177,15 @@ not valid json
         fs::write(&log_path, format!("{entry}\n")).unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         // Manifest should be created
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1031,7 +1221,15 @@ not valid json
 
         // First export - full parse
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
         let output1_str = String::from_utf8(output1.into_inner()).unwrap();
         let first_count = output1_str.lines().count();
 
@@ -1042,7 +1240,15 @@ not valid json
 
         // Second export - should only parse new bytes
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         let second_count = output2_str.lines().count();
 
@@ -1086,7 +1292,14 @@ not valid json
 
         // Export should succeed with full re-parse
         let mut output = Cursor::new(Vec::new());
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        );
         assert!(
             result.is_ok(),
             "export should succeed despite corrupted manifest"
@@ -1111,7 +1324,15 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
 
         // Record the offset
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1132,7 +1353,15 @@ not valid json
 
         // Second export should restart from 0
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
 
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         // Should have session_start + user_message = 2 (full re-parse from start)
@@ -1160,7 +1389,15 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
 
         // Verify manifest has the file
         let manifest_path = data_dir.join("claude-manifest.json");
@@ -1173,7 +1410,15 @@ not valid json
 
         // Second export
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
 
         // Manifest should no longer contain the deleted file
         let manifest: ClaudeManifest =
@@ -1201,7 +1446,15 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
         let output1_str = String::from_utf8(output1.into_inner()).unwrap();
         // 2 sessions x (session_start + user_message) = 4 events
         assert_eq!(output1_str.lines().count(), 4);
@@ -1224,7 +1477,15 @@ not valid json
 
         // Second export
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
 
         let output2_str = String::from_utf8(output2.into_inner()).unwrap();
         // session_start (re-emitted for sess1) + user_message = 2 events
@@ -1253,11 +1514,27 @@ not valid json
 
         // First export
         let mut output1 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output1).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output1,
+        )
+        .unwrap();
 
         // Second export without any changes
         let mut output2 = Cursor::new(Vec::new());
-        run_impl(&data_dir, &claude_dir, &mut output2).unwrap();
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output2,
+        )
+        .unwrap();
 
         // Should have no output (no new content)
         assert!(output2.get_ref().is_empty());
@@ -1275,7 +1552,14 @@ not valid json
         fs::write(&log_path, "").unwrap();
 
         let mut output = Cursor::new(Vec::new());
-        let result = run_impl(&data_dir, &claude_dir, &mut output);
+        let result = run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        );
 
         assert!(result.is_ok());
         assert!(output.get_ref().is_empty());
@@ -1320,5 +1604,44 @@ not valid json
         line.clear();
         reader2.read_line(&mut line).unwrap();
         assert_eq!(line, "line2\n", "should resume at line2");
+    }
+
+    #[test]
+    fn test_export_after_filters_events() {
+        let (temp, data_dir, _claude_dir) = setup_test_dirs();
+        // Write 3 events
+        let events = [
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:00:00.000Z:%1","timestamp":"2025-01-01T00:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:01:00.000Z:%1","timestamp":"2025-01-01T00:01:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:02:00.000Z:%1","timestamp":"2025-01-01T00:02:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+        ];
+        std::fs::write(data_dir.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+
+        // Export with --after pointing to the second event
+        let after_id =
+            format!("{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:01:00.000Z:%1");
+        let mut output = Vec::new();
+        let state_dir = data_dir.clone();
+        run_impl(
+            &data_dir,
+            &temp.path().join(".claude/projects"),
+            &state_dir,
+            TEST_MACHINE_ID,
+            Some(&after_id),
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+        // Should only get the third event (after the marker)
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("00:02:00"));
     }
 }

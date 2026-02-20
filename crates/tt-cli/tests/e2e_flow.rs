@@ -11,11 +11,27 @@ fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
 
+/// Initialize machine identity in the given temp directory.
+/// Required before any `ingest` command.
+fn init_machine(temp: &std::path::Path) {
+    let output = Command::new(tt_binary())
+        .env("HOME", temp)
+        .arg("init")
+        .output()
+        .expect("failed to run tt init");
+    assert!(
+        output.status.success(),
+        "tt init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Test debouncing works correctly for rapid pane focus events.
 #[test]
 fn test_ingest_debouncing() {
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    init_machine(temp.path());
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for the same pane (within debounce window)
     for _ in 0..5 {
@@ -49,7 +65,8 @@ fn test_ingest_debouncing() {
 #[test]
 fn test_ingest_different_panes_not_debounced() {
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    init_machine(temp.path());
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Rapid-fire ingest calls for different panes
     for pane in ["%1", "%2", "%3"] {
@@ -83,9 +100,18 @@ fn test_ingest_different_panes_not_debounced() {
 fn test_export_incremental() {
     let temp = TempDir::new().unwrap();
 
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .arg("init")
+        .output()
+        .unwrap();
+
     // First ingest
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
         .arg("--pane")
@@ -100,6 +126,7 @@ fn test_export_incremental() {
     // First export
     let output1 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -114,6 +141,7 @@ fn test_export_incremental() {
     // Second export without new events
     let output2 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -132,6 +160,7 @@ fn test_export_incremental() {
     std::thread::sleep(std::time::Duration::from_millis(600));
     let _ = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
         .arg("--pane")
@@ -146,6 +175,7 @@ fn test_export_incremental() {
     // Third export should have both events
     let output3 = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -261,14 +291,23 @@ fn test_export_empty_events_file() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    let data_dir = temp.path().join(".local/share/tt");
     std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .arg("init")
+        .output()
+        .unwrap();
 
     // Create empty events.jsonl
     std::fs::write(data_dir.join("events.jsonl"), "").unwrap();
 
     let output = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -320,6 +359,14 @@ fn test_export_large_number_of_events() {
 
     let temp = TempDir::new().unwrap();
 
+    // Initialize machine identity (required by export)
+    let _ = Command::new(tt_binary())
+        .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .arg("init")
+        .output()
+        .unwrap();
+
     // Create many events rapidly (should be debounced)
     for i in 0..100 {
         // Add delay to avoid debouncing
@@ -329,6 +376,7 @@ fn test_export_large_number_of_events() {
 
         let _ = Command::new(tt_binary())
             .env("HOME", temp.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
             .arg("ingest")
             .arg("pane-focus")
             .arg("--pane")
@@ -343,6 +391,7 @@ fn test_export_large_number_of_events() {
 
     let output = Command::new(tt_binary())
         .env("HOME", temp.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
         .unwrap();
@@ -411,7 +460,8 @@ fn test_concurrent_ingest_no_data_loss() {
     use tempfile::TempDir;
 
     let temp = Arc::new(TempDir::new().unwrap());
-    let data_dir = temp.path().join(".time-tracker");
+    init_machine(temp.path());
+    let data_dir = temp.path().join(".local/share/tt");
 
     // Spawn multiple threads trying to ingest simultaneously
     let mut handles = vec![];
@@ -463,7 +513,8 @@ fn test_readonly_events_file_error_handling() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".time-tracker");
+    init_machine(temp.path());
+    let data_dir = temp.path().join(".local/share/tt");
     fs::create_dir_all(&data_dir).unwrap();
 
     // Create events file and make it read-only
@@ -626,6 +677,7 @@ fn test_delegated_time_from_agent_session_events() {
                 timestamp,
                 event_type,
                 source: source.clone(),
+                machine_id: None,
                 schema_version: 1,
                 pane_id: None,
                 tmux_session: None,
