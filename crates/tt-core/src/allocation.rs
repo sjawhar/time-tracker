@@ -315,8 +315,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                 // Note: "active" does NOT restore focus - wait for next focus event
             }
 
-            EventType::TmuxScroll | EventType::UserMessage => {
-                // These confirm focus and reset attention window, but only if
+            EventType::TmuxScroll => {
+                // Scroll confirms focus and resets attention window, but only if
                 // the event is for the currently focused stream (using resolved stream)
                 if let FocusState::Focused {
                     stream_id: focused_stream,
@@ -329,7 +329,6 @@ pub fn allocate_time<E: AllocatableEvent>(
                         tmux_focus_stream_id.as_deref(),
                         browser_focus_state.stream_id.as_deref(),
                     );
-
                     // Only reset attention window if this event is for the resolved stream
                     let event_stream = event.stream_id();
                     if let Some(resolved_stream) = &resolved {
@@ -353,6 +352,40 @@ pub fn allocate_time<E: AllocatableEvent>(
                         }
                     }
                     // If event is for a different stream, ignore it - doesn't affect focus state
+                }
+            }
+
+            EventType::UserMessage => {
+                // User messages represent active work — sending a message to an
+                // agent IS direct work. Establish focus on the message's stream,
+                // just like switching to a tmux pane.
+                if let Some(stream_id) = event.stream_id() {
+                    // Close previous focus interval
+                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                        let resolved = resolve_focus_stream(
+                            &window_focus_state,
+                            tmux_focus_stream_id.as_deref(),
+                            browser_focus_state.stream_id.as_deref(),
+                        );
+                        if let Some(resolved_stream) = &resolved {
+                            let max_end =
+                                *focus_start + Duration::milliseconds(config.attention_window_ms);
+                            let actual_end = event_time.min(max_end);
+                            add_direct(
+                                resolved_stream,
+                                *focus_start,
+                                actual_end,
+                                &mut activity_intervals,
+                                &mut stream_times,
+                            );
+                        }
+                    }
+
+                    tmux_focus_stream_id = Some(stream_id.to_string());
+                    focus_state = FocusState::Focused {
+                        stream_id: stream_id.to_string(),
+                        focus_start: event_time,
+                    };
                 }
             }
 
@@ -1369,5 +1402,90 @@ mod tests {
             stream_a.time_direct_ms, 60_000,
             "capped at attention window"
         );
+    }
+
+    // Test: User message establishes focus when unfocused (no prior tmux focus)
+    #[test]
+    fn test_user_message_establishes_focus_when_unfocused() {
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("A")),
+            TestEvent::user_message(ts(1), "sess1", "A"),
+            TestEvent::user_message(ts(5), "sess1", "A"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(&events, &config, Some(ts(6)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // First user_message at ts(1) establishes focus on A.
+        // Second user_message at ts(5) closes interval [1, min(5, 1+1min)] = [1, 2] = 1 min.
+        // Finalize: min(ts(6), ts(5) + 1min) = ts(6) → [5, 6] = 1 min.
+        // Total: 1 + 1 = 2 min.
+        assert_eq!(stream_a.time_direct_ms, 2 * 60 * 1000);
+    }
+
+    // Test: User message switches focus from one stream to another
+    #[test]
+    fn test_user_message_switches_focus_between_streams() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::user_message(ts(3), "sess1", "B"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(&events, &config, Some(ts(5)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
+        // Focus on A from ts(0), capped at attention window: min(ts(3), ts(0)+1min) = ts(1)
+        // So A gets [0, 1] = 1 min.
+        assert_eq!(stream_a.time_direct_ms, 60_000);
+        // UserMessage at ts(3) establishes focus on B.
+        // Finalize: min(ts(5), ts(3)+1min) = ts(4) → [3, 4] = 1 min.
+        assert_eq!(stream_b.time_direct_ms, 60_000);
+    }
+
+    // Test: Sequence of user messages accumulates direct time
+    #[test]
+    fn test_user_message_sequence_accumulates_direct_time() {
+        let events = vec![
+            TestEvent::user_message(ts(0), "sess1", "A"),
+            TestEvent::user_message(ts(2), "sess1", "A"),
+            TestEvent::user_message(ts(4), "sess1", "A"),
+            TestEvent::user_message(ts(6), "sess1", "A"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(&events, &config, Some(ts(7)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // msg@0 establishes focus
+        // msg@2 closes [0,1min]=1min (capped), reopens at 2
+        // msg@4 closes [2,3min]=1min (capped), reopens at 4
+        // msg@6 closes [4,5min]=1min (capped), reopens at 6
+        // Finalize: min(7, 6+1min)=7 → [6,7]=1min
+        // Total: 4 * 1min = 4 min
+        assert_eq!(stream_a.time_direct_ms, 4 * 60 * 1000);
+    }
+
+    // Test: User message followed by tmux focus restores pane-based tracking
+    #[test]
+    fn test_user_message_then_tmux_focus_switches_back() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::user_message(ts(2), "sess1", "B"),
+            TestEvent::tmux_focus(ts(4), "A"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(&events, &config, Some(ts(5)));
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
+        // A: focus [0, min(2, 0+1min)] = [0, 1] = 1min
+        // B: user_message [2, min(4, 2+1min)] = [2, 3] = 1min
+        // A: tmux_focus [4, min(5, 4+1min)] = [4, 5] = 1min
+        assert_eq!(stream_a.time_direct_ms, 2 * 60_000);
+        assert_eq!(stream_b.time_direct_ms, 60_000);
     }
 }

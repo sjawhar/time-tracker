@@ -93,28 +93,28 @@ Understanding these concepts helps you get the most out of `tt`:
 
 ## Multi-Machine Setup
 
-If you work on remote servers via SSH, sync their events to your local machine.
-
-### Prerequisites
-
-On each remote machine:
-1. Install `tt` binary (follow steps 1-2 above)
-2. Set up tmux hooks
-3. Verify events are being captured locally
-
-### Syncing Events
+Initialize each machine with a unique identity:
 
 ```bash
-# Sync from a remote host
-tt sync user@remote-host
-
-# Uses your ~/.ssh/config for custom ports/keys
-tt sync myserver  # if "myserver" is configured in ssh config
+# On each remote dev server
+tt init --label devbox
+tt init --label gpu-server
 ```
 
-**How it works**: Remote machines store events in `~/.time-tracker/events.jsonl` (a simple JSON log). When you run `tt sync`, it SSHes to the remote, runs `tt export`, and imports the events into your local SQLite database for fast querying.
+Sync events from remotes to your local machine:
 
-**Sync is idempotent**: Running it multiple times won't create duplicates. Events are deduplicated by their unique ID.
+```bash
+tt sync devbox                  # Pull events from one remote
+tt sync devbox gpu-server       # Pull from multiple remotes
+```
+
+List known machines:
+
+```bash
+tt machines
+```
+
+How it works: Each machine gets a persistent UUID via `tt init`. Event IDs are prefixed with this UUID to prevent collisions. `tt sync` SSHes to the remote, runs `tt export`, and imports events into the local database. Sync position is tracked per-remote for incremental pulls.
 
 ---
 
@@ -173,13 +173,19 @@ tt export
 cat events.jsonl | tt import
 ```
 
-### Syncing
+### Machine Identity & Syncing
 
-Transfer events from remote machines to your local database.
+Initialize machine identity and transfer events from remote machines.
 
 ```bash
-# Sync from remote (runs: ssh remote tt export | tt import)
-tt sync user@hostname
+# Initialize this machine with a label
+tt init --label devbox
+
+# Sync from remote machines (by label)
+tt sync devbox gpu-server
+
+# List known machines
+tt machines
 ```
 
 ### Debugging
@@ -219,13 +225,15 @@ Environment variables with `TT_` prefix override config file values.
 
 ## Data Storage
 
-| Location | Machine | Purpose |
-|----------|---------|---------|
-| `~/.time-tracker/events.jsonl` | Remote | Raw event log (simple JSON, easy to sync) |
-| `~/.local/share/tt/tt.db` | Local | SQLite database (fast queries, reports) |
-| `~/.config/tt/config.toml` | Both | Configuration |
+| Location | Purpose |
+|----------|---------|
+| `~/.config/tt/config.toml` | Configuration |
+| `~/.local/share/tt/tt.db` | SQLite database (fast queries, reports) |
+| `~/.local/share/tt/events.jsonl` | Raw event log (simple JSON, easy to sync) |
+| `~/.local/share/tt/machine.json` | Machine identity (UUID + label) |
+| `~/.local/state/tt/hook.log` | tmux hook log output |
 
-**Why the split?** Remote machines write to a simple append-only JSON file - no dependencies, works anywhere. Your local machine imports these into SQLite for fast querying across all your machines.
+Each machine has a persistent UUID assigned by `tt init`. Events are prefixed with this UUID so they remain unique when synced across machines.
 
 ---
 
@@ -312,7 +320,7 @@ For browser tab tracking:
 
 4. **Check file permissions**:
    ```bash
-   ls -la ~/.time-tracker/
+   ls -la ~/.local/share/tt/
    ```
 
 ### Sync failing
@@ -330,7 +338,7 @@ For browser tab tracking:
 
 3. **Check remote has events**:
    ```bash
-   ssh user@host cat ~/.time-tracker/events.jsonl | head -1
+   ssh user@host cat ~/.local/share/tt/events.jsonl | head -1
    ```
 
 ### Time looks wrong
@@ -359,7 +367,7 @@ To clear all data and start over:
 rm ~/.local/share/tt/tt.db
 
 # On remote machines
-rm ~/.time-tracker/events.jsonl
+rm ~/.local/share/tt/events.jsonl
 ```
 
 ### Disabling tracking

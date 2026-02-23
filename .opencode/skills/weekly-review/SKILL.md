@@ -145,10 +145,34 @@ print(plt.build())
 
 ## Phase 2: Data Collection
 
-**CRITICAL: Always run ingestion first.** Session data is only available after ingestion — without this step you will miss most of the data.
+**CRITICAL: Run the FULL ingestion pipeline. Partial data = wrong answer. Do NOT skip steps or present incomplete numbers.**
 
 ```bash
 tt ingest sessions
+```
+
+Then sync ALL remote machines — remote events are often 50%+ of total data:
+
+```bash
+tt machines                    # List known remotes
+tt sync <remote-label>         # For EACH remote machine listed
+```
+
+Check for unassigned events. If any exist, run stream inference BEFORE generating the report:
+
+```bash
+# Quick check — if unassigned count > 0, you MUST run infer-streams
+tt context --events --start "$WEEK_START" --end "$WEEK_END" 2>/dev/null | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+u=sum(1 for e in d.get('events',[]) if not e.get('stream_id'))
+print(f'Unassigned: {u}')
+"
+```
+
+If unassigned > 0, invoke `/infer-streams` before continuing. Then recompute:
+
+```bash
+tt recompute --force
 ```
 
 Then fetch the current week's report data:
@@ -406,6 +430,9 @@ If `.claude/skills/ontology.toml` is missing:
 |---------|-----|
 | Skipping Phase 0 (classify-streams) | **Always** run classify-streams first. Tagged data makes the entire review more meaningful. |
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt report`. Without it you miss most data. |
+| Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
+| Presenting partial results | Run the FULL pipeline (ingest → sync → infer streams → recompute → report). Don't stop partway and show incomplete numbers — it's worse than no answer. |
+| Not running stream inference | If unassigned events exist, run `/infer-streams` BEFORE generating the report. Unassigned events = missing time. |
 | Calling Toggl MCP tools | Use `tt report` exclusively. tt replaces Toggl for this workflow. |
 | Hardcoding project/activity lists | Read from `ontology.toml`. Never hardcode taxonomy. |
 | Condensing user prose | Preserve full text. "Not prioritizing well" loses the detail that enables red-teaming. |
@@ -415,6 +442,7 @@ If `.claude/skills/ontology.toml` is missing:
 | Using `toggl` field in JSONL | Use the `tt` field. Schema uses time-tracker data, not Toggl. |
 | Rushing through narration | Let the user talk. Brief acknowledgments only. Don't lead or suggest what they should say. |
 | Including reflect-style analysis | Session pattern analysis is a separate skill. Weekly review focuses on time, goals, and reflection. |
+| Using `tt context --streams` for time data | `context --streams` returns **lifetime** per-stream totals from the DB, not period-scoped. Use `tt report` for time within a specific period. |
 
 ## Goal Tracking Checkboxes
 

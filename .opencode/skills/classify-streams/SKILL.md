@@ -47,12 +47,19 @@ Parse two lists:
 
 Store both lists in memory for use in Phase 4.
 
-## Phase 2: Ingest & Gather Data
+## Phase 2: Ingest, Sync & Gather Data
 
-**CRITICAL: Always run ingestion first.** Without it, `tt context` returns stale/incomplete data.
+**CRITICAL: Run the FULL ingestion pipeline. Partial data = wrong answer.**
 
 ```bash
 tt ingest sessions
+```
+
+Then sync ALL remote machines — remote events are often 50%+ of total data:
+
+```bash
+tt machines                    # List known remotes
+tt sync <remote-label>         # For EACH remote machine listed
 ```
 
 Then gather context for the target period:
@@ -226,6 +233,7 @@ If the user approves:
 | Mistake | Fix |
 |---------|-----|
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt context`. Without it you miss most data. |
+| Skipping remote sync | **Always** check `tt machines` and sync all remotes before classification. Remote events are often 50%+ of total data. |
 | Inventing tags outside ontology | **Only** use tags from `ontology.toml`. Flag unknowns for user approval. |
 | Reclassifying already-tagged streams | Check existing tags first. Skip streams that already have the relevant tag type. |
 | Auto-extending ontology | **Never** modify `ontology.toml` without user approval. Present suggestions, wait for confirmation. |

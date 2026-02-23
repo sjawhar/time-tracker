@@ -105,6 +105,7 @@ fn get_git_identity(cwd: &std::path::Path) -> Option<ProjectIdentity> {
 impl IngestEvent {
     /// Creates a new pane focus event with a deterministic ID.
     pub fn pane_focus(
+        machine_id: &str,
         pane_id: String,
         tmux_session: String,
         window_index: Option<u32>,
@@ -112,7 +113,7 @@ impl IngestEvent {
         timestamp: DateTime<Utc>,
     ) -> Self {
         let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let id = format!("remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
+        let id = format!("{machine_id}:remote.tmux:tmux_pane_focus:{timestamp_str}:{pane_id}");
 
         let git_identity = get_git_identity(Path::new(&cwd));
 
@@ -139,9 +140,7 @@ const MAX_EVENTS_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Returns the default time tracker data directory.
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".time-tracker")
+    crate::config::dirs_data_path().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Returns the path to the events file within the given data directory.
@@ -271,6 +270,7 @@ fn append_event(data_dir: &Path, event: &IngestEvent) -> Result<()> {
 /// 4. If not debounced, writes the event and updates debounce state
 fn ingest_pane_focus_impl(
     data_dir: &Path,
+    machine_id: &str,
     pane_id: &str,
     session_name: &str,
     window_index: Option<u32>,
@@ -307,6 +307,7 @@ fn ingest_pane_focus_impl(
 
     // Create and write event
     let event = IngestEvent::pane_focus(
+        machine_id,
         pane_id.to_string(),
         session_name.to_string(),
         window_index,
@@ -329,8 +330,10 @@ pub fn ingest_pane_focus(
     window_index: Option<u32>,
     cwd: &str,
 ) -> Result<bool> {
+    let identity = crate::machine::require_machine_identity()?;
     ingest_pane_focus_impl(
         &default_data_dir(),
+        &identity.machine_id,
         pane_id,
         session_name,
         window_index,
@@ -348,6 +351,8 @@ use tt_db::StoredEvent;
 /// Scans Claude Code session directories and the `OpenCode` `SQLite`
 /// database, then upserts discovered sessions into the database.
 pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
+    let machine_id = crate::machine::load_machine_identity()?.map(|m| m.machine_id);
+
     let mut all_sessions = Vec::new();
 
     let (migrated_start, migrated_end) = db
@@ -358,7 +363,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     }
 
     // Claude Code
-    let claude_dir = get_claude_projects_dir()?;
+    let claude_dir = get_claude_projects_dir();
     if claude_dir.exists() {
         println!("Scanning Claude Code sessions...");
         let claude_sessions =
@@ -387,7 +392,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         db.upsert_agent_session(session)
             .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
-        let events = create_session_events(session);
+        let events = create_session_events(session, machine_id.as_deref());
         event_count += events.len();
         db.insert_events(&events).with_context(|| {
             format!("failed to insert events for session {}", session.session_id)
@@ -417,11 +422,98 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         println!("  ... and {} more projects", project_list.len() - 10);
     }
 
+    // Auto-assign unassigned events to existing streams based on cwd matching.
+    let assigned =
+        auto_assign_events_to_streams(db).context("failed to auto-assign events to streams")?;
+    if assigned > 0 {
+        println!("Auto-assigned {assigned} events to streams (by cwd)");
+    }
+
     Ok(())
 }
 
+/// Extracts the relative project path by stripping the home directory prefix.
+///
+/// `/home/sami/time-tracker/default` → `time-tracker/default`
+/// `/home/ubuntu/agent-c/taiga`      → `agent-c/taiga`
+fn project_suffix(cwd: &str) -> Option<&str> {
+    let path = cwd.strip_prefix("/home/")?;
+    // Skip the username component
+    let after_user = path.find('/')? + 1;
+    let suffix = &path[after_user..];
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix)
+    }
+}
+
+/// Auto-assign unassigned events to existing streams based on `cwd` matching.
+///
+/// First tries exact `cwd` match, then falls back to matching by project suffix
+/// (path after `/home/<user>/`). This handles multi-machine setups where the
+/// same project lives under different home directories.
+///
+/// Returns the number of newly assigned events.
+fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
+    use std::collections::HashMap;
+
+    // Build cwd → stream_id and suffix → stream_id mappings from assigned events.
+    let streams = db.get_streams().context("failed to get streams")?;
+    let mut cwd_to_stream: HashMap<String, String> = HashMap::new();
+    let mut suffix_to_stream: HashMap<String, String> = HashMap::new();
+
+    for stream in &streams {
+        let events = db
+            .get_events_by_stream(&stream.id)
+            .context("failed to get events for stream")?;
+        for event in &events {
+            if let Some(cwd) = &event.cwd {
+                cwd_to_stream
+                    .entry(cwd.clone())
+                    .or_insert_with(|| stream.id.clone());
+                if let Some(suffix) = project_suffix(cwd) {
+                    suffix_to_stream
+                        .entry(suffix.to_string())
+                        .or_insert_with(|| stream.id.clone());
+                }
+            }
+        }
+    }
+
+    if cwd_to_stream.is_empty() && suffix_to_stream.is_empty() {
+        return Ok(0);
+    }
+
+    // Find unassigned events whose cwd matches an existing stream.
+    let unassigned = db
+        .get_events_without_stream()
+        .context("failed to get unassigned events")?;
+
+    let assignments: Vec<(String, String)> = unassigned
+        .iter()
+        .filter_map(|event| {
+            let cwd = event.cwd.as_ref()?;
+            // Try exact match first, then suffix match
+            let stream_id = cwd_to_stream
+                .get(cwd.as_str())
+                .or_else(|| project_suffix(cwd).and_then(|suffix| suffix_to_stream.get(suffix)))?;
+            Some((event.id.clone(), stream_id.clone()))
+        })
+        .collect();
+
+    if assignments.is_empty() {
+        return Ok(0);
+    }
+
+    let count = db
+        .assign_events_to_stream(&assignments, "auto")
+        .context("failed to assign events to streams")?;
+    Ok(count)
+}
+
 /// Create events from an agent session.
-fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
+fn create_session_events(session: &AgentSession, machine_id: Option<&str>) -> Vec<StoredEvent> {
     use serde_json::json;
     use tt_core::EventType;
 
@@ -433,6 +525,7 @@ fn create_session_events(session: &AgentSession) -> Vec<StoredEvent> {
         timestamp,
         event_type,
         source: session.source.as_str().to_string(),
+        machine_id: machine_id.map(String::from),
         schema_version: 1,
         pane_id: None,
         tmux_session: None,
@@ -485,8 +578,15 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 /// Get the Claude Code projects directory path.
-fn get_claude_projects_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join("projects"))
+///
+/// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
+fn get_claude_projects_dir() -> PathBuf {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .map_or_else(
+            |_| home_dir().unwrap_or_default().join(".claude"),
+            PathBuf::from,
+        )
+        .join("projects")
 }
 
 /// Get the `OpenCode` database path.
@@ -518,6 +618,9 @@ fn read_events_from(data_dir: &Path) -> Result<Vec<IngestEvent>> {
 }
 
 #[cfg(test)]
+const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
@@ -528,7 +631,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "", "main", None, "/home/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "", "main", None, "/home/test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pane_id"));
     }
@@ -538,7 +642,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "%1", "", None, "/home/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "", None, "/home/test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_name"));
     }
@@ -550,6 +655,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             Some(1),
@@ -568,6 +674,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event1 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -576,6 +683,7 @@ mod tests {
         );
 
         let event2 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -593,6 +701,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let event1 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%3".to_string(),
             "dev".to_string(),
             None,
@@ -601,6 +710,7 @@ mod tests {
         );
 
         let event2 = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
             "%4".to_string(), // Different pane
             "dev".to_string(),
             None,
@@ -616,7 +726,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result = ingest_pane_focus_impl(&data_dir, "%1", "main", Some(0), "/home/test");
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            Some(0),
+            "/home/test",
+        );
 
         assert!(result.is_ok());
         assert!(result.unwrap()); // Event was written
@@ -634,11 +751,13 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event should be written
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Immediate second event for same pane should be debounced
-        let result2 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(!result2.unwrap()); // Debounced
 
         let events = read_events_from(&data_dir).unwrap();
@@ -651,11 +770,13 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First pane
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Different pane should not be debounced
-        let result2 = ingest_pane_focus_impl(&data_dir, "%2", "main", None, "/home/test");
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test");
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -668,14 +789,16 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event
-        let result1 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result1 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result1.unwrap());
 
         // Wait for debounce window to expire
         thread::sleep(Duration::from_millis(550));
 
         // Second event should be written
-        let result2 = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+        let result2 =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -687,9 +810,25 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        ingest_pane_focus_impl(&data_dir, "%1", "session1", Some(0), "/path/a").unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "session1",
+            Some(0),
+            "/path/a",
+        )
+        .unwrap();
 
-        ingest_pane_focus_impl(&data_dir, "%2", "session2", None, "/path/b").unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%2",
+            "session2",
+            None,
+            "/path/b",
+        )
+        .unwrap();
 
         // Read raw file and verify each line is valid JSON
         let content = fs::read_to_string(events_path(&data_dir)).unwrap();
@@ -722,7 +861,8 @@ mod tests {
         fs::write(&events_file, &large_content).unwrap();
 
         // Ingest should rotate the file
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
+            .unwrap();
 
         // Old file should be rotated
         let rotated = rotated_events_path(&data_dir);
@@ -749,7 +889,8 @@ mod tests {
         fs::write(&events_file, "small content").unwrap();
 
         // Ingest should not rotate
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
+            .unwrap();
 
         // No rotated file should exist
         let rotated = rotated_events_path(&data_dir);
@@ -780,7 +921,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -815,7 +956,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -852,7 +993,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
@@ -893,7 +1034,7 @@ mod tests {
             tool_call_timestamps: vec![tool_ts1, tool_ts2],
         };
 
-        let mut events = create_session_events(&session);
+        let mut events = create_session_events(&session, None);
 
         assert_eq!(events[0].event_type, EventType::AgentSession);
         assert_eq!(events[0].action.as_deref(), Some("started"));
@@ -948,7 +1089,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        let events = create_session_events(&session);
+        let events = create_session_events(&session, None);
 
         assert_eq!(events.len(), 2);
         // Events should have "opencode" as source, not "claude"
@@ -960,9 +1101,33 @@ mod tests {
     }
 
     #[test]
+    fn test_event_id_includes_machine_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            Some(0),
+            "/home/test",
+        )
+        .unwrap();
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].id.starts_with(TEST_MACHINE_ID),
+            "event ID '{}' should start with machine_id",
+            events[0].id
+        );
+    }
+
+    #[test]
     fn test_get_claude_projects_dir() {
         if std::env::var("HOME").is_ok() {
-            let path = get_claude_projects_dir().unwrap();
+            let path = get_claude_projects_dir();
             assert!(path.ends_with("projects"));
             assert!(path.to_string_lossy().contains(".claude"));
         }
@@ -990,6 +1155,7 @@ fn test_concurrent_ingests_during_rotation() {
         let handle = thread::spawn(move || {
             ingest_pane_focus_impl(
                 &data_dir_clone,
+                TEST_MACHINE_ID,
                 &format!("%{i}"),
                 "main",
                 None,
@@ -1032,7 +1198,8 @@ fn test_debounce_file_corruption_recovery() {
     fs::write(&debounce_file, "corrupted:data:too:many:colons\ninvalid").unwrap();
 
     // Should handle gracefully and not panic
-    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test");
+    let result =
+        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
     assert!(
         result.is_ok(),
         "Should recover from corrupted debounce file"
@@ -1053,8 +1220,14 @@ fn test_git_identity_extraction_from_jj_directory() {
     fs::create_dir_all(&cwd_with_jj).unwrap();
     fs::create_dir_all(cwd_with_jj.join(".jj")).unwrap();
 
-    let result =
-        ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_with_jj.to_str().unwrap());
+    let result = ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        cwd_with_jj.to_str().unwrap(),
+    );
 
     // Should succeed
     assert!(result.is_ok(), "Ingest should succeed");
@@ -1075,7 +1248,14 @@ fn test_no_jj_directory_returns_no_identity() {
     let cwd_no_jj = temp_dir.path().join("regular-dir");
     fs::create_dir_all(&cwd_no_jj).unwrap();
 
-    let result = ingest_pane_focus_impl(&data_dir, "%1", "main", None, cwd_no_jj.to_str().unwrap());
+    let result = ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        cwd_no_jj.to_str().unwrap(),
+    );
 
     assert!(result.is_ok(), "Ingest should succeed");
 
@@ -1137,11 +1317,11 @@ fn test_lock_file_cleanup() {
     let data_dir = temp_dir.path().join(".time-tracker");
 
     // First ingest
-    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test").unwrap();
 
     // Lock should be released, second ingest should succeed immediately
     let start = std::time::Instant::now();
-    ingest_pane_focus_impl(&data_dir, "%2", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test").unwrap();
     let duration = start.elapsed();
 
     // Should complete quickly (not waiting on lock)
@@ -1164,7 +1344,8 @@ fn test_debounce_with_special_pane_ids() {
     ];
 
     for pane_id in special_panes {
-        let result = ingest_pane_focus_impl(&data_dir, pane_id, "main", None, "/test");
+        let result =
+            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, pane_id, "main", None, "/test");
         assert!(result.is_ok(), "Should handle special pane ID: {pane_id}");
     }
 
@@ -1188,7 +1369,7 @@ fn test_rotation_preserves_old_content() {
     fs::write(&events_file, &large_content).unwrap();
 
     // Ingest should rotate
-    ingest_pane_focus_impl(&data_dir, "%1", "main", None, "/test").unwrap();
+    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/test").unwrap();
 
     // Verify old content is in rotated file
     let rotated = rotated_events_path(&data_dir);
@@ -1225,7 +1406,7 @@ fn test_create_session_events_with_empty_timestamps() {
         tool_call_timestamps: Vec::new(),
     };
 
-    let events = create_session_events(&session);
+    let events = create_session_events(&session, None);
 
     // Should only have session_start (no user_message events)
     assert_eq!(events.len(), 1);

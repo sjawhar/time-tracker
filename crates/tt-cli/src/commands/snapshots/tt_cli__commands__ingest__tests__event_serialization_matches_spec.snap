@@ -3,7 +3,7 @@ source: crates/tt-cli/src/commands/ingest.rs
 expression: json
 ---
 {
-  "id": "remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%3",
+  "id": "00000000-0000-0000-0000-000000000000:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%3",
   "timestamp": "2025-01-29T12:00:00.000Z",
   "source": "remote.tmux",
   "type": "tmux_pane_focus",

@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tt_db::{Database, StoredEvent};
 
+use crate::machine::extract_machine_id;
+
 /// Batch size for database inserts.
 const BATCH_SIZE: usize = 1000;
 
@@ -69,6 +71,11 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
                 // since the stream doesn't exist in this database.
                 event.stream_id = None;
                 event.assignment_source = None;
+
+                // Extract machine_id from event ID prefix (UUID before first colon-separated source)
+                if event.machine_id.is_none() {
+                    event.machine_id = extract_machine_id(&event.id);
+                }
 
                 result.total_read += 1;
                 batch.push(event);
@@ -319,7 +326,10 @@ mod tests {
         // Generate more than BATCH_SIZE events
         let num_events = BATCH_SIZE + 500;
         let mut input_str = String::new();
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "test assertion where overflow is not possible"
+        )]
         for i in 0..num_events {
             let ts = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap()
                 + chrono::Duration::seconds(i as i64);
@@ -378,5 +388,52 @@ mod tests {
         assert_eq!(events[0].schema_version, 2);
         assert_eq!(events[0].cwd, Some("/home/user/project".to_string()));
         assert_eq!(events[0].session_id, Some("sess123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_machine_id_valid() {
+        let id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1";
+        assert_eq!(
+            extract_machine_id(id),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_machine_id_no_uuid() {
+        let id = "remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1";
+        assert_eq!(extract_machine_id(id), None);
+    }
+
+    #[test]
+    fn test_extract_machine_id_invalid_uuid() {
+        let id = "not-a-valid-uuid-at-all-but-36chars:remote.tmux:foo";
+        assert_eq!(extract_machine_id(id), None);
+    }
+
+    #[test]
+    fn test_import_populates_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let event = r#"{"id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1","timestamp":"2025-01-29T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}"#;
+        let input = Cursor::new(format!("{event}\n"));
+        let result = import_from_reader(&db, input).unwrap();
+        assert_eq!(result.inserted, 1);
+
+        // Verify machine_id was extracted and stored
+        let events = db
+            .get_events_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].machine_id.as_deref(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
     }
 }
