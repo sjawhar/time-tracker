@@ -9,10 +9,10 @@ Generate and post a daily standup to Slack using time-tracker activity data.
 
 ## Arguments
 
-- `channel`: Required. Slack channel name (e.g., `#ra-lab-notes-sami`)
+- `channel`: Optional. Slack channel name (default: `#daily-standup`, channel ID `C09QA182QG2`)
 - `date`: Optional. Day to report on (default: yesterday). Use natural language like "yesterday", "Feb 2", or ISO 8601.
 
-Example: `/daily-standup #ra-lab-notes-sami yesterday`
+Example: `/daily-standup #daily-standup yesterday`
 
 ## Workflow
 
@@ -53,15 +53,22 @@ START=$(date -u -d "yesterday 00:00 PST" +%Y-%m-%dT%H:%M:%SZ)
 END=$(date -u -d "today 00:00 PST" +%Y-%m-%dT%H:%M:%SZ)
 ```
 
-## Phase 2: Run Ingestion
+## Phase 2: Run Ingestion + Sync Remotes
 
-**CRITICAL: Always run ingestion before gathering context.** Session data is only available after ingestion — without this step you will miss most of the data.
+**CRITICAL: Always run the full ingestion pipeline. Partial data = wrong answer. Do NOT skip steps or present partial results.**
 
 ```bash
 cargo build 2>/dev/null && cargo run -- ingest sessions
 ```
 
-This scans Claude Code and OpenCode session files and stores metadata in the database. Without it, `tt context` returns stale/incomplete data.
+Then sync ALL remote machines — remote events are often 50%+ of total data:
+
+```bash
+tt machines                    # List known remotes
+tt sync <remote-label>         # For EACH remote machine listed
+```
+
+This scans Claude Code and OpenCode session files, syncs remote events, and stores everything in the database. Without it, `tt context` returns incomplete data.
 
 ## Phase 3: Gather Context
 
@@ -200,6 +207,8 @@ If posting fails:
 | Mistake | Fix |
 |---------|-----|
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt context`. Without it you miss most data. |
+| Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
+| Reporting partial/incomplete numbers | Run the FULL pipeline (ingest → sync → infer streams → recompute) before showing any report. Don't stop partway and present incomplete numbers. |
 | Reporting by repo directory | Organize by logical project, not filesystem path. `dotfiles` is never a project. Ask the user. |
 | No PR links | Always run `gh search prs` and link every PR mentioned in the report. |
 | Date format error | Use ISO 8601: `2026-02-02T08:00:00Z` or relative like "1 day ago" |

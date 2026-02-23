@@ -25,14 +25,33 @@ Optional: Time range (default: since last stream ended, or "7 days ago")
 
 Example: `/infer-streams 3 days ago`
 
-## Phase 1: Ingest + Determine Range
+## Phase 1: Ingest + Sync + Determine Range
+
+**CRITICAL: Run the FULL ingestion pipeline. Partial data = wrong answer.**
 
 ```bash
 cargo build 2>/dev/null && cargo run -- ingest sessions
-tt streams list --json
 ```
 
-**CRITICAL: Always ingest before context.** Without it you miss 75%+ of sessions.
+Then sync ALL remote machines. Check `tt machines` — if any remotes exist, sync them:
+
+```bash
+tt machines                    # List known remotes
+tt sync <remote-label>         # For EACH remote machine
+```
+
+If code in `export.rs`, `import.rs`, or `sync.rs` was changed this session, you MUST deploy the updated binary to remotes first:
+
+```bash
+cargo build --release
+./scripts/deploy-remote.sh <remote-label>
+```
+
+Then determine the time range:
+
+```bash
+tt streams list --json
+```
 
 If streams exist, start from where the last stream ended. If empty, use "7 days ago" or user-specified range.
 
@@ -132,11 +151,14 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 | Computing time in Python | **Never.** Use `tt recompute`. The allocation algorithm handles attention windows, AFK, agent timeouts. |
 | Ignoring tmux_pane_focus events | These have NO session_id. Assign by cwd + time range. |
 | Skipping ingestion | **Always** `tt ingest sessions` first. |
+| Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
+| Reporting partial results | **Never** show a report or time number if remotes haven't been synced or events are unassigned. Incomplete data = wrong answer. |
 | Starting from "8 hours ago" | Check `tt streams list` — start from where streams end. |
 | Treating project as stream | Project = repo. Stream = task/feature. |
 | Splitting subdirectories | `/pivot/agents` is part of `pivot`. |
 | Streams too coarse | "pivot work" → "pivot: pipeline API redesign". |
 | Leaving events unassigned | Everything gets assigned. Use "misc: {activity}" for unclear. |
+| Stopping after assignment | Always `tt recompute --force` after assigning events. Without it, stream times are stale. |
 
 ## Done When
 

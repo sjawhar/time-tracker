@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use tt_cli::commands::{context, export, import, ingest, recompute, report, status, streams, tag};
+use tt_cli::commands::{
+    context, export, import, ingest, init, machines, recompute, report, status, streams, sync, tag,
+};
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
 /// Load config and open database, ensuring the parent directory exists.
@@ -56,9 +58,9 @@ fn main() -> Result<()> {
                 ingest::index_sessions(&db)?;
             }
         },
-        Some(Commands::Export) => {
+        Some(Commands::Export { after }) => {
             // Export doesn't need config - just reads files and outputs to stdout
-            export::run()?;
+            export::run(after.as_deref())?;
         }
         Some(Commands::Import) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
@@ -105,6 +107,17 @@ fn main() -> Result<()> {
                 StreamsAction::List { json } => streams::run(&db, *json)?,
                 StreamsAction::Create { name } => streams::create(&db, name.clone())?,
             }
+        }
+        Some(Commands::Init { label }) => {
+            init::run(label.as_deref())?;
+        }
+        Some(Commands::Machines) => {
+            let (db, _config) = open_database(cli.config.as_deref())?;
+            machines::run(&db)?;
+        }
+        Some(Commands::Sync { remotes }) => {
+            let (db, _config) = open_database(cli.config.as_deref())?;
+            sync::run(&db, remotes)?;
         }
         Some(Commands::Context {
             events,

@@ -37,9 +37,13 @@ pub enum Commands {
 
     /// Export all events for sync to local machine.
     ///
-    /// Reads events from `~/.time-tracker/events.jsonl` and parses Claude Code
+    /// Reads events from `~/.local/share/tt/events.jsonl` and parses Claude Code
     /// session logs, outputting combined events as JSONL to stdout.
-    Export,
+    Export {
+        /// Only export events after this event ID (for incremental sync).
+        #[arg(long)]
+        after: Option<String>,
+    },
 
     /// Import events from stdin into local `SQLite` database.
     ///
@@ -102,6 +106,30 @@ pub enum Commands {
     /// Manage streams.
     #[command(subcommand)]
     Streams(StreamsAction),
+
+    /// Initialize machine identity for multi-machine sync.
+    ///
+    /// Generates a persistent UUID for this machine, stored in
+    /// `~/.local/share/tt/machine.json`. Idempotent — safe to run again.
+    Init {
+        /// Human-friendly label for this machine (defaults to hostname).
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// List known remote machines and their sync status.
+    Machines,
+
+    /// Sync events from remote machine(s) via SSH.
+    ///
+    /// Runs `tt export` on each remote via SSH and imports the events
+    /// into the local database. Tracks sync position per remote for
+    /// incremental pulls.
+    Sync {
+        /// Remote host(s) to sync from (SSH alias or user@host).
+        #[arg(required = true)]
+        remotes: Vec<String>,
+    },
 
     /// Output context for stream inference (JSON).
     ///

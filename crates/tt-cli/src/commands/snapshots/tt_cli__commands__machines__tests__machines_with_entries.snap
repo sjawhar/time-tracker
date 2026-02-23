@@ -1,0 +1,8 @@
+---
+source: crates/tt-cli/src/commands/machines.rs
+assertion_line: 74
+expression: output
+---
+MACHINE ID                             LABEL                LAST SYNC
+aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee   devbox               2025-01-01T00:00:00.000Z
+11111111-2222-3333-4444-555555555555   gpu-server           2025-01-01T00:00:00.000Z

@@ -11,6 +11,7 @@ crates/
 │   │   ├── main.rs         # Entry point: parse args → open db → dispatch
 │   │   ├── cli.rs          # Clap definitions (Commands, IngestEvent, StreamsAction)
 │   │   ├── config.rs       # Figment config loading (defaults → TOML → env)
+│   │   ├── machine.rs      # Machine identity (UUID) for multi-machine sync
 │   │   └── commands/       # One file per subcommand + snapshots/
 │   └── tests/e2e_flow.rs   # Integration tests (spawns actual binary)
 ├── tt-core/       # Domain logic. See crates/tt-core/AGENTS.md
@@ -40,6 +41,8 @@ tt-cli ─┬─> tt-core
 | Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Claude: parse JSONL session files from `~/.claude/`. OpenCode: query SQLite database via rusqlite |
 | Config options | `tt-cli/src/config.rs` | Figment: defaults → `~/.config/tt/config.toml` → `TT_*` env vars |
 | Snapshot test update | Run `cargo insta review` | 18 snapshots in `tt-cli/src/commands/snapshots/` |
+| Add machine support | `tt-cli/src/machine.rs` | UUID-based identity per machine |
+| Multi-machine sync | `tt-cli/src/commands/sync.rs` | SSH-based event pull |
 | Deploy binary | `scripts/deploy-remote.sh` | Builds release, copies via SSH, optionally configures tmux hook |
 
 ## Commands
@@ -52,6 +55,9 @@ cargo test                      # Run all tests (unit + integration + snapshots)
 cargo deny check                # Dependency audit (licenses + advisories)
 cargo insta review              # Review snapshot test changes
 cargo run -- --help             # Show CLI help
+tt init --label devbox          # Initialize machine identity
+tt sync devbox gpu-server       # Pull events from remote machines
+tt machines                     # List known remote machines
 ```
 
 CI (`.github/workflows/pr-and-main.yml`): lint job (fmt + deny) + build job (clippy + test). Runs on push to main and PRs.
@@ -94,6 +100,13 @@ Sync everywhere except future `tt-llm` (which would use tokio for HTTP). CLI has
 
 Figment layered loading: compiled defaults → `~/.config/tt/config.toml` → `TT_*` env vars. Currently only `database_path` is configurable.
 
+XDG directory layout:
+```
+Config: ~/.config/tt/config.toml
+Data:   ~/.local/share/tt/ (tt.db, events.jsonl, machine.json)
+State:  ~/.local/state/tt/ (hook.log, claude-manifest.json)
+```
+
 ## Anti-Patterns
 
 - **No migrations**: Schema version mismatch = hard error. DB must be recreated on schema change.
@@ -111,3 +124,5 @@ Figment layered loading: compiled defaults → `~/.config/tt/config.toml` → `T
 | `AllocationConfig` | tt-core | Tunables: attention_window (1min), agent_timeout (30min) |
 | `AgentSession` | tt-core | Parsed Claude/OpenCode session metadata |
 | `Config` | tt-cli | App config (database_path) |
+| `MachineIdentity` | tt-cli | Persistent UUID + label per machine |
+| `Machine` | tt-db | Known remote machine with sync state |

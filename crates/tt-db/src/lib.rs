@@ -32,12 +32,12 @@
 use std::path::Path;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -108,6 +108,15 @@ pub struct SourceStatus {
     pub last_timestamp: DateTime<Utc>,
 }
 
+/// A known remote machine.
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub machine_id: String,
+    pub label: String,
+    pub last_sync_at: Option<String>,
+    pub last_event_id: Option<String>,
+}
+
 /// An event stored in the database.
 ///
 /// This type represents both events being inserted and events being read.
@@ -126,6 +135,10 @@ pub struct StoredEvent {
 
     /// Event source (e.g., "remote.tmux", "remote.agent").
     pub source: String,
+
+    /// Machine UUID that generated this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 
     /// Schema version of the payload (default: 1).
     #[serde(default = "default_schema_version")]
@@ -373,6 +386,7 @@ impl Database {
                 timestamp TEXT NOT NULL,
                 type TEXT NOT NULL,
                 source TEXT NOT NULL,
+                machine_id TEXT,
                 schema_version INTEGER DEFAULT 1,
                 cwd TEXT,
                 git_project TEXT,
@@ -418,6 +432,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_cwd ON events(cwd);
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
             CREATE INDEX IF NOT EXISTS idx_events_git_project ON events(git_project);
+            CREATE INDEX IF NOT EXISTS idx_events_machine ON events(machine_id);
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
 
@@ -436,11 +451,20 @@ impl Database {
                 user_prompts TEXT DEFAULT '[]',
                 starting_prompt TEXT,
                 assistant_message_count INTEGER DEFAULT 0,
-                tool_call_count INTEGER DEFAULT 0
+                tool_call_count INTEGER DEFAULT 0,
+                machine_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_start_time ON agent_sessions(start_time);
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_path ON agent_sessions(project_path);
             CREATE INDEX IF NOT EXISTS idx_agent_sessions_parent ON agent_sessions(parent_session_id);
+
+            -- Machines table: tracks known remote machines for sync
+            CREATE TABLE IF NOT EXISTS machines (
+                machine_id TEXT PRIMARY KEY,
+                label TEXT,
+                last_sync_at TEXT,
+                last_event_id TEXT
+            );
             ",
         )?;
 
@@ -473,8 +497,8 @@ impl Database {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO events (id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT OR IGNORE INTO events (id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             )?;
 
             for event in events {
@@ -485,6 +509,7 @@ impl Database {
                     timestamp_str,
                     event.event_type.to_string(),
                     event.source,
+                    event.machine_id,
                     event.schema_version,
                     event.cwd,
                     event.git_project,
@@ -524,7 +549,7 @@ impl Database {
         before: Option<DateTime<Utc>>,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let mut sql = String::from(
-            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -570,7 +595,7 @@ impl Database {
         end: DateTime<Utc>,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events
              WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp ASC",
@@ -691,7 +716,7 @@ impl Database {
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_by_stream(&self, stream_id: &str) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
         )?;
 
@@ -711,7 +736,7 @@ impl Database {
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_without_stream(&self) -> Result<Vec<StoredEvent>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
+            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
              FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC",
         )?;
 
@@ -734,6 +759,18 @@ impl Database {
         let count = self.conn.execute(
             "UPDATE events SET stream_id = NULL WHERE assignment_source = 'inferred'",
             [],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Deletes all events from a specific machine.
+    ///
+    /// Used to force a clean re-import when the export format changes.
+    /// Returns the number of events deleted.
+    pub fn delete_events_by_machine(&self, machine_id: &str) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "DELETE FROM events WHERE machine_id = ?1",
+            params![machine_id],
         )?;
         Ok(count as u64)
     }
@@ -928,8 +965,9 @@ impl Database {
     /// Helper to convert a row to a `StoredEvent`.
     ///
     /// Expects the row to have columns in this order:
-    /// `id`, `timestamp`, `type`, `source`, `schema_version`, `cwd`, `git_project`, `git_workspace`,
-    /// `pane_id`, `tmux_session`, `window_index`, `session_id`, `stream_id`, `assignment_source`
+    /// `id`, `timestamp`, `type`, `source`, `machine_id`, `schema_version`, `cwd`, `git_project`,
+    /// `git_workspace`, `pane_id`, `tmux_session`, `window_index`, `status`, `idle_duration_ms`,
+    /// `action`, `session_id`, `stream_id`, `assignment_source`
     ///
     /// Returns `None` if the row has malformed timestamp (with a warning logged).
     fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Option<StoredEvent>, rusqlite::Error> {
@@ -937,19 +975,20 @@ impl Database {
         let timestamp_str: String = row.get(1)?;
         let event_type_str: String = row.get(2)?;
         let source: String = row.get(3)?;
-        let schema_version: i32 = row.get(4)?;
-        let cwd: Option<String> = row.get(5)?;
-        let git_project: Option<String> = row.get(6)?;
-        let git_workspace: Option<String> = row.get(7)?;
-        let pane_id: Option<String> = row.get(8)?;
-        let tmux_session: Option<String> = row.get(9)?;
-        let window_index: Option<u32> = row.get(10)?;
-        let status: Option<String> = row.get(11)?;
-        let idle_duration_ms: Option<i64> = row.get(12)?;
-        let action: Option<String> = row.get(13)?;
-        let session_id: Option<String> = row.get(14)?;
-        let stream_id: Option<String> = row.get(15)?;
-        let assignment_source: Option<String> = row.get(16)?;
+        let machine_id: Option<String> = row.get(4)?;
+        let schema_version: i32 = row.get(5)?;
+        let cwd: Option<String> = row.get(6)?;
+        let git_project: Option<String> = row.get(7)?;
+        let git_workspace: Option<String> = row.get(8)?;
+        let pane_id: Option<String> = row.get(9)?;
+        let tmux_session: Option<String> = row.get(10)?;
+        let window_index: Option<u32> = row.get(11)?;
+        let status: Option<String> = row.get(12)?;
+        let idle_duration_ms: Option<i64> = row.get(13)?;
+        let action: Option<String> = row.get(14)?;
+        let session_id: Option<String> = row.get(15)?;
+        let stream_id: Option<String> = row.get(16)?;
+        let assignment_source: Option<String> = row.get(17)?;
 
         let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
             Ok(dt) => dt.with_timezone(&Utc),
@@ -977,6 +1016,7 @@ impl Database {
             timestamp,
             event_type,
             source,
+            machine_id,
             schema_version,
             pane_id,
             tmux_session,
@@ -1059,8 +1099,8 @@ impl Database {
         let user_prompts_json =
             serde_json::to_string(&entry.user_prompts).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
-            "INSERT INTO agent_sessions (session_id, source, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO agent_sessions (session_id, source, parent_session_id, project_path, project_name, start_time, end_time, message_count, summary, user_prompts, starting_prompt, assistant_message_count, tool_call_count, session_type, machine_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(session_id) DO UPDATE SET
                 source = excluded.source,
                 parent_session_id = excluded.parent_session_id,
@@ -1074,7 +1114,8 @@ impl Database {
                 starting_prompt = excluded.starting_prompt,
                 assistant_message_count = excluded.assistant_message_count,
                 tool_call_count = excluded.tool_call_count,
-                session_type = excluded.session_type",
+                session_type = excluded.session_type,
+                machine_id = excluded.machine_id",
             params![
                 entry.session_id,
                 entry.source.as_str(),
@@ -1090,6 +1131,7 @@ impl Database {
                 entry.assistant_message_count,
                 entry.tool_call_count,
                 entry.session_type.as_str(),
+                Option::<String>::None,
             ],
         )?;
         Ok(())
@@ -1243,6 +1285,76 @@ impl Database {
 
         Ok(statuses)
     }
+
+    /// Inserts or updates a machine entry, including sync position.
+    pub fn upsert_machine(
+        &self,
+        machine_id: &str,
+        label: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO machines (machine_id, label, last_sync_at, last_event_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(machine_id) DO UPDATE SET
+                label = excluded.label,
+                last_sync_at = excluded.last_sync_at,
+                last_event_id = COALESCE(excluded.last_event_id, machines.last_event_id)",
+            params![
+                machine_id,
+                label,
+                format_timestamp(Utc::now()),
+                last_event_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Lists all known machines.
+    pub fn list_machines(&self) -> Result<Vec<Machine>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT machine_id, label, last_sync_at, last_event_id FROM machines ORDER BY label",
+        )?;
+        let machines = stmt
+            .query_map([], |row| {
+                Ok(Machine {
+                    machine_id: row.get(0)?,
+                    label: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    last_sync_at: row.get(2)?,
+                    last_event_id: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(machines)
+    }
+
+    /// Gets the last event ID synced from a machine identified by label.
+    pub fn get_machine_last_event_id_by_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_event_id FROM machines WHERE label = ?1")?;
+        let result: Option<Option<String>> = stmt
+            .query_row(params![label], |row| row.get(0))
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Gets the most recent event ID for a specific machine.
+    pub fn get_latest_event_id_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM events WHERE machine_id = ?1 ORDER BY timestamp DESC LIMIT 1",
+        )?;
+        let result = stmt
+            .query_row(params![machine_id], |row| row.get(0))
+            .optional()?;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -1261,6 +1373,7 @@ mod tests {
             timestamp,
             event_type,
             source: "remote.tmux".to_string(),
+            machine_id: None,
             schema_version: 1,
             pane_id: Some("%3".to_string()),
             tmux_session: Some("dev".to_string()),
@@ -1294,6 +1407,7 @@ mod tests {
             timestamp: ts,
             event_type: tt_core::EventType::TmuxPaneFocus,
             source: "remote.tmux".to_string(),
+            machine_id: None,
             schema_version: 1,
             pane_id: Some("%42".to_string()),
             tmux_session: Some("main".to_string()),
@@ -1526,6 +1640,7 @@ mod tests {
             timestamp: ts,
             event_type: tt_core::EventType::WindowFocus,
             source: "remote.tmux".to_string(),
+            machine_id: None,
             schema_version: 1,
             pane_id: None,
             tmux_session: None,
@@ -1675,6 +1790,7 @@ mod tests {
             timestamp,
             event_type: tt_core::EventType::TmuxPaneFocus,
             source: source.to_string(),
+            machine_id: None,
             schema_version: 1,
             pane_id: None,
             tmux_session: None,
