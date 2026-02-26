@@ -1095,6 +1095,7 @@ impl Database {
     pub fn upsert_agent_session(
         &self,
         entry: &tt_core::session::AgentSession,
+        machine_id: Option<&str>,
     ) -> Result<(), DbError> {
         let user_prompts_json =
             serde_json::to_string(&entry.user_prompts).unwrap_or_else(|_| "[]".to_string());
@@ -1131,7 +1132,7 @@ impl Database {
                 entry.assistant_message_count,
                 entry.tool_call_count,
                 entry.session_type.as_str(),
-                Option::<String>::None,
+                machine_id,
             ],
         )?;
         Ok(())
@@ -2241,7 +2242,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        db.upsert_agent_session(&entry).unwrap();
+        db.upsert_agent_session(&entry, None).unwrap();
 
         let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
         let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
@@ -2288,7 +2289,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        db.upsert_agent_session(&entry).unwrap();
+        db.upsert_agent_session(&entry, None).unwrap();
 
         let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
         let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
@@ -2649,5 +2650,57 @@ mod tests {
         assert_eq!(end.action.as_deref(), Some("ended"));
         assert_eq!(legacy_start.action.as_deref(), Some("started"));
         assert_eq!(legacy_end.action.as_deref(), Some("ended"));
+    }
+
+    #[test]
+    fn test_upsert_agent_session_stores_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let session = tt_core::session::AgentSession {
+            session_id: "test-session-1".to_string(),
+            source: tt_core::session::SessionSource::Claude,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::User,
+            project_path: "/home/test/project".to_string(),
+            project_name: "test-project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap()),
+            message_count: 5,
+            summary: Some("Test session".to_string()),
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 3,
+            tool_call_count: 1,
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        };
+
+        // Upsert with machine_id = Some("test-machine-uuid")
+        db.upsert_agent_session(&session, Some("test-machine-uuid"))
+            .unwrap();
+
+        // Query and verify machine_id is stored
+        let row: String = db
+            .conn
+            .query_row(
+                "SELECT machine_id FROM agent_sessions WHERE session_id = ?1",
+                ["test-session-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, "test-machine-uuid");
+
+        // Upsert same session with machine_id = None (should overwrite)
+        db.upsert_agent_session(&session, None).unwrap();
+
+        // Query and verify machine_id is now NULL
+        let result: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT machine_id FROM agent_sessions WHERE session_id = ?1",
+                ["test-session-1"],
+                |row| row.get(0),
+            )
+            .ok();
+        assert_eq!(result, None);
     }
 }

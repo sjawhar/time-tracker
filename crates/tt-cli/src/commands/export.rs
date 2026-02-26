@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,6 +60,99 @@ pub struct AgentToolUseData {
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// Metadata record for agent sessions in the JSONL export stream.
+///
+/// Emitted alongside events. Importers that don't recognize this record type
+/// will log it as malformed and skip it — no breakage, just no session import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadataExport {
+    /// Always `"session_metadata"` — distinguishes from event records.
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub session_id: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub session_type: String,
+    pub project_path: String,
+    pub project_name: String,
+    pub start_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    pub message_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_prompts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starting_prompt: Option<String>,
+    pub assistant_message_count: i32,
+    pub tool_call_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+}
+
+impl SessionMetadataExport {
+    /// Creates a metadata export record from an `AgentSession`.
+    pub fn from_agent_session(session: &tt_core::session::AgentSession, machine_id: Option<&str>) -> Self {
+        Self {
+            record_type: "session_metadata".to_string(),
+            session_id: session.session_id.clone(),
+            source: session.source.as_str().to_string(),
+            parent_session_id: session.parent_session_id.clone(),
+            session_type: session.session_type.as_str().to_string(),
+            project_path: session.project_path.clone(),
+            project_name: session.project_name.clone(),
+            start_time: session
+                .start_time
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            end_time: session
+                .end_time
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            message_count: session.message_count,
+            summary: session.summary.clone(),
+            user_prompts: session.user_prompts.clone(),
+            starting_prompt: session.starting_prompt.clone(),
+            assistant_message_count: session.assistant_message_count,
+            tool_call_count: session.tool_call_count,
+            machine_id: machine_id.map(String::from),
+        }
+    }
+
+    /// Converts this export record into an `AgentSession` for database import.
+    pub fn into_agent_session(self) -> Option<(tt_core::session::AgentSession, Option<String>)> {
+        let start_time: DateTime<Utc> = self.start_time.parse().ok()?;
+        let end_time = self
+            .end_time
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        let source: tt_core::session::SessionSource = self.source.parse().ok()?;
+        let session_type: tt_core::session::SessionType = self.session_type.parse().ok()?;
+
+        let machine_id = self.machine_id.clone();
+        Some((tt_core::session::AgentSession {
+            session_id: self.session_id,
+            source,
+            parent_session_id: self.parent_session_id,
+            session_type,
+            project_path: self.project_path,
+            project_name: self.project_name,
+            start_time,
+            end_time,
+            message_count: self.message_count,
+            summary: self.summary,
+            user_prompts: self.user_prompts,
+            starting_prompt: self.starting_prompt,
+            assistant_message_count: self.assistant_message_count,
+            tool_call_count: self.tool_call_count,
+            // Timestamps are not part of metadata export — they're only used for
+            // event generation, not session indexing.
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        }, machine_id))
+    }
 }
 
 /// Manifest tracking byte offsets for incremental Claude log parsing.

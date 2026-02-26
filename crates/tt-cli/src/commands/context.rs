@@ -560,7 +560,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&parent).unwrap();
+        db.upsert_agent_session(&parent, None).unwrap();
 
         // Insert a subagent session with parent
         let child = tt_core::session::AgentSession {
@@ -587,7 +587,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&child).unwrap();
+        db.upsert_agent_session(&child, None).unwrap();
 
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
             .unwrap()
@@ -643,7 +643,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&claude_session).unwrap();
+        db.upsert_agent_session(&claude_session, None).unwrap();
 
         // Insert an OpenCode session
         let opencode_session = tt_core::session::AgentSession {
@@ -666,7 +666,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&opencode_session).unwrap();
+        db.upsert_agent_session(&opencode_session, None).unwrap();
 
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
             .unwrap()
@@ -1111,7 +1111,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&session).unwrap();
+        db.upsert_agent_session(&session, None).unwrap();
 
         // Query for sessions in range
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")

@@ -389,7 +389,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
 
     let mut event_count = 0usize;
     for session in &all_sessions {
-        db.upsert_agent_session(session)
+        db.upsert_agent_session(session, None)
             .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
         let events = create_session_events(session, machine_id.as_deref());
