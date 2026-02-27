@@ -25,6 +25,8 @@ pub struct ImportResult {
     pub duplicates: usize,
     /// Number of malformed JSON lines skipped.
     pub malformed: usize,
+    /// Number of agent sessions imported.
+    pub sessions_imported: usize,
 }
 
 /// Imports events from a reader into the database.
@@ -40,6 +42,7 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         inserted: 0,
         duplicates: 0,
         malformed: 0,
+        sessions_imported: 0,
     };
 
     for (line_num, line_result) in buf_reader.lines().enumerate() {
@@ -47,6 +50,22 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
 
         // Skip empty lines
         if line.trim().is_empty() {
+            continue;
+        }
+
+        // Check for session metadata records before event parsing.
+        // This must come before rewrite_legacy_session_types to avoid the
+        // legacy rewriter mangling metadata lines.
+        if let Some((session, machine_id)) = try_parse_session_metadata(&line) {
+            db.upsert_agent_session(&session, machine_id.as_deref())
+                .context("failed to upsert agent session")?;
+            result.sessions_imported += 1;
+            continue;
+        }
+
+        // Check if this line is recognized as metadata but invalid.
+        // If so, skip it without counting as malformed.
+        if is_session_metadata_record(&line) {
             continue;
         }
 
@@ -142,6 +161,63 @@ pub fn run(db: &Database) -> Result<ImportResult> {
     );
 
     Ok(result)
+}
+
+/// Checks if a line is recognized as a session metadata record (regardless of validity).
+fn is_session_metadata_record(line: &str) -> bool {
+    // Fast path: check if line contains the session_metadata type marker
+    if !line.contains("\"session_metadata\"") {
+        return false;
+    }
+
+    // Verify it's actually JSON with type field set to session_metadata
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|value| value.get("type").and_then(|t| t.as_str()) == Some("session_metadata"))
+}
+
+/// Attempts to parse a JSONL line as a session metadata record.
+///
+/// Returns `Some((AgentSession, Option<String>))` if the line has `"type": "session_metadata"` and can be converted,
+/// `None` otherwise (the line is presumably a regular event or recognized but invalid metadata).
+/// When metadata is recognized but invalid, a warning is logged.
+fn try_parse_session_metadata(line: &str) -> Option<(tt_core::session::AgentSession, Option<String>)> {
+    // Fast path: skip lines that can't possibly be session metadata
+    if !line.contains("\"session_metadata\"") {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "session_metadata" {
+        return None;
+    }
+
+    // At this point, we've confirmed it's a session_metadata record.
+    // Now try to deserialize and convert it.
+    let export: super::export::SessionMetadataExport = match serde_json::from_str(line) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                line_content = %line,
+                error = %e,
+                "recognized session_metadata record failed deserialization"
+            );
+            return None;
+        }
+    };
+
+    // Try to convert to AgentSession
+    let session_id = export.session_id.clone();
+    let source = export.source.clone();
+    if let Some((session, machine_id)) = export.into_agent_session() {
+        Some((session, machine_id))
+    } else {
+        tracing::warn!(
+            session_id = %session_id,
+            source = %source,
+            "session_metadata record has invalid fields, skipping"
+        );
+        None
+    }
 }
 
 #[cfg(test)]
@@ -435,5 +511,21 @@ mod tests {
             events[0].machine_id.as_deref(),
             Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
         );
+    }
+
+    #[test]
+    fn test_import_invalid_session_metadata_not_malformed() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Metadata with invalid source (unknown_agent is not a valid SessionSource)
+        let bad_metadata = r#"{"type":"session_metadata","session_id":"ses_bad","source":"unknown_agent","session_type":"user","project_path":"/p","project_name":"p","start_time":"2025-01-29T12:00:00.000Z","message_count":1,"assistant_message_count":0,"tool_call_count":0}"#;
+        let input = Cursor::new(bad_metadata);
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        // Should NOT be counted as malformed (it's recognized metadata, just invalid)
+        assert_eq!(result.malformed, 0);
+        // Should NOT be imported (conversion failed)
+        assert_eq!(result.total_read, 0);
     }
 }
