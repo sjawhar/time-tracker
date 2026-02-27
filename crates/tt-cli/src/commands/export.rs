@@ -532,6 +532,10 @@ fn export_opencode_events(
                 })?,
             };
             writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
+
+        // Emit session metadata record inline
+        let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+        writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
         }
     }
 
@@ -1505,7 +1509,7 @@ not valid json
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
 
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
 
         assert_eq!(events[0]["type"], "agent_session");
         assert_eq!(events[0]["action"], "started");
@@ -1538,6 +1542,12 @@ not valid json
             events[0]["id"],
             format!("{TEST_MACHINE_ID}:remote.agent:agent_session:{ts}:ses_oc_1:started")
         );
+
+        // Last line should be session metadata
+        assert_eq!(events[5]["type"], "session_metadata");
+        assert_eq!(events[5]["session_id"], "ses_oc_1");
+        assert_eq!(events[5]["source"], "opencode");
+        assert_eq!(events[5]["machine_id"], TEST_MACHINE_ID);
     }
 
     #[test]
@@ -1667,7 +1677,7 @@ not valid json
         .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
-        assert_eq!(output_str.lines().count(), 6);
+        assert_eq!(output_str.lines().count(), 7);
         assert!(output_str.contains("\"source\":\"remote.tmux\""));
         assert!(output_str.contains("\"agent\":\"claude-code\""));
         assert!(output_str.contains("\"agent\":\"opencode\""));
@@ -2289,5 +2299,115 @@ not valid json
         // Should only get the third event (after the marker)
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("00:02:00"));
+    }
+
+    #[test]
+    fn test_opencode_export_emits_session_metadata() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_meta_1",
+            "/home/user/project-x",
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_meta_1",
+            "user",
+            1_700_000_010_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_meta_1",
+            "text",
+            Some("hello world"),
+            1_700_000_010_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+
+        // Find the session_metadata line
+        let metadata_line = lines
+            .iter()
+            .find(|l| l.contains("\"session_metadata\""))
+            .expect("expected session_metadata record in output");
+
+        let metadata: Value = serde_json::from_str(metadata_line).unwrap();
+        assert_eq!(metadata["type"], "session_metadata");
+        assert_eq!(metadata["session_id"], "ses_meta_1");
+        assert_eq!(metadata["source"], "opencode");
+        assert_eq!(metadata["project_path"], "/home/user/project-x");
+        assert_eq!(metadata["message_count"], 1);
+        assert_eq!(metadata["machine_id"], TEST_MACHINE_ID);
+    }
+
+    #[test]
+    fn test_session_metadata_export_roundtrip() {
+        use tt_core::session::{AgentSession, SessionSource, SessionType};
+
+        let session = AgentSession {
+            session_id: "test-round-trip".to_string(),
+            source: SessionSource::Claude,
+            parent_session_id: Some("parent-123".to_string()),
+            session_type: SessionType::Subagent,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2025, 1, 29, 13, 0, 0).unwrap()),
+            message_count: 42,
+            summary: Some("test summary".to_string()),
+            user_prompts: vec!["prompt 1".to_string(), "prompt 2".to_string()],
+            starting_prompt: Some("initial prompt".to_string()),
+            assistant_message_count: 20,
+            tool_call_count: 15,
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        };
+
+        let export = SessionMetadataExport::from_agent_session(&session, Some("test-machine"));
+        assert_eq!(export.record_type, "session_metadata");
+        assert_eq!(export.session_id, "test-round-trip");
+        assert_eq!(export.source, "claude");
+        assert_eq!(export.session_type, "subagent");
+        assert_eq!(export.parent_session_id, Some("parent-123".to_string()));
+        assert_eq!(export.machine_id, Some("test-machine".to_string()));
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&export).unwrap();
+        let parsed: SessionMetadataExport = serde_json::from_str(&json).unwrap();
+        let (recovered, machine_id) = parsed.into_agent_session().expect("should convert back");
+
+        assert_eq!(recovered.session_id, session.session_id);
+        assert_eq!(recovered.source, session.source);
+        assert_eq!(recovered.parent_session_id, session.parent_session_id);
+        assert_eq!(recovered.session_type, session.session_type);
+        assert_eq!(recovered.project_path, session.project_path);
+        assert_eq!(recovered.project_name, session.project_name);
+        assert_eq!(recovered.message_count, session.message_count);
+        assert_eq!(recovered.summary, session.summary);
+        assert_eq!(recovered.user_prompts, session.user_prompts);
+        assert_eq!(recovered.starting_prompt, session.starting_prompt);
+        assert_eq!(recovered.assistant_message_count, session.assistant_message_count);
+        assert_eq!(recovered.tool_call_count, session.tool_call_count);
+        assert_eq!(machine_id, Some("test-machine".to_string()));
     }
 }

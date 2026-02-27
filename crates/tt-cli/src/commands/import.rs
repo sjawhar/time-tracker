@@ -156,8 +156,12 @@ pub fn run(db: &Database) -> Result<ImportResult> {
     let result = import_from_reader(db, stdin.lock())?;
 
     eprintln!(
-        "Imported {} events ({} new, {} duplicates, {} malformed)",
-        result.total_read, result.inserted, result.duplicates, result.malformed
+        "Imported {} events, {} sessions ({} new, {} duplicates, {} malformed)",
+        result.total_read,
+        result.sessions_imported,
+        result.inserted,
+        result.duplicates,
+        result.malformed
     );
 
     Ok(result)
@@ -527,5 +531,86 @@ mod tests {
         assert_eq!(result.malformed, 0);
         // Should NOT be imported (conversion failed)
         assert_eq!(result.total_read, 0);
+    }
+
+    #[test]
+    fn test_import_session_metadata() {
+        let db = Database::open_in_memory().unwrap();
+
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_import_1","source":"opencode","session_type":"user","project_path":"/home/user/project","project_name":"project","start_time":"2025-01-29T12:00:00.000Z","end_time":"2025-01-29T13:00:00.000Z","message_count":10,"summary":"test session","user_prompts":["hello"],"starting_prompt":"hello","assistant_message_count":5,"tool_call_count":3}"#;
+        let event_line = make_jsonl_event("e1", "2025-01-29T12:00:00Z");
+        let input = Cursor::new(format!("{event_line}\n{metadata_line}\n"));
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        assert_eq!(result.total_read, 1); // Only the event counts as total_read
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.sessions_imported, 1);
+        assert_eq!(result.malformed, 0);
+
+        // Verify session was stored
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_import_1");
+        assert_eq!(sessions[0].summary, Some("test session".to_string()));
+        assert_eq!(sessions[0].message_count, 10);
+        assert_eq!(sessions[0].starting_prompt, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_import_session_metadata_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_idem","source":"claude","session_type":"user","project_path":"/home/user/p","project_name":"p","start_time":"2025-01-29T12:00:00.000Z","message_count":5,"assistant_message_count":2,"tool_call_count":1}"#;
+
+        // Import twice
+        let input1 = Cursor::new(format!("{metadata_line}\n"));
+        let result1 = import_from_reader(&db, input1).unwrap();
+        assert_eq!(result1.sessions_imported, 1);
+
+        let input2 = Cursor::new(format!("{metadata_line}\n"));
+        let result2 = import_from_reader(&db, input2).unwrap();
+        assert_eq!(result2.sessions_imported, 1);
+
+        // Should still be just 1 session
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_import_old_format_without_metadata() {
+        // Backward compatibility: old-format exports without metadata lines
+        let db = Database::open_in_memory().unwrap();
+        let input_str = format!(
+            "{}\n{}\n",
+            make_jsonl_event("e1", "2025-01-29T12:00:00Z"),
+            make_jsonl_event("e2", "2025-01-29T12:01:00Z")
+        );
+        let input = Cursor::new(input_str);
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        assert_eq!(result.total_read, 2);
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.sessions_imported, 0);
+        assert_eq!(result.malformed, 0);
     }
 }
