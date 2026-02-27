@@ -296,7 +296,7 @@ pub fn generate_report_data_for_date(
 
     // Calculate time from events using the allocation algorithm
     let config = AllocationConfig::default();
-    let result = allocate_time(&events, &config, Some(period_end));
+    let result = allocate_time(&events, &config, Some(period_end), &HashMap::new());
 
     // Get stream metadata (names) for display
     let all_streams = db.get_streams().context("failed to get streams")?;

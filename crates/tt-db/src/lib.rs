@@ -711,6 +711,71 @@ impl Database {
         Ok(count)
     }
 
+    /// Assigns all events for a session to a stream.
+    ///
+    /// Updates all events where `session_id` matches, setting `stream_id` and
+    /// `assignment_source`. Skips events with `assignment_source = 'user'`.
+    /// Returns the number of events updated.
+    pub fn assign_events_by_session_id(
+        &self,
+        session_id: &str,
+        stream_id: &str,
+        source: &str,
+    ) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
+             WHERE session_id = ?3 AND (assignment_source IS NULL OR assignment_source != 'user')",
+            params![stream_id, source, session_id],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Assigns events matching a CWD pattern and optional time range to a stream.
+    ///
+    /// Uses SQL LIKE for CWD matching (e.g., `%/agent-c/viewer%`).
+    /// Skips events with `assignment_source = 'user'`.
+    /// Returns the number of events updated.
+    pub fn assign_events_by_pattern(
+        &self,
+        cwd_like: &str,
+        start: Option<chrono::DateTime<chrono::Utc>>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+        stream_id: &str,
+    ) -> Result<u64, DbError> {
+        let count = match (start, end) {
+            (Some(s), Some(e)) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp >= ?3 AND timestamp <= ?4 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![
+                    stream_id,
+                    cwd_like,
+                    format_timestamp(s),
+                    format_timestamp(e)
+                ],
+            )?,
+            (Some(s), None) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp >= ?3 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like, format_timestamp(s)],
+            )?,
+            (None, Some(e)) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp <= ?3 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like, format_timestamp(e)],
+            )?,
+            (None, None) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like],
+            )?,
+        };
+        Ok(count as u64)
+    }
+
     /// Retrieves events assigned to a specific stream.
     ///
     /// Events are returned ordered by timestamp ascending.
@@ -2700,7 +2765,7 @@ mod tests {
                 ["test-session-1"],
                 |row| row.get(0),
             )
-            .ok();
+            .unwrap();
         assert_eq!(result, None);
     }
 }

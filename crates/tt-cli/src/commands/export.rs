@@ -220,7 +220,6 @@ fn default_data_dir() -> PathBuf {
 
 /// Returns the default Claude projects directory.
 ///
-///
 /// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
 fn default_claude_dir() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR")
@@ -581,11 +580,11 @@ fn export_opencode_events(
                 })?,
             };
             writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
-
-            // Emit session metadata record inline
-            let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
-            writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
         }
+
+        // Emit session metadata record inline
+        let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+        writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
     }
 
     Ok(())
@@ -2458,6 +2457,77 @@ not valid json
         assert_eq!(metadata["project_path"], "/home/user/project-x");
         assert_eq!(metadata["message_count"], 1);
         assert_eq!(metadata["machine_id"], TEST_MACHINE_ID);
+    }
+
+    #[test]
+    fn test_opencode_export_emits_session_metadata_without_end_time() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        // Insert a session where time_created == time_updated
+        // This produces end_time = None (see opencode.rs:123)
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_no_end_1",
+            "/home/user/project-y",
+            1_700_000_000_000,
+            1_700_000_000_000, // Same as created time
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_no_end_1",
+            "user",
+            1_700_000_000_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_no_end_1",
+            "text",
+            Some("test message"),
+            1_700_000_000_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+
+        // Find the session_metadata line
+        let metadata_line = lines
+            .iter()
+            .find(|l| l.contains("\"session_metadata\""))
+            .expect("expected session_metadata record in output");
+
+        let metadata: Value = serde_json::from_str(metadata_line).unwrap();
+        assert_eq!(metadata["type"], "session_metadata");
+        assert_eq!(metadata["session_id"], "ses_no_end_1");
+        assert_eq!(metadata["source"], "opencode");
+        assert_eq!(metadata["project_path"], "/home/user/project-y");
+        assert_eq!(metadata["message_count"], 1);
+        assert_eq!(metadata["machine_id"], TEST_MACHINE_ID);
+
+        // Verify NO "agent_session" event with action "ended" is present
+        let has_ended_event = lines.iter().any(|l| {
+            serde_json::from_str::<Value>(l)
+                .is_ok_and(|event| event["type"] == "agent_session" && event["action"] == "ended")
+        });
+        assert!(
+            !has_ended_event,
+            "should not have agent_session ended event when end_time is None"
+        );
     }
 
     #[test]

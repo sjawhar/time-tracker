@@ -1,6 +1,6 @@
 ---
 name: infer-streams
-description: Use when analyzing tt context output to identify work streams, assign events to streams, and generate time reports. Triggers on weekly review, standup prep, or explicit stream inference requests.
+description: Use when analyzing tt classify output to identify work streams, assign events to streams, and generate time reports. Triggers on weekly review, standup prep, or explicit stream inference requests.
 ---
 
 # Stream Inference
@@ -58,7 +58,14 @@ If streams exist, start from where the last stream ended. If empty, use "7 days 
 ## Phase 2: Gather Context
 
 ```bash
-tt context --events --agents --streams --gaps --start "{time_range}"
+tt classify --unclassified --json --start "{time_range}"
+```
+
+This shows unclassified sessions and event clusters. Use `--summary` for a compact view.
+For full detail including gaps, use:
+
+```bash
+tt classify --json --unclassified --gaps --start "{time_range}"
 ```
 
 ## Phase 3: Identify Streams
@@ -75,48 +82,38 @@ Present the proposed streams to the user for review before persisting.
 
 ## Phase 4: Create Streams + Assign Events
 
-For each approved stream:
+Build a JSON file matching the `tt classify --apply` format:
 
-### 4a. Create stream and capture ID
+```json
+{
+  "streams": [
+    {"name": "project: stream name", "tags": ["project:project-name"]}
+  ],
+  "assign_by_session": [
+    {"session_id": "ses_abc", "stream": "project: stream name"},
+    {"session_id": "ses_def", "stream": "project: stream name"}
+  ],
+  "assign_by_pattern": [
+    {
+      "cwd_like": "%/project-name/%",
+      "start": "2026-02-26T08:00:00Z",
+      "end": "2026-02-27T08:00:00Z",
+      "stream": "project: stream name"
+    }
+  ]
+}
+```
+
+- Use `assign_by_session` for agent session events (all events for that session move together)
+- Use `assign_by_pattern` for non-session events (tmux_pane_focus, AFK) by CWD + time range
+
+Apply:
+
 ```bash
-STREAM_ID=$(tt streams create "project: stream name")
+tt classify --apply assignments.json
 ```
 
-### 4b. Assign events via SQLite
-
-No CLI command exists for event assignment. Use Python to update tt's database directly:
-
-```python
-import sqlite3, os
-db = sqlite3.connect(os.path.expanduser("~/.local/share/tt/tt.db"))
-
-# Assign agent session events (user_message, agent_session, agent_tool_use)
-db.execute("""
-    UPDATE events SET stream_id = ?, assignment_source = 'inferred'
-    WHERE session_id IN (?, ?, ?) AND stream_id IS NULL
-""", (stream_id, *session_ids))
-
-# Assign tmux_pane_focus events (these have NO session_id — match by cwd + time)
-db.execute("""
-    UPDATE events SET stream_id = ?, assignment_source = 'inferred'
-    WHERE event_type = 'tmux_pane_focus'
-      AND cwd LIKE ?
-      AND stream_id IS NULL
-      AND timestamp BETWEEN ? AND ?
-""", (stream_id, cwd_pattern, start_iso, end_iso))
-
-db.commit()
-db.close()
-```
-
-**Important:** `tmux_pane_focus` events have no `session_id`. They MUST be assigned by cwd pattern + time range.
-
-### 4c. Recompute time
-```bash
-tt recompute --force
-```
-
-This runs the proper allocation algorithm which handles attention windows, AFK, agent timeouts, and focus tracking correctly.
+This creates streams, assigns events, and runs `tt recompute --force` automatically.
 
 ## Phase 5: Report Results
 
@@ -149,7 +146,8 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 | Mistake | Fix |
 |---------|-----|
 | Computing time in Python | **Never.** Use `tt recompute`. The allocation algorithm handles attention windows, AFK, agent timeouts. |
-| Ignoring tmux_pane_focus events | These have NO session_id. Assign by cwd + time range. |
+| Ignoring tmux_pane_focus events | These have NO session_id. Use `assign_by_pattern` in the --apply JSON. |
+| Using raw SQL to assign events | **Never.** Use `tt classify --apply`. Raw SQL can split sessions across streams. |
 | Skipping ingestion | **Always** `tt ingest sessions` first. |
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
 | Reporting partial results | **Never** show a report or time number if remotes haven't been synced or events are unassigned. Incomplete data = wrong answer. |
@@ -158,11 +156,11 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 | Splitting subdirectories | `/pivot/agents` is part of `pivot`. |
 | Streams too coarse | "pivot work" → "pivot: pipeline API redesign". |
 | Leaving events unassigned | Everything gets assigned. Use "misc: {activity}" for unclear. |
-| Stopping after assignment | Always `tt recompute --force` after assigning events. Without it, stream times are stale. |
+| Stopping after classify --apply | `tt classify --apply` runs recompute automatically. No separate step needed. |
 
 ## Done When
 
-1. All events assigned to streams (check `tt context --events` for unassigned)
-2. `tt recompute --force` completed
-3. `tt streams list` shows direct/delegated time per stream
+1. All events assigned to streams (check `tt classify --unclassified`)
+2. `tt streams list` shows direct/delegated time per stream
+3. Report presented to user
 4. Report presented to user

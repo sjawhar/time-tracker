@@ -59,20 +59,18 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         // Check for session metadata records before event parsing.
         // This must come before rewrite_legacy_session_types to avoid the
         // legacy rewriter mangling metadata lines.
-        if let Some((session, machine_id)) = try_parse_session_metadata(&line) {
-            db.upsert_agent_session(&session, machine_id.as_deref())
-                .context("failed to upsert agent session")?;
-            result.sessions_imported += 1;
-            if result.machine_id.is_none() {
-                result.machine_id = machine_id;
+        match parse_metadata_line(&line) {
+            MetadataParseResult::Parsed(session, machine_id) => {
+                db.upsert_agent_session(&session, machine_id.as_deref())
+                    .context("failed to upsert agent session")?;
+                result.sessions_imported += 1;
+                if result.machine_id.is_none() {
+                    result.machine_id = machine_id;
+                }
+                continue;
             }
-            continue;
-        }
-
-        // Check if this line is recognized as metadata but invalid.
-        // If so, skip it without counting as malformed.
-        if is_session_metadata_record(&line) {
-            continue;
+            MetadataParseResult::RecognizedInvalid => continue,
+            MetadataParseResult::NotMetadata => {} // fall through to event parsing
         }
 
         let line = match rewrite_legacy_session_types(&line, line_num) {
@@ -173,47 +171,51 @@ pub fn run(db: &Database) -> Result<ImportResult> {
     Ok(result)
 }
 
-/// Checks if a line is recognized as a session metadata record (regardless of validity).
-fn is_session_metadata_record(line: &str) -> bool {
-    // Fast path: check if line contains the session_metadata type marker
-    if !line.contains("\"session_metadata\"") {
-        return false;
-    }
-
-    // Verify it's actually JSON with type field set to session_metadata
-    serde_json::from_str::<serde_json::Value>(line)
-        .is_ok_and(|value| value.get("type").and_then(|t| t.as_str()) == Some("session_metadata"))
+/// Tri-state result of parsing a metadata line.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "AgentSession is the primary variant"
+)]
+enum MetadataParseResult {
+    /// Successfully parsed into an `AgentSession` + optional `machine_id`
+    Parsed(tt_core::session::AgentSession, Option<String>),
+    /// Recognized as `session_metadata` but invalid (skip without counting as malformed)
+    RecognizedInvalid,
+    /// Not a `session_metadata` record at all (continue with normal event parsing)
+    NotMetadata,
 }
 
-/// Attempts to parse a JSONL line as a session metadata record.
+/// Parses a JSONL line as a session metadata record.
 ///
-/// Returns `Some((AgentSession, Option<String>))` if the line has `"type": "session_metadata"` and can be converted,
-/// `None` otherwise (the line is presumably a regular event or recognized but invalid metadata).
-/// When metadata is recognized but invalid, a warning is logged.
-fn try_parse_session_metadata(
-    line: &str,
-) -> Option<(tt_core::session::AgentSession, Option<String>)> {
+/// Returns a tri-state result:
+/// - `Parsed(session, machine_id)` if the line is valid `session_metadata`
+/// - `RecognizedInvalid` if it's recognized as `session_metadata` but invalid
+/// - `NotMetadata` if it's not a `session_metadata` record at all
+fn parse_metadata_line(line: &str) -> MetadataParseResult {
     // Fast path: skip lines that can't possibly be session metadata
     if !line.contains("\"session_metadata\"") {
-        return None;
+        return MetadataParseResult::NotMetadata;
     }
 
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("type")?.as_str()? != "session_metadata" {
-        return None;
+    // Parse as Value to check type field
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return MetadataParseResult::NotMetadata;
+    };
+
+    if value.get("type").and_then(|t| t.as_str()) != Some("session_metadata") {
+        return MetadataParseResult::NotMetadata;
     }
 
-    // At this point, we've confirmed it's a session_metadata record.
-    // Now try to deserialize and convert it.
+    // It's recognized as session_metadata — try full deserialization
     let export: super::export::SessionMetadataExport = match serde_json::from_str(line) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
-                line_content = %line,
+                session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
                 error = %e,
                 "recognized session_metadata record failed deserialization"
             );
-            return None;
+            return MetadataParseResult::RecognizedInvalid;
         }
     };
 
@@ -221,14 +223,14 @@ fn try_parse_session_metadata(
     let session_id = export.session_id.clone();
     let source = export.source.clone();
     if let Some((session, machine_id)) = export.into_agent_session() {
-        Some((session, machine_id))
+        MetadataParseResult::Parsed(session, machine_id)
     } else {
         tracing::warn!(
             session_id = %session_id,
             source = %source,
             "session_metadata record has invalid fields, skipping"
         );
-        None
+        MetadataParseResult::RecognizedInvalid
     }
 }
 
@@ -583,6 +585,37 @@ mod tests {
         assert_eq!(sessions[0].summary, Some("test session".to_string()));
         assert_eq!(sessions[0].message_count, 10);
         assert_eq!(sessions[0].starting_prompt, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_import_session_metadata_with_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Metadata line WITH machine_id
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_with_mid","source":"opencode","session_type":"user","project_path":"/home/user/proj","project_name":"proj","start_time":"2025-01-29T12:00:00.000Z","message_count":3,"assistant_message_count":1,"tool_call_count":0,"machine_id":"test-machine-abc"}"#;
+        let input = Cursor::new(format!("{metadata_line}\n"));
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        // ImportResult.machine_id should be set from the metadata record
+        assert_eq!(result.machine_id, Some("test-machine-abc".to_string()));
+        assert_eq!(result.sessions_imported, 1);
+        assert_eq!(result.total_read, 0); // metadata is not an event
+        assert_eq!(result.malformed, 0);
+
+        // Verify session was stored
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_with_mid");
     }
 
     #[test]

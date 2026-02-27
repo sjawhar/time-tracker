@@ -23,7 +23,7 @@ digraph standup {
 
   start [label="1. Parse date\n(convert to ISO 8601 UTC)" shape=ellipse];
   ingest [label="2. Run ingestion\ntt ingest sessions"];
-  gather [label="3. Gather context\ntt context --events --agents"];
+  gather [label="3. Gather context\ntt classify --json"];
   analyze [label="4. Invoke infer-streams\n(Skill tool, NOT subagent)"];
   prs [label="5. Look up PRs\n(gh search prs)"];
   draft [label="6. Draft update\n(logical projects, PR links)"];
@@ -38,7 +38,7 @@ digraph standup {
 
 Convert user's date to ISO 8601 UTC range.
 
-**Critical**: `tt context` only accepts ISO 8601 format or relative strings.
+**Critical**: `tt classify` accepts ISO 8601 format or relative strings (e.g., "2 days ago").
 
 | User input | Start (UTC) | End (UTC) |
 |------------|-------------|-----------|
@@ -68,21 +68,21 @@ tt machines                    # List known remotes
 tt sync <remote-label>         # For EACH remote machine listed
 ```
 
-This scans Claude Code and OpenCode session files, syncs remote events, and stores everything in the database. Without it, `tt context` returns incomplete data.
+This scans Claude Code and OpenCode session files, syncs remote events, and stores everything in the database. Without it, `tt classify` returns incomplete data.
 
 ## Phase 3: Gather Context
 
 ```bash
-tt context --events --agents --start "$START" --end "$END"
+tt classify --json --start "$START" --end "$END"
 ```
 
 This outputs JSON with:
-- `agents[]`: Claude sessions with `project_name`, `summary`, `tool_call_count`, `start_time`, `end_time`
-- `events[]`: Raw activity signals (used for direct time calculation)
+- `sessions[]`: Agent sessions with `session_id`, `project_name`, `summary`, `tool_call_count`, `start_time`, `end_time`
+- `event_clusters[]`: Non-session activity grouped by CWD + time
 
 ## Phase 4: Analyze Streams
 
-**REQUIRED: Invoke the `infer-streams` skill** to analyze the `tt context` output. Do NOT try to analyze streams yourself or launch a subagent — use the Skill tool:
+**REQUIRED: Invoke the `infer-streams` skill** to analyze the `tt classify` output. Do NOT try to analyze streams yourself or launch a subagent — use the Skill tool:
 
 ```
 Skill("infer-streams")
@@ -206,9 +206,9 @@ If posting fails:
 
 | Mistake | Fix |
 |---------|-----|
-| Skipping ingestion | **Always** run `tt ingest sessions` before `tt context`. Without it you miss most data. |
+| Skipping ingestion | **Always** run `tt ingest sessions` before `tt classify`. Without it you miss most data. |
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
-| Reporting partial/incomplete numbers | Run the FULL pipeline (ingest → sync → infer streams → recompute) before showing any report. Don't stop partway and present incomplete numbers. |
+| Reporting partial/incomplete numbers | Run the FULL pipeline (ingest → sync → classify → report) before showing any report. Don't stop partway and present incomplete numbers. |
 | Reporting by repo directory | Organize by logical project, not filesystem path. `dotfiles` is never a project. Ask the user. |
 | No PR links | Always run `gh search prs` and link every PR mentioned in the report. |
 | Date format error | Use ISO 8601: `2026-02-02T08:00:00Z` or relative like "1 day ago" |

@@ -131,10 +131,10 @@ pub enum Commands {
         remotes: Vec<String>,
     },
 
-    /// Output context for stream inference (JSON).
+    /// [DEPRECATED] Output context for stream inference (JSON).
     ///
-    /// Outputs JSON containing events, agents, streams, and gaps for a time range.
-    /// Each section is opt-in via flags.
+    /// Use `tt classify` instead, which provides the same data plus
+    /// stream proposals and `--apply` for assignments.
     Context {
         /// Include chronological events.
         #[arg(long)]
@@ -163,6 +163,52 @@ pub enum Commands {
         /// End of time range (ISO 8601, defaults to now).
         #[arg(long)]
         end: Option<String>,
+
+        /// Only show events/sessions without a `stream_id`.
+        #[arg(long)]
+        unclassified: bool,
+
+        /// Compact summary output (one line per session/cluster).
+        #[arg(long)]
+        summary: bool,
+    },
+
+    /// Classify events into streams.
+    ///
+    /// Show unclassified sessions and events, or apply LLM-proposed
+    /// stream assignments.
+    Classify {
+        /// Apply assignments from JSON file or stdin ("-").
+        #[arg(long, value_name = "FILE")]
+        apply: Option<String>,
+
+        /// Only show unclassified events (no `stream_id`).
+        #[arg(long)]
+        unclassified: bool,
+
+        /// Compact summary (one line per session/cluster).
+        #[arg(long)]
+        summary: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Start of time range (ISO 8601 or relative like "2 days ago").
+        #[arg(long)]
+        start: Option<String>,
+
+        /// End of time range (ISO 8601, defaults to now).
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Include gaps between user input events.
+        #[arg(long)]
+        gaps: bool,
+
+        /// Minimum gap duration to include (minutes).
+        #[arg(long, default_value = "5")]
+        gap_threshold: u32,
     },
 }
 
