@@ -194,7 +194,9 @@ fn is_session_metadata_record(line: &str) -> bool {
 /// Returns `Some((AgentSession, Option<String>))` if the line has `"type": "session_metadata"` and can be converted,
 /// `None` otherwise (the line is presumably a regular event or recognized but invalid metadata).
 /// When metadata is recognized but invalid, a warning is logged.
-fn try_parse_session_metadata(line: &str) -> Option<(tt_core::session::AgentSession, Option<String>)> {
+fn try_parse_session_metadata(
+    line: &str,
+) -> Option<(tt_core::session::AgentSession, Option<String>)> {
     // Fast path: skip lines that can't possibly be session metadata
     if !line.contains("\"session_metadata\"") {
         return None;
