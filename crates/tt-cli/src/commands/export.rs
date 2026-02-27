@@ -96,7 +96,10 @@ pub struct SessionMetadataExport {
 
 impl SessionMetadataExport {
     /// Creates a metadata export record from an `AgentSession`.
-    pub fn from_agent_session(session: &tt_core::session::AgentSession, machine_id: Option<&str>) -> Self {
+    pub fn from_agent_session(
+        session: &tt_core::session::AgentSession,
+        machine_id: Option<&str>,
+    ) -> Self {
         Self {
             record_type: "session_metadata".to_string(),
             session_id: session.session_id.clone(),
@@ -132,26 +135,29 @@ impl SessionMetadataExport {
         let session_type: tt_core::session::SessionType = self.session_type.parse().ok()?;
 
         let machine_id = self.machine_id.clone();
-        Some((tt_core::session::AgentSession {
-            session_id: self.session_id,
-            source,
-            parent_session_id: self.parent_session_id,
-            session_type,
-            project_path: self.project_path,
-            project_name: self.project_name,
-            start_time,
-            end_time,
-            message_count: self.message_count,
-            summary: self.summary,
-            user_prompts: self.user_prompts,
-            starting_prompt: self.starting_prompt,
-            assistant_message_count: self.assistant_message_count,
-            tool_call_count: self.tool_call_count,
-            // Timestamps are not part of metadata export — they're only used for
-            // event generation, not session indexing.
-            user_message_timestamps: Vec::new(),
-            tool_call_timestamps: Vec::new(),
-        }, machine_id))
+        Some((
+            tt_core::session::AgentSession {
+                session_id: self.session_id,
+                source,
+                parent_session_id: self.parent_session_id,
+                session_type,
+                project_path: self.project_path,
+                project_name: self.project_name,
+                start_time,
+                end_time,
+                message_count: self.message_count,
+                summary: self.summary,
+                user_prompts: self.user_prompts,
+                starting_prompt: self.starting_prompt,
+                assistant_message_count: self.assistant_message_count,
+                tool_call_count: self.tool_call_count,
+                // Timestamps are not part of metadata export — they're only used for
+                // event generation, not session indexing.
+                user_message_timestamps: Vec::new(),
+                tool_call_timestamps: Vec::new(),
+            },
+            machine_id,
+        ))
     }
 }
 
@@ -270,7 +276,7 @@ fn run_impl(
     // Export Claude events with incremental parsing
     if claude_dir.exists() {
         let manifest_path = state_dir.join("claude-manifest.json");
-        export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
+        let _ = export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
     }
 
     if let Some(oc_db) = opencode_db {
@@ -385,7 +391,7 @@ fn export_claude_events(
     manifest_path: &Path,
     machine_id: &str,
     output: &mut dyn Write,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let logs = discover_claude_logs(claude_dir)?;
     let mut manifest = ClaudeManifest::load(manifest_path);
 
@@ -394,6 +400,7 @@ fn export_claude_events(
     let mut seen_sessions: HashMap<String, Option<String>> = HashMap::new();
     // Track which files we've processed (to clean up deleted files from manifest)
     let mut processed_files: HashSet<PathBuf> = HashSet::new();
+    let mut files_with_new_content = Vec::new();
 
     for log_path in logs {
         let start_offset = manifest.sessions.get(&log_path).copied().unwrap_or(0);
@@ -405,6 +412,9 @@ fn export_claude_events(
             start_offset,
         ) {
             Ok(final_offset) => {
+                if final_offset > start_offset {
+                    files_with_new_content.push(log_path.clone());
+                }
                 manifest.sessions.insert(log_path.clone(), final_offset);
                 processed_files.insert(log_path);
             }
@@ -426,7 +436,46 @@ fn export_claude_events(
         tracing::warn!(error = %e, "failed to save manifest, next export may reprocess some events");
     }
 
-    Ok(())
+    for file_path in &files_with_new_content {
+        let Some(session_id) = file_path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|id| !id.is_empty())
+        else {
+            tracing::warn!(path = %file_path.display(), "skipping session metadata for file with invalid session id");
+            continue;
+        };
+
+        let parent_session_id = file_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| *name == "subagents")
+            .and_then(|_| file_path.parent().and_then(Path::parent))
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str);
+
+        match tt_core::session::parse_session_file(file_path, session_id, parent_session_id) {
+            Ok(session) => {
+                if session.parent_session_id.is_some() {
+                    continue;
+                }
+
+                let metadata =
+                    SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+                writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %file_path.display(),
+                    error = %e,
+                    "failed to parse Claude session metadata"
+                );
+            }
+        }
+    }
+
+    Ok(files_with_new_content)
 }
 
 fn export_opencode_events(
@@ -533,9 +582,9 @@ fn export_opencode_events(
             };
             writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
 
-        // Emit session metadata record inline
-        let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
-        writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
+            // Emit session metadata record inline
+            let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+            writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
         }
     }
 
@@ -1097,14 +1146,65 @@ not valid json
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
 
-        // Should have 2 events: session start + user message
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
 
         // First event should be session start
         let session_event: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(session_event["type"], "agent_session");
         assert_eq!(session_event["action"], "started");
         assert_eq!(session_event["session_id"], "sess123");
+    }
+
+    #[test]
+    fn test_claude_session_metadata_inline() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let parent_session = r#"{"type":"user","sessionId":"parent-session","timestamp":"2025-01-29T12:00:00Z","cwd":"/home/user/project","message":{"content":"hello"}}"#;
+        fs::write(
+            project_dir.join("parent-session.jsonl"),
+            format!("{parent_session}\n"),
+        )
+        .unwrap();
+
+        let subagent_dir = project_dir.join("parent-session").join("subagents");
+        fs::create_dir_all(&subagent_dir).unwrap();
+        let subagent_session = r#"{"type":"user","sessionId":"agent-a913a65","timestamp":"2025-01-29T12:01:00Z","cwd":"/home/user/project","message":{"content":"subagent"}}"#;
+        fs::write(
+            subagent_dir.join("agent-a913a65.jsonl"),
+            format!("{subagent_session}\n"),
+        )
+        .unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let records: Vec<Value> = output_str
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let metadata: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["type"] == "session_metadata")
+            .collect();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0]["session_id"], "parent-session");
+        assert_eq!(metadata[0]["machine_id"], TEST_MACHINE_ID);
+
+        assert!(!output_str.contains("agent-a913a65"));
     }
 
     #[test]
@@ -2406,7 +2506,10 @@ not valid json
         assert_eq!(recovered.summary, session.summary);
         assert_eq!(recovered.user_prompts, session.user_prompts);
         assert_eq!(recovered.starting_prompt, session.starting_prompt);
-        assert_eq!(recovered.assistant_message_count, session.assistant_message_count);
+        assert_eq!(
+            recovered.assistant_message_count,
+            session.assistant_message_count
+        );
         assert_eq!(recovered.tool_call_count, session.tool_call_count);
         assert_eq!(machine_id, Some("test-machine".to_string()));
     }

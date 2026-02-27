@@ -64,10 +64,9 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
     let result = import::import_from_reader(db, reader)?;
 
     println!(
-        "  Imported {} events ({} duplicates, {} malformed)",
-        result.inserted, result.duplicates, result.malformed
+        "  Imported {} events, {} sessions ({} duplicates, {} malformed)",
+        result.inserted, result.sessions_imported, result.duplicates, result.malformed
     );
-
     if let Some(ref mid) = machine_id {
         let new_last_id = db.get_latest_event_id_for_machine(mid)?;
         db.upsert_machine(mid, remote, new_last_id.as_deref())?;

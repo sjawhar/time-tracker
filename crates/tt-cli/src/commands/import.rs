@@ -27,6 +27,8 @@ pub struct ImportResult {
     pub malformed: usize,
     /// Number of agent sessions imported.
     pub sessions_imported: usize,
+    /// Machine ID extracted from events or session metadata.
+    pub machine_id: Option<String>,
 }
 
 /// Imports events from a reader into the database.
@@ -43,6 +45,7 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         duplicates: 0,
         malformed: 0,
         sessions_imported: 0,
+        machine_id: None,
     };
 
     for (line_num, line_result) in buf_reader.lines().enumerate() {
@@ -60,6 +63,9 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
             db.upsert_agent_session(&session, machine_id.as_deref())
                 .context("failed to upsert agent session")?;
             result.sessions_imported += 1;
+            if result.machine_id.is_none() {
+                result.machine_id = machine_id;
+            }
             continue;
         }
 
@@ -94,6 +100,10 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
                 // Extract machine_id from event ID prefix (UUID before first colon-separated source)
                 if event.machine_id.is_none() {
                     event.machine_id = extract_machine_id(&event.id);
+                }
+
+                if result.machine_id.is_none() {
+                    result.machine_id.clone_from(&event.machine_id);
                 }
 
                 result.total_read += 1;
@@ -514,6 +524,17 @@ mod tests {
         assert_eq!(
             events[0].machine_id.as_deref(),
             Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn test_import_result_has_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let event = r#"{"id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1","timestamp":"2025-01-29T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}"#;
+        let result = import_from_reader(&db, Cursor::new(event)).unwrap();
+        assert_eq!(
+            result.machine_id,
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
         );
     }
 
