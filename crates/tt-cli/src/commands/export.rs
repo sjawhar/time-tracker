@@ -219,7 +219,7 @@ fn default_data_dir() -> PathBuf {
 }
 
 /// Returns the default Claude projects directory.
-/// Returns the default Claude projects directory.
+///
 ///
 /// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
 fn default_claude_dir() -> PathBuf {

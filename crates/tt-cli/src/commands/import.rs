@@ -166,12 +166,8 @@ pub fn run(db: &Database) -> Result<ImportResult> {
     let result = import_from_reader(db, stdin.lock())?;
 
     eprintln!(
-        "Imported {} events, {} sessions ({} new, {} duplicates, {} malformed)",
-        result.total_read,
-        result.sessions_imported,
-        result.inserted,
-        result.duplicates,
-        result.malformed
+        "Imported {} new events, {} sessions ({} duplicates, {} malformed lines)",
+        result.inserted, result.sessions_imported, result.duplicates, result.malformed
     );
 
     Ok(result)
