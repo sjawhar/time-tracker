@@ -270,7 +270,8 @@ pub fn generate_report_data(
     generated_at: DateTime<Utc>,
 ) -> Result<ReportData> {
     let today = generated_at.with_timezone(&Local).date_naive();
-    generate_report_data_for_date(db, period, generated_at, today)
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "Etc/UTC".to_string());
+    generate_report_data_for_date(db, period, generated_at, today, timezone)
 }
 
 /// Generates report data from the database for a specific reference date.
@@ -279,6 +280,7 @@ pub fn generate_report_data_for_date(
     period: Period,
     generated_at: DateTime<Utc>,
     reference_date: NaiveDate,
+    timezone: String,
 ) -> Result<ReportData> {
     let (period_start, period_end) = get_period_boundaries(period, reference_date);
 
@@ -286,8 +288,6 @@ pub fn generate_report_data_for_date(
         Period::Week | Period::LastWeek => PeriodType::Week,
         Period::Day | Period::LastDay => PeriodType::Day,
     };
-
-    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
 
     // Get events within the period
     let events = db
@@ -809,10 +809,17 @@ fn generate_weekly_reports(
     generated_at: DateTime<Utc>,
 ) -> Result<Vec<ReportData>> {
     let today = Local::now().date_naive();
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "Etc/UTC".to_string());
     let mut reports = Vec::with_capacity(weeks as usize);
     for offset in 0..weeks {
         let reference_date = today - chrono::Duration::days(i64::from(offset) * 7);
-        let data = generate_report_data_for_date(db, Period::Week, generated_at, reference_date)?;
+        let data = generate_report_data_for_date(
+            db,
+            Period::Week,
+            generated_at,
+            reference_date,
+            timezone.clone(),
+        )?;
         reports.push(data);
     }
     Ok(reports)
@@ -1024,7 +1031,14 @@ mod tests {
         let reports = reference_dates
             .iter()
             .map(|date| {
-                generate_report_data_for_date(&db, Period::Week, generated_at, *date).unwrap()
+                generate_report_data_for_date(
+                    &db,
+                    Period::Week,
+                    generated_at,
+                    *date,
+                    "Etc/UTC".to_string(),
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let weeks_report = JsonWeeksReport {
@@ -1232,7 +1246,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(), // Mon midnight UTC (assuming UTC-8)
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
@@ -1249,7 +1263,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![
                 make_test_stream("abc123def456", "tmux/dev/session-1", 7_200_000, 4_500_000), // 2h direct, 1h15m delegated
                 make_test_stream("def456ghi789", "tmux/dev/session-2", 2_700_000, 1_800_000), // 45m direct, 30m delegated
@@ -1269,7 +1283,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1295,7 +1309,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![
                 make_test_stream("abc123def456", "tmux/dev/session-1", 3_600_000, 0),
                 make_test_stream("def456ghi789", "tmux/dev/session-2", 1_800_000, 600_000),
@@ -1321,7 +1335,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1346,7 +1360,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![
                 make_test_stream("abc123def456", "tmux/dev/session-1", 1_200_000, 0),
                 make_test_stream("def456ghi789", "tmux/dev/session-2", 600_000, 300_000),
@@ -1368,7 +1382,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end,
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1409,7 +1423,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end,
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1481,7 +1495,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end,
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1544,7 +1558,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 29, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 1, 30, 8, 0, 0).unwrap(),
             period_type: PeriodType::Day,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1578,7 +1592,7 @@ mod tests {
             period_start: Utc.with_ymd_and_hms(2025, 1, 27, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 2, 3, 8, 0, 0).unwrap(),
             period_type: PeriodType::Week,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams,
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
@@ -1625,7 +1639,7 @@ Delegated time: 3h 13m (36%)
             period_start: Utc.with_ymd_and_hms(2025, 1, 29, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 1, 30, 8, 0, 0).unwrap(),
             period_type: PeriodType::Day,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
@@ -1648,7 +1662,7 @@ Delegated time: 3h 13m (36%)
             period_start: Utc.with_ymd_and_hms(2025, 1, 29, 8, 0, 0).unwrap(),
             period_end: Utc.with_ymd_and_hms(2025, 1, 30, 8, 0, 0).unwrap(),
             period_type: PeriodType::Day,
-            timezone: "America/Los_Angeles".to_string(),
+            timezone: "Etc/UTC".to_string(),
             streams: vec![make_test_stream(
                 "abc123def456",
                 "tmux/dev/session-1",
