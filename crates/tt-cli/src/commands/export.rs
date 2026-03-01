@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,6 +60,105 @@ pub struct AgentToolUseData {
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// Metadata record for agent sessions in the JSONL export stream.
+///
+/// Emitted alongside events. Importers that don't recognize this record type
+/// will log it as malformed and skip it — no breakage, just no session import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadataExport {
+    /// Always `"session_metadata"` — distinguishes from event records.
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub session_id: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub session_type: String,
+    pub project_path: String,
+    pub project_name: String,
+    pub start_time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    pub message_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_prompts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starting_prompt: Option<String>,
+    pub assistant_message_count: i32,
+    pub tool_call_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+}
+
+impl SessionMetadataExport {
+    /// Creates a metadata export record from an `AgentSession`.
+    pub fn from_agent_session(
+        session: &tt_core::session::AgentSession,
+        machine_id: Option<&str>,
+    ) -> Self {
+        Self {
+            record_type: "session_metadata".to_string(),
+            session_id: session.session_id.clone(),
+            source: session.source.as_str().to_string(),
+            parent_session_id: session.parent_session_id.clone(),
+            session_type: session.session_type.as_str().to_string(),
+            project_path: session.project_path.clone(),
+            project_name: session.project_name.clone(),
+            start_time: session
+                .start_time
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            end_time: session
+                .end_time
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            message_count: session.message_count,
+            summary: session.summary.clone(),
+            user_prompts: session.user_prompts.clone(),
+            starting_prompt: session.starting_prompt.clone(),
+            assistant_message_count: session.assistant_message_count,
+            tool_call_count: session.tool_call_count,
+            machine_id: machine_id.map(String::from),
+        }
+    }
+
+    /// Converts this export record into an `AgentSession` for database import.
+    pub fn into_agent_session(self) -> Option<(tt_core::session::AgentSession, Option<String>)> {
+        let start_time: DateTime<Utc> = self.start_time.parse().ok()?;
+        let end_time = self
+            .end_time
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        let source: tt_core::session::SessionSource = self.source.parse().ok()?;
+        let session_type: tt_core::session::SessionType = self.session_type.parse().ok()?;
+
+        let machine_id = self.machine_id.clone();
+        Some((
+            tt_core::session::AgentSession {
+                session_id: self.session_id,
+                source,
+                parent_session_id: self.parent_session_id,
+                session_type,
+                project_path: self.project_path,
+                project_name: self.project_name,
+                start_time,
+                end_time,
+                message_count: self.message_count,
+                summary: self.summary,
+                user_prompts: self.user_prompts,
+                starting_prompt: self.starting_prompt,
+                assistant_message_count: self.assistant_message_count,
+                tool_call_count: self.tool_call_count,
+                // Timestamps are not part of metadata export — they're only used for
+                // event generation, not session indexing.
+                user_message_timestamps: Vec::new(),
+                tool_call_timestamps: Vec::new(),
+            },
+            machine_id,
+        ))
+    }
 }
 
 /// Manifest tracking byte offsets for incremental Claude log parsing.
@@ -120,7 +219,6 @@ fn default_data_dir() -> PathBuf {
 }
 
 /// Returns the default Claude projects directory.
-/// Returns the default Claude projects directory.
 ///
 /// Respects `CLAUDE_CONFIG_DIR` if set, otherwise falls back to `~/.claude`.
 fn default_claude_dir() -> PathBuf {
@@ -177,7 +275,7 @@ fn run_impl(
     // Export Claude events with incremental parsing
     if claude_dir.exists() {
         let manifest_path = state_dir.join("claude-manifest.json");
-        export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
+        let _ = export_claude_events(claude_dir, &manifest_path, machine_id, output)?;
     }
 
     if let Some(oc_db) = opencode_db {
@@ -292,7 +390,7 @@ fn export_claude_events(
     manifest_path: &Path,
     machine_id: &str,
     output: &mut dyn Write,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     let logs = discover_claude_logs(claude_dir)?;
     let mut manifest = ClaudeManifest::load(manifest_path);
 
@@ -301,6 +399,7 @@ fn export_claude_events(
     let mut seen_sessions: HashMap<String, Option<String>> = HashMap::new();
     // Track which files we've processed (to clean up deleted files from manifest)
     let mut processed_files: HashSet<PathBuf> = HashSet::new();
+    let mut files_with_new_content = Vec::new();
 
     for log_path in logs {
         let start_offset = manifest.sessions.get(&log_path).copied().unwrap_or(0);
@@ -312,6 +411,9 @@ fn export_claude_events(
             start_offset,
         ) {
             Ok(final_offset) => {
+                if final_offset > start_offset {
+                    files_with_new_content.push(log_path.clone());
+                }
                 manifest.sessions.insert(log_path.clone(), final_offset);
                 processed_files.insert(log_path);
             }
@@ -333,7 +435,46 @@ fn export_claude_events(
         tracing::warn!(error = %e, "failed to save manifest, next export may reprocess some events");
     }
 
-    Ok(())
+    for file_path in &files_with_new_content {
+        let Some(session_id) = file_path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|id| !id.is_empty())
+        else {
+            tracing::warn!(path = %file_path.display(), "skipping session metadata for file with invalid session id");
+            continue;
+        };
+
+        let parent_session_id = file_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|name| *name == "subagents")
+            .and_then(|_| file_path.parent().and_then(Path::parent))
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str);
+
+        match tt_core::session::parse_session_file(file_path, session_id, parent_session_id) {
+            Ok(session) => {
+                if session.parent_session_id.is_some() {
+                    continue;
+                }
+
+                let metadata =
+                    SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+                writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %file_path.display(),
+                    error = %e,
+                    "failed to parse Claude session metadata"
+                );
+            }
+        }
+    }
+
+    Ok(files_with_new_content)
 }
 
 fn export_opencode_events(
@@ -440,6 +581,10 @@ fn export_opencode_events(
             };
             writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
         }
+
+        // Emit session metadata record inline
+        let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+        writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
     }
 
     Ok(())
@@ -1000,14 +1145,65 @@ not valid json
         let output_str = String::from_utf8(output.into_inner()).unwrap();
         let lines: Vec<&str> = output_str.lines().collect();
 
-        // Should have 2 events: session start + user message
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
 
         // First event should be session start
         let session_event: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(session_event["type"], "agent_session");
         assert_eq!(session_event["action"], "started");
         assert_eq!(session_event["session_id"], "sess123");
+    }
+
+    #[test]
+    fn test_claude_session_metadata_inline() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let parent_session = r#"{"type":"user","sessionId":"parent-session","timestamp":"2025-01-29T12:00:00Z","cwd":"/home/user/project","message":{"content":"hello"}}"#;
+        fs::write(
+            project_dir.join("parent-session.jsonl"),
+            format!("{parent_session}\n"),
+        )
+        .unwrap();
+
+        let subagent_dir = project_dir.join("parent-session").join("subagents");
+        fs::create_dir_all(&subagent_dir).unwrap();
+        let subagent_session = r#"{"type":"user","sessionId":"agent-a913a65","timestamp":"2025-01-29T12:01:00Z","cwd":"/home/user/project","message":{"content":"subagent"}}"#;
+        fs::write(
+            subagent_dir.join("agent-a913a65.jsonl"),
+            format!("{subagent_session}\n"),
+        )
+        .unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let records: Vec<Value> = output_str
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let metadata: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["type"] == "session_metadata")
+            .collect();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0]["session_id"], "parent-session");
+        assert_eq!(metadata[0]["machine_id"], TEST_MACHINE_ID);
+
+        assert!(!output_str.contains("agent-a913a65"));
     }
 
     #[test]
@@ -1412,7 +1608,7 @@ not valid json
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
 
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
 
         assert_eq!(events[0]["type"], "agent_session");
         assert_eq!(events[0]["action"], "started");
@@ -1445,6 +1641,12 @@ not valid json
             events[0]["id"],
             format!("{TEST_MACHINE_ID}:remote.agent:agent_session:{ts}:ses_oc_1:started")
         );
+
+        // Last line should be session metadata
+        assert_eq!(events[5]["type"], "session_metadata");
+        assert_eq!(events[5]["session_id"], "ses_oc_1");
+        assert_eq!(events[5]["source"], "opencode");
+        assert_eq!(events[5]["machine_id"], TEST_MACHINE_ID);
     }
 
     #[test]
@@ -1574,7 +1776,7 @@ not valid json
         .unwrap();
 
         let output_str = String::from_utf8(output.into_inner()).unwrap();
-        assert_eq!(output_str.lines().count(), 6);
+        assert_eq!(output_str.lines().count(), 7);
         assert!(output_str.contains("\"source\":\"remote.tmux\""));
         assert!(output_str.contains("\"agent\":\"claude-code\""));
         assert!(output_str.contains("\"agent\":\"opencode\""));
@@ -2196,5 +2398,189 @@ not valid json
         // Should only get the third event (after the marker)
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("00:02:00"));
+    }
+
+    #[test]
+    fn test_opencode_export_emits_session_metadata() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_meta_1",
+            "/home/user/project-x",
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_meta_1",
+            "user",
+            1_700_000_010_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_meta_1",
+            "text",
+            Some("hello world"),
+            1_700_000_010_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+
+        // Find the session_metadata line
+        let metadata_line = lines
+            .iter()
+            .find(|l| l.contains("\"session_metadata\""))
+            .expect("expected session_metadata record in output");
+
+        let metadata: Value = serde_json::from_str(metadata_line).unwrap();
+        assert_eq!(metadata["type"], "session_metadata");
+        assert_eq!(metadata["session_id"], "ses_meta_1");
+        assert_eq!(metadata["source"], "opencode");
+        assert_eq!(metadata["project_path"], "/home/user/project-x");
+        assert_eq!(metadata["message_count"], 1);
+        assert_eq!(metadata["machine_id"], TEST_MACHINE_ID);
+    }
+
+    #[test]
+    fn test_opencode_export_emits_session_metadata_without_end_time() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let opencode_db = create_test_opencode_db(&data_dir);
+
+        // Insert a session where time_created == time_updated
+        // This produces end_time = None (see opencode.rs:123)
+        insert_opencode_session(
+            opencode_db.as_path(),
+            "ses_no_end_1",
+            "/home/user/project-y",
+            1_700_000_000_000,
+            1_700_000_000_000, // Same as created time
+        );
+        insert_opencode_message(
+            opencode_db.as_path(),
+            "m1",
+            "ses_no_end_1",
+            "user",
+            1_700_000_000_000,
+        );
+        insert_opencode_part(
+            opencode_db.as_path(),
+            "p1",
+            "m1",
+            "ses_no_end_1",
+            "text",
+            Some("test message"),
+            1_700_000_000_000,
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(opencode_db.as_path()),
+            TEST_MACHINE_ID,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+
+        // Find the session_metadata line
+        let metadata_line = lines
+            .iter()
+            .find(|l| l.contains("\"session_metadata\""))
+            .expect("expected session_metadata record in output");
+
+        let metadata: Value = serde_json::from_str(metadata_line).unwrap();
+        assert_eq!(metadata["type"], "session_metadata");
+        assert_eq!(metadata["session_id"], "ses_no_end_1");
+        assert_eq!(metadata["source"], "opencode");
+        assert_eq!(metadata["project_path"], "/home/user/project-y");
+        assert_eq!(metadata["message_count"], 1);
+        assert_eq!(metadata["machine_id"], TEST_MACHINE_ID);
+
+        // Verify NO "agent_session" event with action "ended" is present
+        let has_ended_event = lines.iter().any(|l| {
+            serde_json::from_str::<Value>(l)
+                .is_ok_and(|event| event["type"] == "agent_session" && event["action"] == "ended")
+        });
+        assert!(
+            !has_ended_event,
+            "should not have agent_session ended event when end_time is None"
+        );
+    }
+
+    #[test]
+    fn test_session_metadata_export_roundtrip() {
+        use tt_core::session::{AgentSession, SessionSource, SessionType};
+
+        let session = AgentSession {
+            session_id: "test-round-trip".to_string(),
+            source: SessionSource::Claude,
+            parent_session_id: Some("parent-123".to_string()),
+            session_type: SessionType::Subagent,
+            project_path: "/home/user/project".to_string(),
+            project_name: "project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2025, 1, 29, 13, 0, 0).unwrap()),
+            message_count: 42,
+            summary: Some("test summary".to_string()),
+            user_prompts: vec!["prompt 1".to_string(), "prompt 2".to_string()],
+            starting_prompt: Some("initial prompt".to_string()),
+            assistant_message_count: 20,
+            tool_call_count: 15,
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        };
+
+        let export = SessionMetadataExport::from_agent_session(&session, Some("test-machine"));
+        assert_eq!(export.record_type, "session_metadata");
+        assert_eq!(export.session_id, "test-round-trip");
+        assert_eq!(export.source, "claude");
+        assert_eq!(export.session_type, "subagent");
+        assert_eq!(export.parent_session_id, Some("parent-123".to_string()));
+        assert_eq!(export.machine_id, Some("test-machine".to_string()));
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&export).unwrap();
+        let parsed: SessionMetadataExport = serde_json::from_str(&json).unwrap();
+        let (recovered, machine_id) = parsed.into_agent_session().expect("should convert back");
+
+        assert_eq!(recovered.session_id, session.session_id);
+        assert_eq!(recovered.source, session.source);
+        assert_eq!(recovered.parent_session_id, session.parent_session_id);
+        assert_eq!(recovered.session_type, session.session_type);
+        assert_eq!(recovered.project_path, session.project_path);
+        assert_eq!(recovered.project_name, session.project_name);
+        assert_eq!(recovered.message_count, session.message_count);
+        assert_eq!(recovered.summary, session.summary);
+        assert_eq!(recovered.user_prompts, session.user_prompts);
+        assert_eq!(recovered.starting_prompt, session.starting_prompt);
+        assert_eq!(
+            recovered.assistant_message_count,
+            session.assistant_message_count
+        );
+        assert_eq!(recovered.tool_call_count, session.tool_call_count);
+        assert_eq!(machine_id, Some("test-machine".to_string()));
     }
 }

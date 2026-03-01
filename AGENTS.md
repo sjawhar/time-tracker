@@ -58,6 +58,9 @@ cargo run -- --help             # Show CLI help
 tt init --label devbox          # Initialize machine identity
 tt sync devbox gpu-server       # Pull events from remote machines
 tt machines                     # List known remote machines
+tt classify --json              # Show sessions + events for classification
+tt classify --apply input.json  # Apply stream assignments from LLM
+tt classify --unclassified      # Show only unassigned data
 ```
 
 CI (`.github/workflows/pr-and-main.yml`): lint job (fmt + deny) + build job (clippy + test). Runs on push to main and PRs.

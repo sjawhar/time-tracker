@@ -711,6 +711,71 @@ impl Database {
         Ok(count)
     }
 
+    /// Assigns all events for a session to a stream.
+    ///
+    /// Updates all events where `session_id` matches, setting `stream_id` and
+    /// `assignment_source`. Skips events with `assignment_source = 'user'`.
+    /// Returns the number of events updated.
+    pub fn assign_events_by_session_id(
+        &self,
+        session_id: &str,
+        stream_id: &str,
+        source: &str,
+    ) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
+             WHERE session_id = ?3 AND (assignment_source IS NULL OR assignment_source != 'user')",
+            params![stream_id, source, session_id],
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Assigns events matching a CWD pattern and optional time range to a stream.
+    ///
+    /// Uses SQL LIKE for CWD matching (e.g., `%/agent-c/viewer%`).
+    /// Skips events with `assignment_source = 'user'`.
+    /// Returns the number of events updated.
+    pub fn assign_events_by_pattern(
+        &self,
+        cwd_like: &str,
+        start: Option<chrono::DateTime<chrono::Utc>>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+        stream_id: &str,
+    ) -> Result<u64, DbError> {
+        let count = match (start, end) {
+            (Some(s), Some(e)) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp >= ?3 AND timestamp <= ?4 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![
+                    stream_id,
+                    cwd_like,
+                    format_timestamp(s),
+                    format_timestamp(e)
+                ],
+            )?,
+            (Some(s), None) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp >= ?3 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like, format_timestamp(s)],
+            )?,
+            (None, Some(e)) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 AND timestamp <= ?3 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like, format_timestamp(e)],
+            )?,
+            (None, None) => self.conn.execute(
+                "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+                 WHERE cwd LIKE ?2 \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')",
+                params![stream_id, cwd_like],
+            )?,
+        };
+        Ok(count as u64)
+    }
+
     /// Retrieves events assigned to a specific stream.
     ///
     /// Events are returned ordered by timestamp ascending.
@@ -1095,6 +1160,7 @@ impl Database {
     pub fn upsert_agent_session(
         &self,
         entry: &tt_core::session::AgentSession,
+        machine_id: Option<&str>,
     ) -> Result<(), DbError> {
         let user_prompts_json =
             serde_json::to_string(&entry.user_prompts).unwrap_or_else(|_| "[]".to_string());
@@ -1131,7 +1197,7 @@ impl Database {
                 entry.assistant_message_count,
                 entry.tool_call_count,
                 entry.session_type.as_str(),
-                Option::<String>::None,
+                machine_id,
             ],
         )?;
         Ok(())
@@ -2241,7 +2307,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        db.upsert_agent_session(&entry).unwrap();
+        db.upsert_agent_session(&entry, None).unwrap();
 
         let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
         let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
@@ -2288,7 +2354,7 @@ mod tests {
             tool_call_timestamps: Vec::new(),
         };
 
-        db.upsert_agent_session(&entry).unwrap();
+        db.upsert_agent_session(&entry, None).unwrap();
 
         let start = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap();
         let end = chrono::Utc.with_ymd_and_hms(2026, 1, 29, 12, 0, 0).unwrap();
@@ -2649,5 +2715,57 @@ mod tests {
         assert_eq!(end.action.as_deref(), Some("ended"));
         assert_eq!(legacy_start.action.as_deref(), Some("started"));
         assert_eq!(legacy_end.action.as_deref(), Some("ended"));
+    }
+
+    #[test]
+    fn test_upsert_agent_session_stores_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let session = tt_core::session::AgentSession {
+            session_id: "test-session-1".to_string(),
+            source: tt_core::session::SessionSource::Claude,
+            parent_session_id: None,
+            session_type: tt_core::session::SessionType::User,
+            project_path: "/home/test/project".to_string(),
+            project_name: "test-project".to_string(),
+            start_time: Utc.with_ymd_and_hms(2026, 1, 29, 9, 0, 0).unwrap(),
+            end_time: Some(Utc.with_ymd_and_hms(2026, 1, 29, 10, 0, 0).unwrap()),
+            message_count: 5,
+            summary: Some("Test session".to_string()),
+            user_prompts: vec![],
+            starting_prompt: None,
+            assistant_message_count: 3,
+            tool_call_count: 1,
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        };
+
+        // Upsert with machine_id = Some("test-machine-uuid")
+        db.upsert_agent_session(&session, Some("test-machine-uuid"))
+            .unwrap();
+
+        // Query and verify machine_id is stored
+        let row: String = db
+            .conn
+            .query_row(
+                "SELECT machine_id FROM agent_sessions WHERE session_id = ?1",
+                ["test-session-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, "test-machine-uuid");
+
+        // Upsert same session with machine_id = None (should overwrite)
+        db.upsert_agent_session(&session, None).unwrap();
+
+        // Query and verify machine_id is now NULL
+        let result: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT machine_id FROM agent_sessions WHERE session_id = ?1",
+                ["test-session-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(result, None);
     }
 }
