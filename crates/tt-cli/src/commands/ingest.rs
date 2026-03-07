@@ -389,7 +389,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
 
     let mut event_count = 0usize;
     for session in &all_sessions {
-        db.upsert_agent_session(session)
+        db.upsert_agent_session(session, None)
             .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
         let events = create_session_events(session, machine_id.as_deref());
@@ -450,6 +450,10 @@ fn project_suffix(cwd: &str) -> Option<&str> {
 
 /// Auto-assign unassigned events to existing streams based on `cwd` matching.
 ///
+/// Only assigns events when the CWD maps to exactly ONE existing stream
+/// (no ambiguity). If a CWD could match multiple streams, the event is left
+/// unassigned for the LLM to classify via `tt classify`.
+///
 /// First tries exact `cwd` match, then falls back to matching by project suffix
 /// (path after `/home/<user>/`). This handles multi-machine setups where the
 /// same project lives under different home directories.
@@ -458,10 +462,11 @@ fn project_suffix(cwd: &str) -> Option<&str> {
 fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
     use std::collections::HashMap;
 
-    // Build cwd → stream_id and suffix → stream_id mappings from assigned events.
+    // Build cwd → set of stream_ids and suffix → set of stream_ids from assigned events.
+    // We track ALL matching streams per CWD, not just the first.
     let streams = db.get_streams().context("failed to get streams")?;
-    let mut cwd_to_stream: HashMap<String, String> = HashMap::new();
-    let mut suffix_to_stream: HashMap<String, String> = HashMap::new();
+    let mut cwd_to_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut suffix_to_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
 
     for stream in &streams {
         let events = db
@@ -469,23 +474,25 @@ fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
             .context("failed to get events for stream")?;
         for event in &events {
             if let Some(cwd) = &event.cwd {
-                cwd_to_stream
+                cwd_to_streams
                     .entry(cwd.clone())
-                    .or_insert_with(|| stream.id.clone());
+                    .or_default()
+                    .insert(stream.id.clone());
                 if let Some(suffix) = project_suffix(cwd) {
-                    suffix_to_stream
+                    suffix_to_streams
                         .entry(suffix.to_string())
-                        .or_insert_with(|| stream.id.clone());
+                        .or_default()
+                        .insert(stream.id.clone());
                 }
             }
         }
     }
 
-    if cwd_to_stream.is_empty() && suffix_to_stream.is_empty() {
+    if cwd_to_streams.is_empty() && suffix_to_streams.is_empty() {
         return Ok(0);
     }
 
-    // Find unassigned events whose cwd matches an existing stream.
+    // Find unassigned events whose cwd maps to exactly ONE stream.
     let unassigned = db
         .get_events_without_stream()
         .context("failed to get unassigned events")?;
@@ -494,11 +501,37 @@ fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
         .iter()
         .filter_map(|event| {
             let cwd = event.cwd.as_ref()?;
-            // Try exact match first, then suffix match
-            let stream_id = cwd_to_stream
-                .get(cwd.as_str())
-                .or_else(|| project_suffix(cwd).and_then(|suffix| suffix_to_stream.get(suffix)))?;
-            Some((event.id.clone(), stream_id.clone()))
+
+            // Try exact CWD match first
+            if let Some(stream_ids) = cwd_to_streams.get(cwd.as_str()) {
+                if stream_ids.len() == 1 {
+                    let stream_id = stream_ids.iter().next()?;
+                    return Some((event.id.clone(), stream_id.clone()));
+                }
+                tracing::debug!(
+                    cwd = %cwd,
+                    streams = stream_ids.len(),
+                    "skipping ambiguous CWD match"
+                );
+                return None;
+            }
+
+            // Fall back to suffix match
+            let suffix = project_suffix(cwd)?;
+            if let Some(stream_ids) = suffix_to_streams.get(suffix) {
+                if stream_ids.len() == 1 {
+                    let stream_id = stream_ids.iter().next()?;
+                    return Some((event.id.clone(), stream_id.clone()));
+                }
+                tracing::debug!(
+                    cwd = %cwd,
+                    suffix = %suffix,
+                    streams = stream_ids.len(),
+                    "skipping ambiguous suffix match"
+                );
+            }
+
+            None
         })
         .collect();
 
@@ -623,6 +656,7 @@ const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::thread;
     use std::time::Duration;
 
@@ -1055,7 +1089,7 @@ mod tests {
         events.sort_by_key(|event| event.timestamp);
 
         let config = AllocationConfig::default();
-        let result = allocate_time(&events, &config, None);
+        let result = allocate_time(&events, &config, None, &HashMap::new());
         let stream = result
             .stream_times
             .iter()

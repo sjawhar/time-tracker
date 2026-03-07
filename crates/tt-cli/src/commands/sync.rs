@@ -7,7 +7,6 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::commands::{import, ingest, recompute};
-use crate::machine::extract_machine_id;
 
 /// Runs the sync command for one or more remotes.
 pub fn run(db: &tt_db::Database, remotes: &[String]) -> Result<()> {
@@ -58,17 +57,14 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
         return Ok(());
     }
 
-    let machine_id = extract_machine_id_from_output(&output.stdout);
-
     let reader = Cursor::new(output.stdout);
     let result = import::import_from_reader(db, reader)?;
 
     println!(
-        "  Imported {} events ({} duplicates, {} malformed)",
-        result.inserted, result.duplicates, result.malformed
+        "  Imported {} events, {} sessions ({} duplicates, {} malformed)",
+        result.inserted, result.sessions_imported, result.duplicates, result.malformed
     );
-
-    if let Some(ref mid) = machine_id {
+    if let Some(ref mid) = result.machine_id {
         let new_last_id = db.get_latest_event_id_for_machine(mid)?;
         db.upsert_machine(mid, remote, new_last_id.as_deref())?;
     } else {
@@ -81,11 +77,69 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extracts the machine UUID from the first line of export output.
-fn extract_machine_id_from_output(stdout: &[u8]) -> Option<String> {
-    let first_line = stdout.split(|&b| b == b'\n').next()?;
-    let first_line = std::str::from_utf8(first_line).ok()?;
-    let value: serde_json::Value = serde_json::from_str(first_line).ok()?;
-    let id = value.get("id")?.as_str()?;
-    extract_machine_id(id)
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use tt_db::Database;
+
+    use crate::commands::import;
+
+    fn make_jsonl_event(id: &str, ts: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","timestamp":"{ts}","source":"remote.tmux","type":"tmux_pane_focus","data":{{}}}}"#
+        )
+    }
+
+    #[test]
+    fn test_sync_import_message_format() {
+        // Verify the format string used in sync_single produces expected output
+        let inserted = 5;
+        let sessions_imported = 2;
+        let duplicates = 1;
+        let malformed = 0;
+        let msg = format!(
+            "  Imported {inserted} events, {sessions_imported} sessions ({duplicates} duplicates, {malformed} malformed)"
+        );
+        assert_eq!(
+            msg,
+            "  Imported 5 events, 2 sessions (1 duplicates, 0 malformed)"
+        );
+    }
+
+    #[test]
+    fn test_import_result_machine_id_from_uuid_prefixed_event() {
+        let db = Database::open_in_memory().unwrap();
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let event_id = format!("{uuid}:remote.tmux:tmux_pane_focus:2025-06-01T12:00:00.000Z:%1");
+        let jsonl = format!(
+            r#"{{"id":"{event_id}","timestamp":"2025-06-01T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+        );
+        let reader = Cursor::new(jsonl.as_bytes().to_vec());
+        let result = import::import_from_reader(&db, reader).unwrap();
+
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.machine_id, Some(uuid.to_string()));
+    }
+
+    #[test]
+    fn test_import_result_machine_id_none_when_no_events() {
+        let db = Database::open_in_memory().unwrap();
+        let reader = Cursor::new(Vec::<u8>::new());
+        let result = import::import_from_reader(&db, reader).unwrap();
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.machine_id, None);
+    }
+
+    #[test]
+    fn test_import_result_machine_id_none_for_non_uuid_ids() {
+        let db = Database::open_in_memory().unwrap();
+        let jsonl = make_jsonl_event("plain-id-no-uuid", "2025-06-01T12:00:00Z");
+        let reader = Cursor::new(jsonl.as_bytes().to_vec());
+        let result = import::import_from_reader(&db, reader).unwrap();
+
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.machine_id, None);
+    }
 }

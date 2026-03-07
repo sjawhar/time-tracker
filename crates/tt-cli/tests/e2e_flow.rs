@@ -3,6 +3,7 @@
 //! Tests the full pipeline: ingest → export → import → query
 //! This validates the prototype implementation works end-to-end.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
@@ -725,6 +726,7 @@ fn test_delegated_time_from_agent_session_events() {
         &stream_events,
         &AllocationConfig::default(),
         Some(base + Duration::seconds(180)),
+        &HashMap::new(),
     );
     let stream_time = result
         .stream_times

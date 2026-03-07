@@ -162,18 +162,10 @@ Check for unassigned events. If any exist, run stream inference BEFORE generatin
 
 ```bash
 # Quick check — if unassigned count > 0, you MUST run infer-streams
-tt context --events --start "$WEEK_START" --end "$WEEK_END" 2>/dev/null | python3 -c "
-import json,sys; d=json.load(sys.stdin)
-u=sum(1 for e in d.get('events',[]) if not e.get('stream_id'))
-print(f'Unassigned: {u}')
-"
+tt classify --unclassified --summary --start "$WEEK_START" --end "$WEEK_END"
 ```
 
-If unassigned > 0, invoke `/infer-streams` before continuing. Then recompute:
-
-```bash
-tt recompute --force
-```
+If unclassified sessions/events exist, invoke `/infer-streams` before continuing.
 
 Then fetch the current week's report data:
 
@@ -192,10 +184,10 @@ This returns JSON with:
 **Supplementary details** (optional, for richer session context):
 
 ```bash
-tt context --agents --streams --start "$WEEK_START" --end "$WEEK_END"
+tt classify --json --start "$WEEK_START" --end "$WEEK_END"
 ```
 
-This provides full agent session data with `summary`, `starting_prompt`, `tool_call_count`, etc.
+This provides full session data with `summary`, `starting_prompt`, `tool_call_count`, etc.
 
 ## Phase 3: Present Context
 
@@ -442,7 +434,7 @@ If `.claude/skills/ontology.toml` is missing:
 | Using `toggl` field in JSONL | Use the `tt` field. Schema uses time-tracker data, not Toggl. |
 | Rushing through narration | Let the user talk. Brief acknowledgments only. Don't lead or suggest what they should say. |
 | Including reflect-style analysis | Session pattern analysis is a separate skill. Weekly review focuses on time, goals, and reflection. |
-| Using `tt context --streams` for time data | `context --streams` returns **lifetime** per-stream totals from the DB, not period-scoped. Use `tt report` for time within a specific period. |
+| Using `tt classify --json` for time data | `classify` shows sessions and clusters, not period-scoped time. Use `tt report` for time within a specific period. |
 
 ## Goal Tracking Checkboxes
 
@@ -459,7 +451,7 @@ Read goal definitions from `config.toml` `[goals]` section. Default goals if con
 
 ## Notes
 
-- Uses `tt report` and `tt context` for time data — NOT Toggl
+- Uses `tt report` and `tt classify` for time data — NOT Toggl
 - Red team uses Task tool with `subagent_type: "red-teamer"`
 - **Charts**: Use `uvx --with plotext python` for terminal bar charts (no install needed)
 - **Taxonomy**: Read from shared `ontology.toml`, not hardcoded

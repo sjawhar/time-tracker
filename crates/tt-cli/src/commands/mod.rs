@@ -1,5 +1,6 @@
 //! CLI subcommand implementations.
 
+pub mod classify;
 pub mod context;
 pub mod export;
 pub mod import;
@@ -12,3 +13,5 @@ pub mod status;
 pub mod streams;
 pub mod sync;
 pub mod tag;
+
+pub mod util;

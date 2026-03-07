@@ -3,7 +3,10 @@
 //! Uses the attention allocation algorithm to calculate time based on
 //! focus events and agent activity.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use tt_core::{AllocationConfig, allocate_time};
 use tt_db::Database;
 
@@ -40,9 +43,50 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
 
     tracing::debug!(event_count = events.len(), "loaded events for allocation");
 
+    // Warn about sessions with events split across multiple streams.
+    // This is a data integrity issue that causes undercounting.
+    let mut session_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    for event in &events {
+        if let (Some(session_id), Some(stream_id)) = (&event.session_id, &event.stream_id) {
+            session_streams
+                .entry(session_id.clone())
+                .or_default()
+                .insert(stream_id.clone());
+        }
+    }
+    for (session_id, stream_ids) in &session_streams {
+        if stream_ids.len() > 1 {
+            let streams_list: Vec<_> = stream_ids.iter().collect();
+            eprintln!(
+                "Warning: session {} has events in {} streams: {:?}",
+                &session_id[..session_id.len().min(30)],
+                stream_ids.len(),
+                streams_list,
+            );
+            eprintln!("  Use 'tt classify --apply' to fix.");
+        }
+    }
+
+    // Load session end times for accurate delegated time calculation.
+    // When a session has a known end_time, the algorithm uses it instead of the
+    // timeout heuristic (which undercounts delegated time for gappy sessions).
+    let earliest = events.first().map_or_else(Utc::now, |e| e.timestamp);
+    let latest = events.last().map_or_else(Utc::now, |e| e.timestamp);
+    let session_end_times: HashMap<String, DateTime<Utc>> = db
+        .agent_sessions_in_range(earliest, latest)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| s.end_time.map(|end| (s.session_id, end)))
+        .collect();
+
+    tracing::debug!(
+        sessions_with_end_time = session_end_times.len(),
+        "loaded session end times"
+    );
+
     // Run the allocation algorithm
     let config = AllocationConfig::default();
-    let result = allocate_time(&events, &config, None);
+    let result = allocate_time(&events, &config, None, &session_end_times);
 
     tracing::debug!(
         stream_count = result.stream_times.len(),
