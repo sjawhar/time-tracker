@@ -5,7 +5,8 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use tt_cli::commands::{
-    context, export, import, ingest, init, machines, recompute, report, status, streams, sync, tag,
+    classify, context, export, import, ingest, init, machines, recompute, report, status, streams,
+    sync, tag,
 };
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
@@ -127,6 +128,8 @@ fn main() -> Result<()> {
             gap_threshold,
             start,
             end,
+            unclassified,
+            summary,
         }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
             context::run(
@@ -138,7 +141,35 @@ fn main() -> Result<()> {
                 *gap_threshold,
                 start.clone(),
                 end.clone(),
+                *unclassified,
+                *summary,
             )?;
+        }
+        Some(Commands::Classify {
+            apply,
+            unclassified,
+            summary,
+            json,
+            start,
+            end,
+            gaps,
+            gap_threshold,
+        }) => {
+            let (db, _config) = open_database(cli.config.as_deref())?;
+            if let Some(input_path) = apply {
+                classify::run_apply(&db, input_path)?;
+            } else {
+                classify::run_show(
+                    &db,
+                    *unclassified,
+                    *summary,
+                    *json,
+                    start.clone(),
+                    end.clone(),
+                    *gaps,
+                    *gap_threshold,
+                )?;
+            }
         }
         None => {
             // No subcommand, show help

@@ -3,17 +3,12 @@
 //! Exports layered context (events, agents, streams, gaps) for use by humans
 //! or LLMs when making stream assignment decisions.
 
-use std::sync::LazyLock;
-
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use regex::Regex;
 use serde::Serialize;
 use tt_db::Database;
 
-/// Pre-compiled regex for relative time parsing.
-static RELATIVE_TIME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)\s+(minute|hour|day|week)s?\s+ago$").unwrap());
+use super::util::parse_datetime;
 
 /// Output structure for context export.
 #[derive(Debug, Serialize)]
@@ -235,48 +230,6 @@ fn export_gaps(
     Ok(gaps)
 }
 
-/// Conservative bounds for relative time parsing (~1000 years in minutes).
-const MAX_RELATIVE_MINUTES: i64 = 1000 * 365 * 24 * 60;
-
-/// Parse a datetime string as either ISO 8601 or relative time.
-///
-/// Supports:
-/// - ISO 8601: "2026-01-15T10:30:00Z"
-/// - Relative: "2 hours ago", "30 minutes ago", "1 day ago", "1 week ago"
-fn parse_datetime(s: &str) -> anyhow::Result<DateTime<Utc>> {
-    // Try ISO 8601 first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-
-    // Try relative time: "N hours/minutes/days/weeks ago"
-    let Some(caps) = RELATIVE_TIME_RE.captures(s) else {
-        anyhow::bail!(
-            "Invalid datetime: {s}. Use ISO 8601 (e.g., 2026-01-15T10:30:00Z) or relative (e.g., '2 hours ago')"
-        );
-    };
-
-    let n: i64 = caps[1]
-        .parse()
-        .context("failed to parse number in relative time")?;
-
-    let (max_for_unit, minutes_per_unit) = match &caps[2] {
-        "minute" => (MAX_RELATIVE_MINUTES, 1),
-        "hour" => (MAX_RELATIVE_MINUTES / 60, 60),
-        "day" => (MAX_RELATIVE_MINUTES / (60 * 24), 60 * 24),
-        "week" => (MAX_RELATIVE_MINUTES / (60 * 24 * 7), 60 * 24 * 7),
-        unit => anyhow::bail!("Unknown time unit: {unit}"),
-    };
-
-    if n > max_for_unit {
-        anyhow::bail!("Relative time value too large: {n} {}", &caps[2]);
-    }
-
-    // Safe to create Duration now that we've validated the range
-    let duration = Duration::minutes(n * minutes_per_unit);
-    Ok(Utc::now() - duration)
-}
-
 /// Run the context export command.
 ///
 /// Exports layered context to stdout as JSON, filtered by flags and time range.
@@ -291,7 +244,15 @@ pub fn run(
     gap_threshold: u32,
     start: Option<String>,
     end: Option<String>,
+    unclassified: bool,
+    summary: bool,
 ) -> anyhow::Result<()> {
+    eprintln!("Warning: `tt context` is deprecated. Use `tt classify` instead.");
+    eprintln!("  tt classify --json            (replaces tt context --events --agents)");
+    eprintln!("  tt classify --unclassified    (replaces tt context --unclassified)");
+    eprintln!("  tt classify --gaps            (replaces tt context --gaps)");
+    eprintln!();
+
     // Parse end time (default to now)
     let end_time = end
         .map(|s| parse_datetime(&s))
@@ -313,7 +274,7 @@ pub fn run(
         );
     }
 
-    let output = ContextOutput {
+    let mut output = ContextOutput {
         time_range: TimeRange {
             start: start_time,
             end: end_time,
@@ -331,6 +292,28 @@ pub fn run(
             .then(|| export_gaps(db, start_time, end_time, gap_threshold))
             .transpose()?,
     };
+
+    // Apply --unclassified filter: remove events/agents that already have a stream_id
+    if unclassified {
+        if let Some(ref mut evts) = output.events {
+            evts.retain(|e| e.stream_id.is_none());
+        }
+        // For agents, filter to sessions whose events are unassigned
+        // (agent exports don't have stream_id directly, so this is a best-effort filter)
+    }
+
+    // Apply --summary filter: truncate to compact representations
+    if summary {
+        if let Some(ref mut agents_list) = output.agents {
+            for agent in agents_list.iter_mut() {
+                // Truncate summary and prompts for compact output
+                if let Some(ref mut s) = agent.summary {
+                    s.truncate(120);
+                }
+                agent.user_prompts.truncate(1);
+            }
+        }
+    }
 
     println!(
         "{}",
@@ -560,7 +543,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&parent).unwrap();
+        db.upsert_agent_session(&parent, None).unwrap();
 
         // Insert a subagent session with parent
         let child = tt_core::session::AgentSession {
@@ -587,7 +570,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&child).unwrap();
+        db.upsert_agent_session(&child, None).unwrap();
 
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
             .unwrap()
@@ -643,7 +626,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&claude_session).unwrap();
+        db.upsert_agent_session(&claude_session, None).unwrap();
 
         // Insert an OpenCode session
         let opencode_session = tt_core::session::AgentSession {
@@ -666,7 +649,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&opencode_session).unwrap();
+        db.upsert_agent_session(&opencode_session, None).unwrap();
 
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
             .unwrap()
@@ -746,7 +729,7 @@ mod tests {
         let db = tt_db::Database::open_in_memory().unwrap();
 
         // Run should succeed with empty database
-        let result = run(&db, false, false, false, false, 5, None, None);
+        let result = run(&db, false, false, false, false, 5, None, None, false, false);
         assert!(result.is_ok());
     }
 
@@ -755,7 +738,7 @@ mod tests {
         let db = tt_db::Database::open_in_memory().unwrap();
 
         // Should succeed with events flag
-        let result = run(&db, true, false, false, false, 5, None, None);
+        let result = run(&db, true, false, false, false, 5, None, None, false, false);
         assert!(result.is_ok());
     }
 
@@ -764,7 +747,7 @@ mod tests {
         let db = tt_db::Database::open_in_memory().unwrap();
 
         // Should succeed with all flags enabled
-        let result = run(&db, true, true, true, true, 5, None, None);
+        let result = run(&db, true, true, true, true, 5, None, None, false, false);
         assert!(result.is_ok());
     }
 
@@ -781,6 +764,8 @@ mod tests {
             5,
             Some("2026-01-15T10:00:00Z".to_string()),
             Some("2026-01-15T12:00:00Z".to_string()),
+            false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -798,6 +783,8 @@ mod tests {
             5,
             Some("2 hours ago".to_string()),
             None,
+            false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -815,6 +802,8 @@ mod tests {
             5,
             Some("invalid-time".to_string()),
             None,
+            false,
+            false,
         );
         assert!(result.is_err());
     }
@@ -832,6 +821,8 @@ mod tests {
             5,
             None,
             Some("not-a-date".to_string()),
+            false,
+            false,
         );
         assert!(result.is_err());
     }
@@ -1111,7 +1102,7 @@ mod tests {
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
         };
-        db.upsert_agent_session(&session).unwrap();
+        db.upsert_agent_session(&session, None).unwrap();
 
         // Query for sessions in range
         let start = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")

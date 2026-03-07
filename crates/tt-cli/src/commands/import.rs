@@ -25,6 +25,10 @@ pub struct ImportResult {
     pub duplicates: usize,
     /// Number of malformed JSON lines skipped.
     pub malformed: usize,
+    /// Number of agent sessions imported.
+    pub sessions_imported: usize,
+    /// Machine ID extracted from events or session metadata.
+    pub machine_id: Option<String>,
 }
 
 /// Imports events from a reader into the database.
@@ -40,6 +44,8 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         inserted: 0,
         duplicates: 0,
         malformed: 0,
+        sessions_imported: 0,
+        machine_id: None,
     };
 
     for (line_num, line_result) in buf_reader.lines().enumerate() {
@@ -48,6 +54,23 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         // Skip empty lines
         if line.trim().is_empty() {
             continue;
+        }
+
+        // Check for session metadata records before event parsing.
+        // This must come before rewrite_legacy_session_types to avoid the
+        // legacy rewriter mangling metadata lines.
+        match parse_metadata_line(&line) {
+            MetadataParseResult::Parsed(session, machine_id) => {
+                db.upsert_agent_session(&session, machine_id.as_deref())
+                    .context("failed to upsert agent session")?;
+                result.sessions_imported += 1;
+                if result.machine_id.is_none() {
+                    result.machine_id = machine_id;
+                }
+                continue;
+            }
+            MetadataParseResult::RecognizedInvalid => continue,
+            MetadataParseResult::NotMetadata => {} // fall through to event parsing
         }
 
         let line = match rewrite_legacy_session_types(&line, line_num) {
@@ -75,6 +98,10 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
                 // Extract machine_id from event ID prefix (UUID before first colon-separated source)
                 if event.machine_id.is_none() {
                     event.machine_id = extract_machine_id(&event.id);
+                }
+
+                if result.machine_id.is_none() {
+                    result.machine_id.clone_from(&event.machine_id);
                 }
 
                 result.total_read += 1;
@@ -137,11 +164,74 @@ pub fn run(db: &Database) -> Result<ImportResult> {
     let result = import_from_reader(db, stdin.lock())?;
 
     eprintln!(
-        "Imported {} events ({} new, {} duplicates, {} malformed)",
-        result.total_read, result.inserted, result.duplicates, result.malformed
+        "Imported {} new events, {} sessions ({} duplicates, {} malformed lines)",
+        result.inserted, result.sessions_imported, result.duplicates, result.malformed
     );
 
     Ok(result)
+}
+
+/// Tri-state result of parsing a metadata line.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "AgentSession is the primary variant"
+)]
+enum MetadataParseResult {
+    /// Successfully parsed into an `AgentSession` + optional `machine_id`
+    Parsed(tt_core::session::AgentSession, Option<String>),
+    /// Recognized as `session_metadata` but invalid (skip without counting as malformed)
+    RecognizedInvalid,
+    /// Not a `session_metadata` record at all (continue with normal event parsing)
+    NotMetadata,
+}
+
+/// Parses a JSONL line as a session metadata record.
+///
+/// Returns a tri-state result:
+/// - `Parsed(session, machine_id)` if the line is valid `session_metadata`
+/// - `RecognizedInvalid` if it's recognized as `session_metadata` but invalid
+/// - `NotMetadata` if it's not a `session_metadata` record at all
+fn parse_metadata_line(line: &str) -> MetadataParseResult {
+    // Fast path: skip lines that can't possibly be session metadata
+    if !line.contains("\"session_metadata\"") {
+        return MetadataParseResult::NotMetadata;
+    }
+
+    // Parse as Value to check type field
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return MetadataParseResult::NotMetadata;
+    };
+
+    if value.get("type").and_then(|t| t.as_str()) != Some("session_metadata") {
+        return MetadataParseResult::NotMetadata;
+    }
+
+    // It's recognized as session_metadata — try full deserialization
+    let export: super::export::SessionMetadataExport = match serde_json::from_str(line) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                error = %e,
+                "recognized session_metadata record failed deserialization"
+            );
+            return MetadataParseResult::RecognizedInvalid;
+        }
+    };
+
+    // Try to convert to AgentSession
+    let session_id = export.session_id.clone();
+    let source = export.source.clone();
+    if let Some((session, machine_id)) = export.into_agent_session() {
+        MetadataParseResult::Parsed(session, machine_id)
+    } else {
+        tracing::warn!(
+            session_id = %session_id,
+            source = %source,
+            "session_metadata record has invalid fields, skipping"
+        );
+        MetadataParseResult::RecognizedInvalid
+    }
 }
 
 #[cfg(test)]
@@ -435,5 +525,144 @@ mod tests {
             events[0].machine_id.as_deref(),
             Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
         );
+    }
+
+    #[test]
+    fn test_import_result_has_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+        let event = r#"{"id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%1","timestamp":"2025-01-29T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}"#;
+        let result = import_from_reader(&db, Cursor::new(event)).unwrap();
+        assert_eq!(
+            result.machine_id,
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_invalid_session_metadata_not_malformed() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Metadata with invalid source (unknown_agent is not a valid SessionSource)
+        let bad_metadata = r#"{"type":"session_metadata","session_id":"ses_bad","source":"unknown_agent","session_type":"user","project_path":"/p","project_name":"p","start_time":"2025-01-29T12:00:00.000Z","message_count":1,"assistant_message_count":0,"tool_call_count":0}"#;
+        let input = Cursor::new(bad_metadata);
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        // Should NOT be counted as malformed (it's recognized metadata, just invalid)
+        assert_eq!(result.malformed, 0);
+        // Should NOT be imported (conversion failed)
+        assert_eq!(result.total_read, 0);
+    }
+
+    #[test]
+    fn test_import_session_metadata() {
+        let db = Database::open_in_memory().unwrap();
+
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_import_1","source":"opencode","session_type":"user","project_path":"/home/user/project","project_name":"project","start_time":"2025-01-29T12:00:00.000Z","end_time":"2025-01-29T13:00:00.000Z","message_count":10,"summary":"test session","user_prompts":["hello"],"starting_prompt":"hello","assistant_message_count":5,"tool_call_count":3}"#;
+        let event_line = make_jsonl_event("e1", "2025-01-29T12:00:00Z");
+        let input = Cursor::new(format!("{event_line}\n{metadata_line}\n"));
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        assert_eq!(result.total_read, 1); // Only the event counts as total_read
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.sessions_imported, 1);
+        assert_eq!(result.malformed, 0);
+
+        // Verify session was stored
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_import_1");
+        assert_eq!(sessions[0].summary, Some("test session".to_string()));
+        assert_eq!(sessions[0].message_count, 10);
+        assert_eq!(sessions[0].starting_prompt, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_import_session_metadata_with_machine_id() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Metadata line WITH machine_id
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_with_mid","source":"opencode","session_type":"user","project_path":"/home/user/proj","project_name":"proj","start_time":"2025-01-29T12:00:00.000Z","message_count":3,"assistant_message_count":1,"tool_call_count":0,"machine_id":"test-machine-abc"}"#;
+        let input = Cursor::new(format!("{metadata_line}\n"));
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        // ImportResult.machine_id should be set from the metadata record
+        assert_eq!(result.machine_id, Some("test-machine-abc".to_string()));
+        assert_eq!(result.sessions_imported, 1);
+        assert_eq!(result.total_read, 0); // metadata is not an event
+        assert_eq!(result.malformed, 0);
+
+        // Verify session was stored
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_with_mid");
+    }
+
+    #[test]
+    fn test_import_session_metadata_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+
+        let metadata_line = r#"{"type":"session_metadata","session_id":"ses_idem","source":"claude","session_type":"user","project_path":"/home/user/p","project_name":"p","start_time":"2025-01-29T12:00:00.000Z","message_count":5,"assistant_message_count":2,"tool_call_count":1}"#;
+
+        // Import twice
+        let input1 = Cursor::new(format!("{metadata_line}\n"));
+        let result1 = import_from_reader(&db, input1).unwrap();
+        assert_eq!(result1.sessions_imported, 1);
+
+        let input2 = Cursor::new(format!("{metadata_line}\n"));
+        let result2 = import_from_reader(&db, input2).unwrap();
+        assert_eq!(result2.sessions_imported, 1);
+
+        // Should still be just 1 session
+        let sessions = db
+            .agent_sessions_in_range(
+                chrono::DateTime::parse_from_rfc3339("2025-01-29T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono::DateTime::parse_from_rfc3339("2025-01-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_import_old_format_without_metadata() {
+        // Backward compatibility: old-format exports without metadata lines
+        let db = Database::open_in_memory().unwrap();
+        let input_str = format!(
+            "{}\n{}\n",
+            make_jsonl_event("e1", "2025-01-29T12:00:00Z"),
+            make_jsonl_event("e2", "2025-01-29T12:01:00Z")
+        );
+        let input = Cursor::new(input_str);
+
+        let result = import_from_reader(&db, input).unwrap();
+
+        assert_eq!(result.total_read, 2);
+        assert_eq!(result.inserted, 2);
+        assert_eq!(result.sessions_imported, 0);
+        assert_eq!(result.malformed, 0);
     }
 }
