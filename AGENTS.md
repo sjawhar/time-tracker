@@ -39,7 +39,7 @@ tt-cli ─┬─> tt-core
 | Add DB table/column | `tt-db/src/lib.rs` | Bump `SCHEMA_VERSION`, add to `init()`. No migrations—schema mismatch = fail-fast |
 | Add event type | `tt-db/src/lib.rs` (`StoredEvent`) | Then handle in `allocation.rs` and relevant command |
 | Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Claude: parse JSONL session files from `~/.claude/`. OpenCode: query SQLite database via rusqlite |
-| Config options | `tt-cli/src/config.rs` | Figment: defaults → `~/.config/tt/config.toml` → `TT_*` env vars |
+| Config options | `tt-cli/src/config.rs` | Figment: defaults → `~/.config/time-tracker/config.toml` → `TT_*` env vars |
 | Snapshot test update | Run `cargo insta review` | 18 snapshots in `tt-cli/src/commands/snapshots/` |
 | Add machine support | `tt-cli/src/machine.rs` | UUID-based identity per machine |
 | Multi-machine sync | `tt-cli/src/commands/sync.rs` | SSH-based event pull |
@@ -101,13 +101,13 @@ Sync everywhere except future `tt-llm` (which would use tokio for HTTP). CLI has
 
 ### Configuration
 
-Figment layered loading: compiled defaults → `~/.config/tt/config.toml` → `TT_*` env vars. Currently only `database_path` is configurable.
+Figment layered loading: compiled defaults → `~/.config/time-tracker/config.toml` → `TT_*` env vars. Currently only `database_path` is configurable.
 
 XDG directory layout:
 ```
-Config: ~/.config/tt/config.toml
-Data:   ~/.local/share/tt/ (tt.db, events.jsonl, machine.json)
-State:  ~/.local/state/tt/ (hook.log, claude-manifest.json)
+Config: ~/.config/time-tracker/config.toml
+Data:   ~/.local/share/time-tracker/ (tt.db, events.jsonl, machine.json)
+State:  ~/.local/state/time-tracker/ (hook.log, claude-manifest.json)
 ```
 
 ## Anti-Patterns

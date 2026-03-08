@@ -32,7 +32,7 @@ fn init_machine(temp: &std::path::Path) {
 fn test_ingest_debouncing() {
     let temp = TempDir::new().unwrap();
     init_machine(temp.path());
-    let data_dir = temp.path().join(".local/share/tt");
+    let data_dir = temp.path().join(".local/share/time-tracker");
 
     // Rapid-fire ingest calls for the same pane (within debounce window)
     for _ in 0..5 {
@@ -67,7 +67,7 @@ fn test_ingest_debouncing() {
 fn test_ingest_different_panes_not_debounced() {
     let temp = TempDir::new().unwrap();
     init_machine(temp.path());
-    let data_dir = temp.path().join(".local/share/tt");
+    let data_dir = temp.path().join(".local/share/time-tracker");
 
     // Rapid-fire ingest calls for different panes
     for pane in ["%1", "%2", "%3"] {
@@ -292,7 +292,7 @@ fn test_export_empty_events_file() {
     use tempfile::TempDir;
 
     let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join(".local/share/tt");
+    let data_dir = temp.path().join(".local/share/time-tracker");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Initialize machine identity (required by export)
@@ -462,7 +462,7 @@ fn test_concurrent_ingest_no_data_loss() {
 
     let temp = Arc::new(TempDir::new().unwrap());
     init_machine(temp.path());
-    let data_dir = temp.path().join(".local/share/tt");
+    let data_dir = temp.path().join(".local/share/time-tracker");
 
     // Spawn multiple threads trying to ingest simultaneously
     let mut handles = vec![];
@@ -515,7 +515,7 @@ fn test_readonly_events_file_error_handling() {
 
     let temp = TempDir::new().unwrap();
     init_machine(temp.path());
-    let data_dir = temp.path().join(".local/share/tt");
+    let data_dir = temp.path().join(".local/share/time-tracker");
     fs::create_dir_all(&data_dir).unwrap();
 
     // Create events file and make it read-only
