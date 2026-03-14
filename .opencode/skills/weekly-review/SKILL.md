@@ -21,7 +21,7 @@ Interactive weekly reflection with time-tracker integration and historical trend
 ## Arguments
 
 **Required** (first argument): Path to JSONL data file
-- Example: `/weekly-review ~/app/ignore/weekly-reviews.jsonl`
+- Example: `/weekly-review ~/OneDrive/Apps/TimeTracker/data/weekly-reviews.jsonl`
 
 The file will be created if it doesn't exist. Data is appended (one JSON object per line).
 
@@ -51,23 +51,23 @@ These rules take priority over other instructions:
 The JSONL path is passed as the skill's `args` parameter:
 
 ```
-/weekly-review ~/path/to/weekly-reviews.jsonl
+/weekly-review ~/OneDrive/Apps/TimeTracker/data/weekly-reviews.jsonl
 ```
 
 **Handling**:
-- If `args` is empty or missing, prompt the user: "Please provide a path to your weekly reviews JSONL file"
+- If `args` is empty or missing, default to `~/OneDrive/Apps/TimeTracker/data/weekly-reviews.jsonl`
 - Expand `~` to the user's home directory (use `$HOME` or equivalent)
 - Create the file if it doesn't exist (first review will have no historical trends)
 
 ## Config Loading
 
-**Review config**: Read `.claude/skills/weekly-review/config.toml` for:
+**Review config**: Read `~/.config/time-tracker/weekly-review.toml` for:
 - `[prompts]` — reflection questions
 - `[goals]` — checkbox items
 - `[ratings]` — rating dimensions and scale
 - `[review]` — output path, week start day
 
-**Ontology config**: Read `.claude/skills/ontology.toml` for:
+**Ontology config**: Read `~/.config/time-tracker/ontology.toml` for:
 - `projects.names[]` — valid project tags
 - `activities.names[]` — valid activity tags
 
@@ -191,7 +191,7 @@ This provides full session data with `summary`, `starting_prompt`, `tool_call_co
 
 ## Phase 3: Present Context
 
-1. **Load ontology** from `.claude/skills/ontology.toml` — use `projects.names[]` and `activities.names[]` to organize the presentation.
+1. **Load ontology** from `~/.config/time-tracker/ontology.toml` — use `projects.names[]` and `activities.names[]` to organize the presentation.
 
 2. **Show computed time allocations** from tt report data:
 
@@ -351,7 +351,7 @@ On track (personal): Unsure
 
 ## JSONL Schema
 
-Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.claude/skills/weekly-review/example.json`.
+Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.opencode/skills/weekly-review/example.json`.
 
 **Field notes**:
 - **`reflection.*`**: Preserve the user's full prose — don't condense. The detail enables future red-teaming.
@@ -398,11 +398,11 @@ Other:        ██████████ 20%
 3. Still show trend indicators: "↗ up from 30%" or "↘ down from 50%"
 
 ### Config Missing
-If `.claude/skills/weekly-review/config.toml` is missing:
+If `~/.config/time-tracker/weekly-review.toml` is missing:
 - Use built-in defaults for reflection questions, goals, ratings
 - Log a note: "No config found — using defaults"
 
-If `.claude/skills/ontology.toml` is missing:
+If `~/.config/time-tracker/ontology.toml` is missing:
 - Skip ontology-based organization in Phase 3
 - Present raw tt report data without project/activity grouping
 
@@ -426,7 +426,7 @@ If `.claude/skills/ontology.toml` is missing:
 | Presenting partial results | Run the FULL pipeline (ingest → sync → infer streams → recompute → report). Don't stop partway and show incomplete numbers — it's worse than no answer. |
 | Not running stream inference | If unassigned events exist, run `/infer-streams` BEFORE generating the report. Unassigned events = missing time. |
 | Calling Toggl MCP tools | Use `tt report` exclusively. tt replaces Toggl for this workflow. |
-| Hardcoding project/activity lists | Read from `ontology.toml`. Never hardcode taxonomy. |
+| Hardcoding project/activity lists | Read from `~/.config/time-tracker/ontology.toml`. Never hardcode taxonomy. |
 | Condensing user prose | Preserve full text. "Not prioritizing well" loses the detail that enables red-teaming. |
 | Skipping phase confirmations | Always confirm before transitioning from narration (Phase 4) to structured (Phase 5). |
 | Using `cargo run --` instead of `tt` | Use the `tt` binary directly. Build once if needed, then use the binary. |
@@ -438,7 +438,7 @@ If `.claude/skills/ontology.toml` is missing:
 
 ## Goal Tracking Checkboxes
 
-Read goal definitions from `config.toml` `[goals]` section. Default goals if config is missing:
+Read goal definitions from `~/.config/time-tracker/weekly-review.toml` `[goals]` section. Default goals if config is missing:
 
 - `paired_engineer`: Paired with an engineer this week
 - `read_writeups`: Read team members' writeups
@@ -454,10 +454,10 @@ Read goal definitions from `config.toml` `[goals]` section. Default goals if con
 - Uses `tt report` and `tt classify` for time data — NOT Toggl
 - Red team uses Task tool with `subagent_type: "red-teamer"`
 - **Charts**: Use `uvx --with plotext python` for terminal bar charts (no install needed)
-- **Taxonomy**: Read from shared `ontology.toml`, not hardcoded
+- **Taxonomy**: Read from shared `~/.config/time-tracker/ontology.toml`, not hardcoded
 - **Direct vs delegated**: tt tracks human-focus time (direct) and agent-work time (delegated) separately. Both are valuable for the review.
 - JSONL format allows easy appending and parsing
-- **Config precedence**: `config.toml` settings > built-in defaults. Ontology from `ontology.toml` > no ontology.
+- **Config precedence**: `weekly-review.toml` settings > built-in defaults. Ontology from `ontology.toml` > no ontology.
 
 ## Appendix: Toggl Calibration (Optional)
 

@@ -106,7 +106,7 @@ GET http://localhost:5600/api/0/buckets/{bucket_id}/events?start={timestamp}&end
 ### Configuration
 
 ```toml
-# ~/.config/tt/config.toml
+# ~/.config/time-tracker/config.toml
 [activitywatch]
 enabled = true  # default
 url = "http://localhost:5600"  # configurable for non-standard setups (Docker, VMs, custom port)

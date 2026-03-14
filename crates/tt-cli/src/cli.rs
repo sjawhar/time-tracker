@@ -37,7 +37,7 @@ pub enum Commands {
 
     /// Export all events for sync to local machine.
     ///
-    /// Reads events from `~/.local/share/tt/events.jsonl` and parses Claude Code
+    /// Reads events from `~/.local/share/time-tracker/events.jsonl` and parses Claude Code
     /// session logs, outputting combined events as JSONL to stdout.
     Export {
         /// Only export events after this event ID (for incremental sync).
@@ -110,7 +110,7 @@ pub enum Commands {
     /// Initialize machine identity for multi-machine sync.
     ///
     /// Generates a persistent UUID for this machine, stored in
-    /// `~/.local/share/tt/machine.json`. Idempotent — safe to run again.
+    /// `~/.local/share/time-tracker/machine.json`. Idempotent — safe to run again.
     Init {
         /// Human-friendly label for this machine (defaults to hostname).
         #[arg(long)]

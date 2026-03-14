@@ -30,7 +30,7 @@ Handle predictable tagging patterns without LLM calls. Rules run first; LLM hand
 
 ### Configuration
 
-Rules are defined in `~/.config/tt/config.toml` using TOML syntax.
+Rules are defined in `~/.config/time-tracker/config.toml` using TOML syntax.
 
 ```toml
 [[rules]]
@@ -112,7 +112,7 @@ Display all loaded rules with their index, patterns, and validation status.
 
 ```
 $ tt rules list
-Rules from ~/.config/tt/config.toml:
+Rules from ~/.config/time-tracker/config.toml:
 
   1. path: ~/work/acme/*     → tags: [acme-webapp]
   2. path: ~/projects/oss/*  → tags: [open-source]
@@ -122,7 +122,7 @@ Rules from ~/.config/tt/config.toml:
 
 # With validation errors:
 $ tt rules list
-Rules from ~/.config/tt/config.toml:
+Rules from ~/.config/time-tracker/config.toml:
 
   1. path: ~/work/acme/*     → tags: [acme-webapp]
   2. [INVALID] path: ~/work/[invalid → Error: Missing closing bracket
@@ -219,7 +219,7 @@ Warning: Rules file has errors, rules disabled.
 
 ### Acceptance Criteria
 
-1. Rules load from `~/.config/tt/config.toml` at startup
+1. Rules load from `~/.config/time-tracker/config.toml` at startup
 2. Path patterns support `~`, `*`, and `**` glob syntax
 3. First matching rule's tags are applied to streams
 4. `tt rules list` shows all loaded rules with validation status
@@ -289,7 +289,7 @@ Health and tracking status.
 **Response**:
 ```json
 {
-  "database": "/home/user/.local/share/tt/events.db",
+  "database": "/home/user/.local/share/time-tracker/events.db",
   "event_count": 15432,
   "sources": {
     "remote.agent": "2025-01-29T12:45:00Z",
@@ -499,7 +499,7 @@ Push notifications to external systems when significant events occur in Time Tra
 
 ### Configuration
 
-Webhooks are defined in `~/.config/tt/config.toml`:
+Webhooks are defined in `~/.config/time-tracker/config.toml`:
 
 ```toml
 [[webhooks]]

@@ -66,23 +66,23 @@ impl Config {
     }
 }
 
-/// Returns the platform-specific config directory for tt.
+/// Returns the platform-specific config directory for time-tracker.
 fn dirs_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("tt"))
+    dirs::config_dir().map(|p| p.join("time-tracker"))
 }
 
-/// Returns the platform-specific data directory for tt.
+/// Returns the platform-specific data directory for time-tracker.
 ///
-/// On Linux: `~/.local/share/tt`
+/// On Linux: `~/.local/share/time-tracker`
 pub fn dirs_data_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|p| p.join("tt"))
+    dirs::data_dir().map(|p| p.join("time-tracker"))
 }
 
-/// Returns the platform-specific state directory for tt.
+/// Returns the platform-specific state directory for time-tracker.
 ///
-/// On Linux: `~/.local/state/tt`
+/// On Linux: `~/.local/state/time-tracker`
 pub fn dirs_state_path() -> Option<PathBuf> {
-    dirs::state_dir().map(|p| p.join("tt"))
+    dirs::state_dir().map(|p| p.join("time-tracker"))
 }
 
 #[cfg(test)]
@@ -100,15 +100,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dirs_data_path_ends_with_tt() {
+    fn test_dirs_data_path_ends_with_time_tracker() {
         let path = dirs_data_path().unwrap();
-        assert_eq!(path.file_name().unwrap(), "tt");
+        assert_eq!(path.file_name().unwrap(), "time-tracker");
     }
 
     #[test]
-    fn test_dirs_state_path_ends_with_tt() {
+    fn test_dirs_state_path_ends_with_time_tracker() {
         let path = dirs_state_path().unwrap();
-        assert_eq!(path.file_name().unwrap(), "tt");
+        assert_eq!(path.file_name().unwrap(), "time-tracker");
     }
 
     #[test]

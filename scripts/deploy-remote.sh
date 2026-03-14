@@ -35,19 +35,19 @@ fi
 
 echo "Deploying tt to $REMOTE..."
 
-# Create ~/.local/bin on remote if it doesn't exist
-ssh "$REMOTE" 'mkdir -p ~/.local/bin'
+# Create ~/.dotfiles/bin on remote if it doesn't exist
+ssh "$REMOTE" 'mkdir -p ~/.dotfiles/bin'
 
 # Copy binary
-scp "$BINARY" "$REMOTE:~/.local/bin/tt"
+scp "$BINARY" "$REMOTE:~/.dotfiles/bin/tt"
 
 # Make executable
-ssh "$REMOTE" 'chmod +x ~/.local/bin/tt'
+ssh "$REMOTE" 'chmod +x ~/.dotfiles/bin/tt'
 
 # Add to PATH if not already there
-ssh "$REMOTE" 'grep -q "PATH=.*\.local/bin" ~/.bashrc 2>/dev/null || echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+ssh "$REMOTE" 'grep -q "PATH=.*\.dotfiles/bin" ~/.bashrc 2>/dev/null || echo "export PATH=\"\$HOME/.dotfiles/bin:\$PATH\"" >> ~/.bashrc'
 
-echo "Binary deployed to ~/.local/bin/tt"
+echo "Binary deployed to ~/.dotfiles/bin/tt"
 
 # Verify deployment
 echo ""

@@ -26,14 +26,14 @@ source ~/.bashrc
 Copy the hook configuration to a stable location:
 
 ```bash
-mkdir -p ~/.config/tt
-cp /path/to/time-tracker/config/tmux-hook.conf ~/.config/tt/
+mkdir -p ~/.config/time-tracker
+cp /path/to/time-tracker/config/tmux-hook.conf ~/.config/time-tracker/
 ```
 
 Add to your `~/.tmux.conf`:
 
 ```bash
-source-file ~/.config/tt/tmux-hook.conf
+source-file ~/.config/time-tracker/tmux-hook.conf
 ```
 
 Reload and verify:
@@ -212,10 +212,10 @@ tt infer
 
 ## Configuration
 
-Configuration file: `~/.config/tt/config.toml`
+Configuration file: `~/.config/time-tracker/config.toml`
 
 ```toml
-# Database location (default: ~/.local/share/tt/tt.db)
+# Database location (default: ~/.local/share/time-tracker/tt.db)
 database_path = "/custom/path/tt.db"
 ```
 
@@ -227,11 +227,11 @@ Environment variables with `TT_` prefix override config file values.
 
 | Location | Purpose |
 |----------|---------|
-| `~/.config/tt/config.toml` | Configuration |
-| `~/.local/share/tt/tt.db` | SQLite database (fast queries, reports) |
-| `~/.local/share/tt/events.jsonl` | Raw event log (simple JSON, easy to sync) |
-| `~/.local/share/tt/machine.json` | Machine identity (UUID + label) |
-| `~/.local/state/tt/hook.log` | tmux hook log output |
+| `~/.config/time-tracker/config.toml` | Configuration |
+| `~/.local/share/time-tracker/tt.db` | SQLite database (fast queries, reports) |
+| `~/.local/share/time-tracker/events.jsonl` | Raw event log (simple JSON, easy to sync) |
+| `~/.local/share/time-tracker/machine.json` | Machine identity (UUID + label) |
+| `~/.local/state/time-tracker/hook.log` | tmux hook log output |
 
 Each machine has a persistent UUID assigned by `tt init`. Events are prefixed with this UUID so they remain unique when synced across machines.
 
@@ -320,7 +320,7 @@ For browser tab tracking:
 
 4. **Check file permissions**:
    ```bash
-   ls -la ~/.local/share/tt/
+   ls -la ~/.local/share/time-tracker/
    ```
 
 ### Sync failing
@@ -338,7 +338,7 @@ For browser tab tracking:
 
 3. **Check remote has events**:
    ```bash
-   ssh user@host cat ~/.local/share/tt/events.jsonl | head -1
+   ssh user@host cat ~/.local/share/time-tracker/events.jsonl | head -1
    ```
 
 ### Time looks wrong
@@ -364,10 +364,10 @@ To clear all data and start over:
 
 ```bash
 # On local machine
-rm ~/.local/share/tt/tt.db
+rm ~/.local/share/time-tracker/tt.db
 
 # On remote machines
-rm ~/.local/share/tt/events.jsonl
+rm ~/.local/share/time-tracker/events.jsonl
 ```
 
 ### Disabling tracking

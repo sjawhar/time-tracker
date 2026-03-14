@@ -136,7 +136,7 @@ tt status
 
 **Output:**
 ```
-Database: ~/.local/share/tt/events.db
+Database: ~/.local/share/time-tracker/events.db
 
 Sources:
   remote.agent:  2025-01-29T12:45:00Z
