@@ -93,11 +93,9 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            use_cross: false
-          - target: aarch64-unknown-linux-gnu
-            use_cross: true
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -109,20 +107,13 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@cross
+      - uses: taiki-e/install-action@cross
 
       - name: Set release version
         run: sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
 
       - name: Build
-        run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         run: tar czf tt-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release tt
@@ -165,10 +156,10 @@ jobs:
 
       - name: Generate checksums
         run: |
-          cd tt-x86_64-unknown-linux-gnu
-          sha256sum tt-x86_64-unknown-linux-gnu.tar.gz >> ../SHA256SUMS
-          cd ../tt-aarch64-unknown-linux-gnu
-          sha256sum tt-aarch64-unknown-linux-gnu.tar.gz >> ../SHA256SUMS
+          cd tt-x86_64-unknown-linux-musl
+          sha256sum tt-x86_64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
+          cd ../tt-aarch64-unknown-linux-musl
+          sha256sum tt-aarch64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
 
       - name: Create GitHub Release
         env:
