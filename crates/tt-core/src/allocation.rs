@@ -31,7 +31,7 @@ pub struct AllocationConfig {
 impl Default for AllocationConfig {
     fn default() -> Self {
         Self {
-            attention_window_ms: 300_000, // 5 minutes
+            attention_window_ms: 120_000, // 2 minutes
             agent_timeout_ms: 1_800_000,  // 30 minutes
         }
     }

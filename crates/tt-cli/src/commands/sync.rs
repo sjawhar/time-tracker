@@ -1,8 +1,8 @@
 //! Sync command for pulling events from remote machines via SSH.
 
 use std::fmt::Write;
-use std::io::Cursor;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -41,24 +41,44 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
         }
     }
 
-    let output = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .arg(remote)
         .arg(&export_cmd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    sync_single_with_command(db, remote, &mut command)
+}
+
+fn sync_single_with_command(
+    db: &tt_db::Database,
+    remote: &str,
+    command: &mut Command,
+) -> Result<()> {
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to SSH to {remote}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("remote tt export failed on {remote}: {stderr}");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to get SSH stdout"))?;
+
+    let result = import::import_from_reader(db, stdout)?;
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for SSH child on {remote}"))?;
+
+    let mut stderr_buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_buf);
     }
 
-    if output.stdout.is_empty() {
-        println!("  No new events from {remote}");
-        return Ok(());
+    if !status.success() {
+        bail!("remote tt export failed on {remote}: {stderr_buf}");
     }
-
-    let reader = Cursor::new(output.stdout);
-    let result = import::import_from_reader(db, reader)?;
 
     println!(
         "  Imported {} events, {} sessions ({} duplicates, {} malformed)",
@@ -80,10 +100,23 @@ fn sync_single(db: &tt_db::Database, remote: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::process::{Command, Stdio};
 
+    use anyhow::Result;
     use tt_db::Database;
 
+    use super::sync_single_with_command;
     use crate::commands::import;
+
+    fn run_with_shell(db: &Database, remote: &str, script: &str) -> Result<()> {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        sync_single_with_command(db, remote, &mut command)
+    }
 
     fn make_jsonl_event(id: &str, ts: &str) -> String {
         format!(
@@ -141,5 +174,59 @@ mod tests {
 
         assert_eq!(result.inserted, 1);
         assert_eq!(result.machine_id, None);
+    }
+
+    #[test]
+    fn test_sync_single_streams_child_stdout_into_importer() -> Result<()> {
+        let db = Database::open_in_memory()?;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let event_id = format!("{uuid}:remote.tmux:tmux_pane_focus:2025-06-01T12:00:00.000Z:%1");
+        let jsonl = format!(
+            r#"{{"id":"{event_id}","timestamp":"2025-06-01T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+        );
+
+        let script = format!("printf '%s\\n' '{jsonl}'");
+        run_with_shell(&db, "streaming-remote", &script)?;
+
+        let events = db.get_events(None, None)?;
+        assert_eq!(events.len(), 1);
+        let machines = db.list_machines()?;
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].machine_id, uuid);
+        assert_eq!(machines[0].label, "streaming-remote");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_single_empty_export_succeeds() -> Result<()> {
+        let db = Database::open_in_memory()?;
+        run_with_shell(&db, "empty-remote", "")?;
+
+        let events = db.get_events(None, None)?;
+        assert!(events.is_empty());
+        let machines = db.list_machines()?;
+        assert!(machines.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_single_non_zero_exit_errors_and_does_not_update_machine_state() -> Result<()> {
+        let db = Database::open_in_memory()?;
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let event_id = format!("{uuid}:remote.tmux:tmux_pane_focus:2025-06-01T12:00:00.000Z:%1");
+        let jsonl = format!(
+            r#"{{"id":"{event_id}","timestamp":"2025-06-01T12:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+        );
+
+        let script =
+            format!("printf '%s\\n' '{jsonl}'; printf '%s' 'synthetic ssh failure' >&2; exit 23");
+        let err = run_with_shell(&db, "failing-remote", &script).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("remote tt export failed on failing-remote"));
+        assert!(err_msg.contains("synthetic ssh failure"));
+
+        let machines = db.list_machines()?;
+        assert!(machines.is_empty());
+        Ok(())
     }
 }

@@ -59,9 +59,9 @@ fn main() -> Result<()> {
                 ingest::index_sessions(&db)?;
             }
         },
-        Some(Commands::Export { after }) => {
+        Some(Commands::Export { after, since }) => {
             // Export doesn't need config - just reads files and outputs to stdout
-            export::run(after.as_deref())?;
+            export::run(after.as_deref(), since.as_deref())?;
         }
         Some(Commands::Import) => {
             let (db, _config) = open_database(cli.config.as_deref())?;

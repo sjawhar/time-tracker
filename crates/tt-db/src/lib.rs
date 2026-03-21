@@ -851,6 +851,24 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Deletes `user_message` events belonging to non-user agent sessions.
+    ///
+    /// When sessions are reclassified (e.g., from `user` to `agent`), stale
+    /// `user_message` events from previous ingestions create false focus signals
+    /// in the allocation algorithm. This cleans them up.
+    ///
+    /// Returns the number of events deleted.
+    pub fn delete_non_user_message_events(&self) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "DELETE FROM events WHERE type = 'user_message' \
+             AND session_id IN (\
+               SELECT session_id FROM agent_sessions WHERE session_type != 'user'\
+             )",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
     /// Updates time fields for multiple streams.
     ///
     /// Also clears the `needs_recompute` flag and updates `updated_at`.
