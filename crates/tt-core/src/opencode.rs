@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::session::{
     AgentSession, MAX_USER_MESSAGE_TIMESTAMPS, MAX_USER_PROMPTS, SessionError, SessionSource,
@@ -37,7 +37,10 @@ struct MessageStats {
     last_message_time: Option<i64>,
 }
 
-pub fn scan_opencode_sessions(db_path: &Path) -> Result<Vec<AgentSession>, SessionError> {
+pub fn scan_opencode_sessions(
+    db_path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<AgentSession>, SessionError> {
     // NO_MUTEX is safe: single connection used from a single thread (no rayon).
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = match Connection::open_with_flags(db_path, flags) {
@@ -53,43 +56,91 @@ pub fn scan_opencode_sessions(db_path: &Path) -> Result<Vec<AgentSession>, Sessi
         return Ok(Vec::new());
     }
 
-    let mut stmt = match conn
-        .prepare("SELECT id, directory, title, parent_id, time_created, time_updated FROM session")
-    {
-        Ok(stmt) => stmt,
-        Err(err) => {
-            tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
-            return Ok(Vec::new());
-        }
-    };
-
-    let session_rows = match stmt.query_map([], |row| {
-        Ok(SessionRow {
-            id: row.get::<_, String>(0)?,
-            directory: row.get::<_, String>(1)?,
-            title: row.get::<_, String>(2)?,
-            parent_id: row.get::<_, Option<String>>(3)?,
-            time_created: row.get::<_, i64>(4)?,
-            time_updated: row.get::<_, i64>(5)?,
-        })
-    }) {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
-            return Ok(Vec::new());
-        }
-    };
-
     let mut sessions = Vec::new();
-    for session_row in session_rows {
-        match session_row {
-            Ok(row) => {
-                if let Err(err) = build_agent_session(&conn, row).map(|s| sessions.push(s)) {
-                    tracing::warn!(error = %err, "skipping invalid OpenCode session");
+
+    if let Some(ts) = since {
+        let mut stmt = match conn.prepare(
+            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session \
+             WHERE time_updated > ?",
+        ) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
+                return Ok(Vec::new());
+            }
+        };
+
+        match stmt.query_map(params![ts.timestamp_millis()], |row| {
+            Ok(SessionRow {
+                id: row.get::<_, String>(0)?,
+                directory: row.get::<_, String>(1)?,
+                title: row.get::<_, String>(2)?,
+                parent_id: row.get::<_, Option<String>>(3)?,
+                time_created: row.get::<_, i64>(4)?,
+                time_updated: row.get::<_, i64>(5)?,
+            })
+        }) {
+            Ok(rows) => {
+                for session_row in rows {
+                    match session_row {
+                        Ok(row) => {
+                            if let Err(err) =
+                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                            {
+                                tracing::warn!(error = %err, "skipping invalid OpenCode session");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "skipping invalid OpenCode session row");
+                        }
+                    }
                 }
             }
             Err(err) => {
-                tracing::warn!(error = %err, "skipping invalid OpenCode session row");
+                tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
+                return Ok(Vec::new());
+            }
+        }
+    } else {
+        let mut stmt = match conn.prepare(
+            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session",
+        ) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
+                return Ok(Vec::new());
+            }
+        };
+
+        match stmt.query_map([], |row| {
+            Ok(SessionRow {
+                id: row.get::<_, String>(0)?,
+                directory: row.get::<_, String>(1)?,
+                title: row.get::<_, String>(2)?,
+                parent_id: row.get::<_, Option<String>>(3)?,
+                time_created: row.get::<_, i64>(4)?,
+                time_updated: row.get::<_, i64>(5)?,
+            })
+        }) {
+            Ok(rows) => {
+                for session_row in rows {
+                    match session_row {
+                        Ok(row) => {
+                            if let Err(err) =
+                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                            {
+                                tracing::warn!(error = %err, "skipping invalid OpenCode session");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "skipping invalid OpenCode session row");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
+                return Ok(Vec::new());
             }
         }
     }
@@ -431,7 +482,7 @@ mod tests {
             1_700_000_060_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
         assert_eq!(session.session_id, "ses_test1");
@@ -496,7 +547,7 @@ mod tests {
             1_700_000_002_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         let session = &sessions[0];
 
         assert_eq!(session.message_count, 2);
@@ -563,7 +614,7 @@ mod tests {
             1_700_000_003_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         let session = &sessions[0];
 
         assert_eq!(
@@ -704,7 +755,7 @@ mod tests {
             1_700_000_010_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         let session = &sessions[0];
 
         assert_eq!(session.session_type, SessionType::Subagent);
@@ -724,7 +775,7 @@ mod tests {
             1_700_000_000_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         let session = &sessions[0];
 
         assert_eq!(session.message_count, 0);
@@ -755,7 +806,7 @@ mod tests {
             1_700_000_100_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
 
         assert_eq!(sessions.len(), 2);
         // Sorted by start_time
@@ -764,8 +815,180 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_since_none_returns_all_sessions() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_old",
+            "/home/user/project-old",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_001_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_new",
+            "/home/user/project-new",
+            "",
+            None,
+            1_700_000_100_000,
+            1_700_000_101_000,
+        );
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "ses_old");
+        assert_eq!(sessions[1].session_id, "ses_new");
+    }
+
+    #[test]
+    fn test_scan_since_very_old_timestamp_returns_all_sessions() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_a",
+            "/home/user/project-a",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_b",
+            "/home/user/project-b",
+            "",
+            None,
+            1_700_000_100_000,
+            1_700_000_110_000,
+        );
+
+        let since = Utc.timestamp_millis_opt(1).single().unwrap();
+        let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_since_between_two_sessions_returns_only_newer_sessions() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_before",
+            "/home/user/project-before",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_after",
+            "/home/user/project-after",
+            "",
+            None,
+            1_700_000_020_000,
+            1_700_000_030_000,
+        );
+
+        let since = Utc
+            .timestamp_millis_opt(1_700_000_015_000)
+            .single()
+            .unwrap();
+        let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_after");
+    }
+
+    #[test]
+    fn test_scan_since_exact_updated_boundary_excludes_equal_timestamp() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_exact",
+            "/home/user/project-exact",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_020_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_after",
+            "/home/user/project-after",
+            "",
+            None,
+            1_700_000_030_000,
+            1_700_000_021_000,
+        );
+
+        let since = Utc
+            .timestamp_millis_opt(1_700_000_020_000)
+            .single()
+            .unwrap();
+        let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_after");
+    }
+
+    #[test]
+    fn test_scan_since_very_recent_timestamp_returns_no_sessions() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_only",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+
+        let since = Utc
+            .timestamp_millis_opt(1_800_000_000_000)
+            .single()
+            .unwrap();
+        let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
+
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_scan_since_includes_updated_old_session() {
+        let (_temp, db_path) = create_test_db();
+
+        insert_session(
+            &db_path,
+            "ses_old_but_updated",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_200_000,
+        );
+
+        let since = Utc
+            .timestamp_millis_opt(1_700_000_100_000)
+            .single()
+            .unwrap();
+        let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "ses_old_but_updated");
+    }
+
+    #[test]
     fn test_scan_nonexistent_db() {
-        let result = scan_opencode_sessions(Path::new("/nonexistent")).unwrap();
+        let result = scan_opencode_sessions(Path::new("/nonexistent"), None).unwrap();
         assert!(result.is_empty());
     }
 
@@ -797,7 +1020,7 @@ mod tests {
             );
         }
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         let session = &sessions[0];
 
         assert_eq!(session.user_prompts.len(), MAX_USER_PROMPTS);
@@ -912,7 +1135,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].message_count, 0);
     }
@@ -940,7 +1163,7 @@ mod tests {
             1_700_000_110_000,
         );
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         // Should only contain the good session
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "ses_good");
@@ -1041,7 +1264,7 @@ mod tests {
         let db_path = temp.path().join("opencode.db");
         fs::write(&db_path, "").unwrap();
 
-        let sessions = scan_opencode_sessions(&db_path).unwrap();
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         assert!(sessions.is_empty());
     }
 }

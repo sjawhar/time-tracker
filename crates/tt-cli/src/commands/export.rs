@@ -235,16 +235,28 @@ fn default_claude_dir() -> PathBuf {
 }
 
 fn default_opencode_db_path() -> PathBuf {
-    dirs::home_dir()
+    dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/opencode/opencode.db")
+        .join("opencode/opencode.db")
 }
 
 /// Runs the export command, outputting all events to stdout.
-pub fn run(after: Option<&str>) -> Result<()> {
+pub fn run(after: Option<&str>, since: Option<&str>) -> Result<()> {
     let identity = crate::machine::require_machine_identity()?;
     let data_dir = default_data_dir();
     let state_dir = crate::config::dirs_state_path().unwrap_or_else(|| data_dir.clone());
+
+    // Parse since timestamp if provided
+    let since_dt = if let Some(since_str) = since {
+        Some(
+            chrono::DateTime::parse_from_rfc3339(since_str)
+                .map_err(|e| anyhow::anyhow!("invalid --since timestamp '{since_str}': {e}"))?
+                .with_timezone(&chrono::Utc),
+        )
+    } else {
+        None
+    };
+
     run_impl(
         &data_dir,
         &default_claude_dir(),
@@ -252,11 +264,16 @@ pub fn run(after: Option<&str>) -> Result<()> {
         Some(&default_opencode_db_path()),
         &identity.machine_id,
         after,
+        since_dt.as_ref(),
         &mut std::io::stdout(),
     )
 }
 
 /// Implementation of export that allows injecting paths for testing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "export entrypoint parameters are explicit by design"
+)]
 fn run_impl(
     data_dir: &Path,
     claude_dir: &Path,
@@ -264,6 +281,7 @@ fn run_impl(
     opencode_db: Option<&Path>,
     machine_id: &str,
     after: Option<&str>,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
     output: &mut dyn Write,
 ) -> Result<()> {
     // Export tmux events
@@ -280,7 +298,7 @@ fn run_impl(
 
     if let Some(oc_db) = opencode_db {
         if oc_db.exists() {
-            export_opencode_events(oc_db, machine_id, output)?;
+            export_opencode_events(oc_db, machine_id, since, output)?;
         }
     }
 
@@ -323,7 +341,7 @@ fn export_tmux_events(
                     }
                 }
             }
-            // Skip the marker event itself and everything before it
+            // Skip the marker event itself and everything before it.
             continue;
         }
 
@@ -480,14 +498,16 @@ fn export_claude_events(
 fn export_opencode_events(
     opencode_db: &Path,
     machine_id: &str,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    let sessions = tt_core::opencode::scan_opencode_sessions(opencode_db).with_context(|| {
-        format!(
-            "failed to scan OpenCode sessions from {}",
-            opencode_db.display()
-        )
-    })?;
+    let sessions = tt_core::opencode::scan_opencode_sessions(opencode_db, since.copied())
+        .with_context(|| {
+            format!(
+                "failed to scan OpenCode sessions from {}",
+                opencode_db.display()
+            )
+        })?;
 
     for session in sessions {
         let start_ts = session
@@ -1031,6 +1051,7 @@ mod tests {
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         );
 
@@ -1053,6 +1074,7 @@ mod tests {
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1081,6 +1103,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1106,6 +1129,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1137,6 +1161,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1185,6 +1210,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1228,6 +1254,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1265,6 +1292,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1299,6 +1327,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1338,6 +1367,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1371,6 +1401,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1400,6 +1431,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1460,6 +1492,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -1471,6 +1504,7 @@ not valid json
             &data_dir2,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -1506,6 +1540,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1528,6 +1563,7 @@ not valid json
             &data_dir,
             Some(opencode_db.as_path()),
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1597,6 +1633,7 @@ not valid json
             &data_dir,
             Some(opencode_db.as_path()),
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1703,6 +1740,7 @@ not valid json
             Some(opencode_db1.as_path()),
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -1714,6 +1752,7 @@ not valid json
             &data_dir2,
             Some(opencode_db2.as_path()),
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -1771,6 +1810,7 @@ not valid json
             Some(opencode_db.as_path()),
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1803,6 +1843,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1885,6 +1926,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         )
         .unwrap();
@@ -1924,6 +1966,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -1970,6 +2013,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -1989,6 +2033,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -2043,6 +2088,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output,
         );
         assert!(
@@ -2076,6 +2122,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -2105,6 +2152,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -2143,6 +2191,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -2164,6 +2213,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -2202,6 +2252,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -2233,6 +2284,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -2272,6 +2324,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             None,
+            None,
             &mut output1,
         )
         .unwrap();
@@ -2284,6 +2337,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output2,
         )
@@ -2311,6 +2365,7 @@ not valid json
             &data_dir,
             None,
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         );
@@ -2389,6 +2444,7 @@ not valid json
             None,
             TEST_MACHINE_ID,
             Some(&after_id),
+            None,
             &mut output,
         )
         .unwrap();
@@ -2398,6 +2454,46 @@ not valid json
         // Should only get the third event (after the marker)
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("00:02:00"));
+    }
+
+    #[test]
+    fn test_export_after_missing_marker_exports_nothing() {
+        let (temp, data_dir, _claude_dir) = setup_test_dirs();
+        let events = [
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:00:00.000Z:%1","timestamp":"2025-01-01T00:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:01:00.000Z:%1","timestamp":"2025-01-01T00:01:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+        ];
+        std::fs::write(
+            data_dir.join("events.jsonl"),
+            events.join(
+                "
+",
+            ) + "
+",
+        )
+        .unwrap();
+
+        let missing_after_id =
+            format!("{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:09:00.000Z:%1");
+        let mut output = Vec::new();
+        let state_dir = data_dir.clone();
+        run_impl(
+            &data_dir,
+            &temp.path().join(".claude/projects"),
+            &state_dir,
+            None,
+            TEST_MACHINE_ID,
+            Some(&missing_after_id),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        assert!(output.is_empty(), "missing marker should export nothing");
     }
 
     #[test]
@@ -2436,6 +2532,7 @@ not valid json
             &data_dir,
             Some(opencode_db.as_path()),
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -2497,6 +2594,7 @@ not valid json
             &data_dir,
             Some(opencode_db.as_path()),
             TEST_MACHINE_ID,
+            None,
             None,
             &mut output,
         )
@@ -2582,5 +2680,44 @@ not valid json
         );
         assert_eq!(recovered.tool_call_count, session.tool_call_count);
         assert_eq!(machine_id, Some("test-machine".to_string()));
+    }
+
+    #[test]
+    fn test_since_parameter_threading() {
+        // Test that since parameter is threaded through run_impl to export_opencode_events
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let db_path = create_test_opencode_db(&data_dir);
+        let mut output = Cursor::new(Vec::new());
+
+        // Create a test session with a known timestamp
+        let session_id = "test-since-session";
+        let created_ms = Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let updated_ms = Utc
+            .with_ymd_and_hms(2026, 1, 1, 13, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        insert_opencode_session(&db_path, session_id, "/test/path", created_ms, updated_ms);
+
+        // Test with since = None (should export all sessions)
+        let result = run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(&db_path),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        );
+
+        assert!(result.is_ok());
+        let output_str = String::from_utf8(output.get_ref().clone()).unwrap();
+        assert!(
+            output_str.contains(session_id),
+            "session should be exported when since is None"
+        );
     }
 }

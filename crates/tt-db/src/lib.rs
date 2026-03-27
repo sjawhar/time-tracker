@@ -851,6 +851,24 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Deletes `user_message` events belonging to non-user agent sessions.
+    ///
+    /// When sessions are reclassified (e.g., from `user` to `agent`), stale
+    /// `user_message` events from previous ingestions create false focus signals
+    /// in the allocation algorithm. This cleans them up.
+    ///
+    /// Returns the number of events deleted.
+    pub fn delete_non_user_message_events(&self) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "DELETE FROM events WHERE type = 'user_message' \
+             AND session_id IN (\
+               SELECT session_id FROM agent_sessions WHERE session_type != 'user'\
+             )",
+            [],
+        )?;
+        Ok(count as u64)
+    }
+
     /// Updates time fields for multiple streams.
     ///
     /// Also clears the `needs_recompute` flag and updates `updated_at`.
@@ -1376,6 +1394,26 @@ impl Database {
         Ok(())
     }
 
+    /// Inserts or updates a machine entry with explicit sync timestamp.
+    pub fn upsert_machine_with_sync_time(
+        &self,
+        machine_id: &str,
+        label: &str,
+        last_event_id: Option<&str>,
+        last_sync_at: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO machines (machine_id, label, last_sync_at, last_event_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(machine_id) DO UPDATE SET
+                label = excluded.label,
+                last_sync_at = excluded.last_sync_at,
+                last_event_id = COALESCE(excluded.last_event_id, machines.last_event_id)",
+            params![machine_id, label, last_sync_at, last_event_id],
+        )?;
+        Ok(())
+    }
+
     /// Lists all known machines.
     pub fn list_machines(&self) -> Result<Vec<Machine>, DbError> {
         let mut stmt = self.conn.prepare(
@@ -1402,6 +1440,20 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare("SELECT last_event_id FROM machines WHERE label = ?1")?;
+        let result: Option<Option<String>> = stmt
+            .query_row(params![label], |row| row.get(0))
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Gets the last sync timestamp for a machine identified by label.
+    pub fn get_machine_last_sync_at_by_label(
+        &self,
+        label: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_sync_at FROM machines WHERE label = ?1")?;
         let result: Option<Option<String>> = stmt
             .query_row(params![label], |row| row.get(0))
             .optional()?;

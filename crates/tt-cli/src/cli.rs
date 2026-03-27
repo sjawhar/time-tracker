@@ -43,6 +43,10 @@ pub enum Commands {
         /// Only export events after this event ID (for incremental sync).
         #[arg(long)]
         after: Option<String>,
+
+        /// Only export events after this timestamp (for incremental `OpenCode` export).
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Import events from stdin into local `SQLite` database.

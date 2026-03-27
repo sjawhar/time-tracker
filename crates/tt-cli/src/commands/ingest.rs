@@ -376,8 +376,8 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     let opencode_db = get_opencode_db_path()?;
     if opencode_db.exists() {
         println!("Scanning OpenCode sessions...");
-        let opencode_sessions =
-            scan_opencode_sessions(&opencode_db).context("failed to scan OpenCode sessions")?;
+        let opencode_sessions = scan_opencode_sessions(&opencode_db, None)
+            .context("failed to scan OpenCode sessions")?;
         println!("  Found {} OpenCode sessions", opencode_sessions.len());
         all_sessions.extend(opencode_sessions);
     }
@@ -397,6 +397,15 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         db.insert_events(&events).with_context(|| {
             format!("failed to insert events for session {}", session.session_id)
         })?;
+    }
+
+    // Clean up stale user_message events from sessions that were reclassified
+    // (e.g., Legion workers previously classified as User, now Agent).
+    let cleaned = db
+        .delete_non_user_message_events()
+        .context("failed to clean up stale user_message events")?;
+    if cleaned > 0 {
+        println!("Cleaned {cleaned} stale user_message events from non-user sessions");
     }
 
     println!(
@@ -583,10 +592,14 @@ fn create_session_events(session: &AgentSession, machine_id: Option<&str>) -> Ve
     start_event.data["project_name"] = json!(session.project_name);
     events.push(start_event);
 
-    // User message events
-    for ts in &session.user_message_timestamps {
-        let id_suffix = format!("user_message-{}", ts.timestamp_millis());
-        events.push(make_event(&id_suffix, *ts, EventType::UserMessage));
+    // User message events — only for human-driven sessions.
+    // Non-User sessions (Agent, Subagent) have automated prompts that would
+    // create false focus signals in the allocation algorithm.
+    if session.session_type == tt_core::session::SessionType::User {
+        for ts in &session.user_message_timestamps {
+            let id_suffix = format!("user_message-{}", ts.timestamp_millis());
+            events.push(make_event(&id_suffix, *ts, EventType::UserMessage));
+        }
     }
 
     for (index, ts) in session.tool_call_timestamps.iter().enumerate() {
@@ -624,7 +637,9 @@ fn get_claude_projects_dir() -> PathBuf {
 
 /// Get the `OpenCode` database path.
 fn get_opencode_db_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local/share/opencode/opencode.db"))
+    Ok(dirs::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?
+        .join("opencode/opencode.db"))
 }
 
 /// Reads all events from the events file in the specified data directory.
@@ -1446,4 +1461,79 @@ fn test_create_session_events_with_empty_timestamps() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
     assert_eq!(events[0].action.as_deref(), Some("started"));
+}
+
+#[test]
+fn test_non_user_session_skips_user_message_events() {
+    use chrono::TimeZone;
+    use tt_core::session::{AgentSession, SessionSource, SessionType};
+
+    let ts1 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 5, 0).unwrap();
+    let ts2 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 10, 0).unwrap();
+
+    // Agent session (e.g., Legion worker) with user_message_timestamps
+    let session = AgentSession {
+        session_id: "ses_legion_worker".to_string(),
+        source: SessionSource::OpenCode,
+        parent_session_id: None,
+        session_type: SessionType::Agent,
+        project_path: "/home/ubuntu/.local/share/legion/workspaces/test".to_string(),
+        project_name: "test".to_string(),
+        start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+        end_time: Some(Utc.with_ymd_and_hms(2026, 2, 2, 11, 0, 0).unwrap()),
+        message_count: 4,
+        summary: None,
+        user_prompts: vec!["automated prompt".to_string()],
+        starting_prompt: Some("automated prompt".to_string()),
+        assistant_message_count: 2,
+        tool_call_count: 100,
+        user_message_timestamps: vec![ts1, ts2],
+        tool_call_timestamps: vec![ts1, ts2],
+    };
+
+    let events = create_session_events(&session, None);
+
+    // Should have: session_start + 2 tool_use + session_end = 4 events
+    // Should NOT have any UserMessage events
+    assert_eq!(events.len(), 4);
+    for event in &events {
+        assert_ne!(
+            event.event_type,
+            tt_core::EventType::UserMessage,
+            "Agent sessions must not emit UserMessage events"
+        );
+    }
+}
+
+#[test]
+fn test_subagent_session_skips_user_message_events() {
+    use chrono::TimeZone;
+    use tt_core::session::{AgentSession, SessionSource, SessionType};
+
+    let ts1 = Utc.with_ymd_and_hms(2026, 2, 2, 10, 5, 0).unwrap();
+
+    let session = AgentSession {
+        session_id: "ses_subagent".to_string(),
+        source: SessionSource::OpenCode,
+        parent_session_id: Some("ses_parent".to_string()),
+        session_type: SessionType::Subagent,
+        project_path: "/home/ubuntu/project".to_string(),
+        project_name: "project".to_string(),
+        start_time: Utc.with_ymd_and_hms(2026, 2, 2, 10, 0, 0).unwrap(),
+        end_time: None,
+        message_count: 2,
+        summary: None,
+        user_prompts: vec!["parent prompt".to_string()],
+        starting_prompt: Some("parent prompt".to_string()),
+        assistant_message_count: 1,
+        tool_call_count: 0,
+        user_message_timestamps: vec![ts1],
+        tool_call_timestamps: Vec::new(),
+    };
+
+    let events = create_session_events(&session, None);
+
+    // Should have only session_start — no UserMessage, no end
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
 }
