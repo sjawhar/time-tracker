@@ -308,10 +308,6 @@ fn run_impl(
 /// Exports tmux events from events.jsonl, passing through valid lines.
 /// When `after` is provided, exports events strictly after the matching event
 /// (the marker event itself is excluded).
-///
-/// If the marker event is not found in the file (e.g., after file rotation),
-/// falls back to exporting ALL events. The import side uses `INSERT OR IGNORE`
-/// to handle duplicates, so this is safe.
 fn export_tmux_events(
     events_file: &Path,
     after: Option<&str>,
@@ -320,9 +316,6 @@ fn export_tmux_events(
     let file = File::open(events_file).context("failed to open events.jsonl")?;
     let reader = BufReader::new(file);
     let mut past_marker = after.is_none();
-
-    // Collect lines so we can fall back to exporting all if marker not found.
-    let mut buffered_lines: Vec<String> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = match line {
@@ -348,11 +341,7 @@ fn export_tmux_events(
                     }
                 }
             }
-            if !past_marker {
-                // Buffer lines in case we need to fall back to full export.
-                buffered_lines.push(line);
-            }
-            // Skip the marker event itself and everything before it
+            // Skip the marker event itself and everything before it.
             continue;
         }
 
@@ -363,20 +352,6 @@ fn export_tmux_events(
             }
             Err(e) => {
                 tracing::warn!(line = line_num + 1, error = %e, "malformed JSON, skipping");
-            }
-        }
-    }
-
-    // If marker was requested but never found (e.g., file was rotated),
-    // export ALL buffered events. INSERT OR IGNORE on the import side
-    // ensures duplicates are harmless.
-    if after.is_some() && !past_marker {
-        tracing::info!(
-            "marker event not found in events.jsonl (file may have rotated); exporting all events"
-        );
-        for line in &buffered_lines {
-            if serde_json::from_str::<&serde_json::value::RawValue>(line).is_ok() {
-                writeln!(output, "{line}").context("failed to write event")?;
             }
         }
     }
@@ -2479,6 +2454,46 @@ not valid json
         // Should only get the third event (after the marker)
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("00:02:00"));
+    }
+
+    #[test]
+    fn test_export_after_missing_marker_exports_nothing() {
+        let (temp, data_dir, _claude_dir) = setup_test_dirs();
+        let events = [
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:00:00.000Z:%1","timestamp":"2025-01-01T00:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:01:00.000Z:%1","timestamp":"2025-01-01T00:01:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+        ];
+        std::fs::write(
+            data_dir.join("events.jsonl"),
+            events.join(
+                "
+",
+            ) + "
+",
+        )
+        .unwrap();
+
+        let missing_after_id =
+            format!("{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:09:00.000Z:%1");
+        let mut output = Vec::new();
+        let state_dir = data_dir.clone();
+        run_impl(
+            &data_dir,
+            &temp.path().join(".claude/projects"),
+            &state_dir,
+            None,
+            TEST_MACHINE_ID,
+            Some(&missing_after_id),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        assert!(output.is_empty(), "missing marker should export nothing");
     }
 
     #[test]
