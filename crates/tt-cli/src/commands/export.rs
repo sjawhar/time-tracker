@@ -2665,44 +2665,44 @@ not valid json
         );
         assert_eq!(recovered.tool_call_count, session.tool_call_count);
         assert_eq!(machine_id, Some("test-machine".to_string()));
+    }
 
-        #[test]
-        fn test_since_parameter_threading() {
-            // Test that since parameter is threaded through run_impl to export_opencode_events
-            let (_temp, data_dir, claude_dir) = setup_test_dirs();
-            let db_path = create_test_opencode_db(&data_dir);
-            let mut output = Cursor::new(Vec::new());
+    #[test]
+    fn test_since_parameter_threading() {
+        // Test that since parameter is threaded through run_impl to export_opencode_events
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let db_path = create_test_opencode_db(&data_dir);
+        let mut output = Cursor::new(Vec::new());
 
-            // Create a test session with a known timestamp
-            let session_id = "test-since-session";
-            let created_ms = Utc
-                .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
-                .unwrap()
-                .timestamp_millis();
-            let updated_ms = Utc
-                .with_ymd_and_hms(2026, 1, 1, 13, 0, 0)
-                .unwrap()
-                .timestamp_millis();
-            insert_opencode_session(&db_path, session_id, "/test/path", created_ms, updated_ms);
+        // Create a test session with a known timestamp
+        let session_id = "test-since-session";
+        let created_ms = Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let updated_ms = Utc
+            .with_ymd_and_hms(2026, 1, 1, 13, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        insert_opencode_session(&db_path, session_id, "/test/path", created_ms, updated_ms);
 
-            // Test with since = None (should export all sessions)
-            let result = run_impl(
-                &data_dir,
-                &claude_dir,
-                &data_dir,
-                Some(&db_path),
-                TEST_MACHINE_ID,
-                None,
-                None,
-                &mut output,
-            );
+        // Test with since = None (should export all sessions)
+        let result = run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            Some(&db_path),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        );
 
-            assert!(result.is_ok());
-            let output_str = String::from_utf8(output.get_ref().clone()).unwrap();
-            assert!(
-                output_str.contains(session_id),
-                "session should be exported when since is None"
-            );
-        }
+        assert!(result.is_ok());
+        let output_str = String::from_utf8(output.get_ref().clone()).unwrap();
+        assert!(
+            output_str.contains(session_id),
+            "session should be exported when since is None"
+        );
     }
 }

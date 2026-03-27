@@ -84,7 +84,9 @@ pub fn scan_opencode_sessions(
                 for session_row in rows {
                     match session_row {
                         Ok(row) => {
-                            if let Err(err) = build_agent_session(&conn, row).map(|s| sessions.push(s)) {
+                            if let Err(err) =
+                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                            {
                                 tracing::warn!(error = %err, "skipping invalid OpenCode session");
                             }
                         }
@@ -124,7 +126,9 @@ pub fn scan_opencode_sessions(
                 for session_row in rows {
                     match session_row {
                         Ok(row) => {
-                            if let Err(err) = build_agent_session(&conn, row).map(|s| sessions.push(s)) {
+                            if let Err(err) =
+                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                            {
                                 tracing::warn!(error = %err, "skipping invalid OpenCode session");
                             }
                         }
@@ -140,7 +144,6 @@ pub fn scan_opencode_sessions(
             }
         }
     }
-
 
     sessions.sort_by_key(|e| e.start_time);
     Ok(sessions)
