@@ -240,6 +240,12 @@ fn default_opencode_db_path() -> PathBuf {
         .join("opencode/opencode.db")
 }
 
+fn parse_after_timestamp(after: Option<&str>) -> Option<DateTime<Utc>> {
+    let rest = after?.splitn(4, ':').nth(3)?;
+    let timestamp = rest.get(..24)?;
+    timestamp.parse().ok()
+}
+
 /// Runs the export command, outputting all events to stdout.
 pub fn run(after: Option<&str>, since: Option<&str>) -> Result<()> {
     let identity = crate::machine::require_machine_identity()?;
@@ -306,8 +312,10 @@ fn run_impl(
 }
 
 /// Exports tmux events from events.jsonl, passing through valid lines.
-/// When `after` is provided, exports events strictly after the matching event
-/// (the marker event itself is excluded).
+/// When `after` is provided, extracts the timestamp and exports only events
+/// strictly after that timestamp. This uses timestamp comparison rather than
+/// ID matching because the `--after` ID may be from a different event source
+/// (e.g., an agent event) that doesn't exist in events.jsonl.
 fn export_tmux_events(
     events_file: &Path,
     after: Option<&str>,
@@ -315,7 +323,7 @@ fn export_tmux_events(
 ) -> Result<()> {
     let file = File::open(events_file).context("failed to open events.jsonl")?;
     let reader = BufReader::new(file);
-    let mut past_marker = after.is_none();
+    let cutoff = parse_after_timestamp(after);
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = match line {
@@ -331,18 +339,19 @@ fn export_tmux_events(
             continue;
         }
 
-        if !past_marker {
-            if let Some(after_id) = after {
-                // Parse the id field specifically rather than substring matching
-                // to avoid false matches in cwd or data fields.
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if value.get("id").and_then(serde_json::Value::as_str) == Some(after_id) {
-                        past_marker = true;
+        // When a cutoff timestamp is set, filter by timestamp comparison.
+        if let Some(cutoff_ts) = cutoff {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(ts_str) = value.get("timestamp").and_then(serde_json::Value::as_str) {
+                    if let Ok(event_ts) = ts_str.parse::<DateTime<Utc>>() {
+                        if event_ts <= cutoff_ts {
+                            continue;
+                        }
                     }
                 }
             }
-            // Skip the marker event itself and everything before it.
-            continue;
+            // If we can't parse the timestamp, pass the event through
+            // (better to duplicate than lose data)
         }
 
         // Validate it's valid JSON before passing through (use RawValue to avoid parsing overhead)
@@ -2454,6 +2463,54 @@ not valid json
         // Should only get the third event (after the marker)
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("00:02:00"));
+    }
+
+    #[test]
+    fn test_export_after_cross_source_filters_tmux_by_timestamp() {
+        // Bug regression: when --after is an agent event ID (from OpenCode/Claude),
+        // tmux events should still be exported if they have timestamps after the cutoff.
+        // Previously, export_tmux_events used exact ID matching which meant the agent
+        // event ID was never found in events.jsonl, causing ALL tmux events to be skipped.
+        let (temp, data_dir, _claude_dir) = setup_test_dirs();
+
+        let events = [
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:00:00.000Z:%1","timestamp":"2025-01-01T00:00:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+            format!(
+                r#"{{"id":"{TEST_MACHINE_ID}:remote.tmux:tmux_pane_focus:2025-01-01T00:05:00.000Z:%1","timestamp":"2025-01-01T00:05:00.000Z","source":"remote.tmux","type":"tmux_pane_focus","pane_id":"%1","tmux_session":"main","cwd":"/tmp"}}"#
+            ),
+        ];
+        std::fs::write(data_dir.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+
+        // Use an agent event ID as the --after marker (different source than tmux)
+        let agent_after_id = format!(
+            "{TEST_MACHINE_ID}:remote.agent:agent_session:2025-01-01T00:02:00.000Z:ses_abc:started"
+        );
+        let mut output = Vec::new();
+        let state_dir = data_dir.clone();
+        run_impl(
+            &data_dir,
+            &temp.path().join(".claude/projects"),
+            &state_dir,
+            None,
+            TEST_MACHINE_ID,
+            Some(&agent_after_id),
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = output_str.lines().collect();
+        // The agent --after timestamp is 00:02:00, so only the tmux event at 00:05:00
+        // should be exported (the 00:00:00 event is before the cutoff)
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected 1 tmux event after cutoff, got {lines:?}"
+        );
+        assert!(lines[0].contains("00:05:00"));
     }
 
     #[test]
