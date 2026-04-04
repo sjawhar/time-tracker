@@ -308,6 +308,13 @@ impl Database {
     /// If the database has an incompatible schema version, returns an error.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
+        // WAL + NORMAL: bulk ingest commits ~80k small transactions; the default
+        // (rollback journal + synchronous=FULL) fsyncs twice per commit, which
+        // dominated ingest time. WAL with synchronous=NORMAL only fsyncs at
+        // checkpoints, keeping durability safe against app crashes (the OS still
+        // owns the WAL) while making per-commit cost negligible.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
