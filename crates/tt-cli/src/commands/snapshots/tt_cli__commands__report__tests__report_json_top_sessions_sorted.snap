@@ -1,6 +1,5 @@
 ---
 source: crates/tt-cli/src/commands/report.rs
-assertion_line: 1475
 expression: output
 ---
 {
@@ -71,6 +70,8 @@ expression: output
   "totals": {
     "time_direct_ms": 7200000,
     "time_delegated_ms": 4500000,
-    "stream_count": 1
+    "stream_count": 1,
+    "unassigned_direct_ms": 0,
+    "unassigned_delegated_ms": 0
   }
 }
