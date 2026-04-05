@@ -32,7 +32,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -603,6 +603,39 @@ impl Database {
 
         let mut events = Vec::new();
         let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
+
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+
+    pub fn get_agent_session_start_events(
+        &self,
+        session_ids: &[String],
+    ) -> Result<Vec<StoredEvent>, DbError> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = session_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
+             FROM events
+             WHERE type = 'agent_session' AND action = 'started' AND session_id IN ({placeholders})
+             ORDER BY timestamp ASC"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut events = Vec::new();
+        let mut rows = stmt.query(params_from_iter(session_ids.iter()))?;
 
         while let Some(row) = rows.next()? {
             if let Some(event) = Self::row_to_event(row)? {
@@ -1744,6 +1777,70 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
         let events = db.get_events_in_range(start, end).unwrap();
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_get_agent_session_start_events_filters_and_orders_results() {
+        let db = Database::open_in_memory().unwrap();
+        let ts1 = Utc.with_ymd_and_hms(2025, 1, 14, 23, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 1, 0, 0).unwrap();
+        let ts4 = Utc.with_ymd_and_hms(2025, 1, 15, 2, 0, 0).unwrap();
+
+        for stream_id in ["stream-a", "stream-b"] {
+            db.insert_stream(&Stream {
+                id: stream_id.to_string(),
+                created_at: ts1,
+                updated_at: ts1,
+                name: Some(stream_id.to_string()),
+                time_direct_ms: 0,
+                time_delegated_ms: 0,
+                first_event_at: None,
+                last_event_at: None,
+                needs_recompute: false,
+            })
+            .unwrap();
+        }
+
+        let mut second_start = make_event("session-b-start", ts2, tt_core::EventType::AgentSession);
+        second_start.action = Some("started".to_string());
+        second_start.session_id = Some("session-b".to_string());
+        second_start.stream_id = Some("stream-b".to_string());
+
+        let mut first_start = make_event("session-a-start", ts1, tt_core::EventType::AgentSession);
+        first_start.action = Some("started".to_string());
+        first_start.session_id = Some("session-a".to_string());
+        first_start.stream_id = Some("stream-a".to_string());
+
+        let mut tool_use = make_event("session-a-tool", ts3, tt_core::EventType::AgentToolUse);
+        tool_use.session_id = Some("session-a".to_string());
+        tool_use.stream_id = Some("stream-a".to_string());
+
+        let mut end = make_event("session-a-end", ts4, tt_core::EventType::AgentSession);
+        end.action = Some("ended".to_string());
+        end.session_id = Some("session-a".to_string());
+        end.stream_id = Some("stream-a".to_string());
+
+        for event in [&second_start, &first_start, &tool_use, &end] {
+            db.insert_event(event).unwrap();
+        }
+
+        let events = db
+            .get_agent_session_start_events(&["session-b".to_string(), "session-a".to_string()])
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id, "session-a-start");
+        assert_eq!(events[1].id, "session-b-start");
+    }
+
+    #[test]
+    fn test_get_agent_session_start_events_empty_input() {
+        let db = Database::open_in_memory().unwrap();
+
+        let events = db.get_agent_session_start_events(&[]).unwrap();
 
         assert!(events.is_empty());
     }
