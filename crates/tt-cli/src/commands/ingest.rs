@@ -420,7 +420,7 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
     }
 
     let mut project_list: Vec<_> = projects.into_iter().collect();
-    project_list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    project_list.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
     println!("\nSessions by project:");
     for (project, count) in &project_list[..project_list.len().min(10)] {
