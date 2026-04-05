@@ -90,6 +90,14 @@ pub enum Commands {
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..), group = "period")]
         weeks: Option<u32>,
 
+        /// Start date (YYYY-MM-DD, local time). Use with --end for custom range.
+        #[arg(long, group = "period")]
+        start: Option<String>,
+
+        /// End date (YYYY-MM-DD, local time, exclusive). Use with --start for custom range.
+        #[arg(long, requires = "start")]
+        end: Option<String>,
+
         /// Output as JSON.
         #[arg(long)]
         json: bool,
