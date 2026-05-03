@@ -81,10 +81,24 @@ fn main() -> Result<()> {
             day,
             last_day,
             weeks,
+            start,
+            end,
             json,
         }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
-            let period = if *last_week {
+            let period = if let Some(start_str) = start {
+                let start_date = chrono::NaiveDate::parse_from_str(start_str, "%Y-%m-%d")
+                    .with_context(|| format!("invalid --start date '{start_str}', expected YYYY-MM-DD"))?;
+                let end_date = match end {
+                    Some(end_str) => chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d")
+                        .with_context(|| format!("invalid --end date '{end_str}', expected YYYY-MM-DD"))?,
+                    None => chrono::Local::now().date_naive() + chrono::Duration::days(1),
+                };
+                report::Period::Custom(
+                    report::local_midnight_to_utc(start_date),
+                    report::local_midnight_to_utc(end_date),
+                )
+            } else if *last_week {
                 report::Period::LastWeek
             } else if *day {
                 report::Period::Day
@@ -93,7 +107,7 @@ fn main() -> Result<()> {
             } else {
                 report::Period::Week
             };
-            report::run(&db, period, *json, *weeks)?;
+            report::run(&db, period, *json, *weeks)?
         }
         Some(Commands::Tag {
             stream,

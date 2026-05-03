@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 use tt_core::session::AgentSession;
-use tt_core::{AllocationConfig, allocate_time};
+use tt_core::{AllocationConfig, EventType, allocate_time};
 use tt_db::Database;
 
 /// Report period type.
@@ -23,6 +23,7 @@ pub enum Period {
     LastWeek,
     Day,
     LastDay,
+    Custom(DateTime<Utc>, DateTime<Utc>),
 }
 
 /// Period type for JSON output.
@@ -64,7 +65,7 @@ const DEFAULT_WEEK_START_DAY: &str = "monday";
 
 /// Converts a local date at midnight to UTC.
 /// Handles DST ambiguity by picking the earlier time.
-fn local_midnight_to_utc(local_date: NaiveDate) -> DateTime<Utc> {
+pub fn local_midnight_to_utc(local_date: NaiveDate) -> DateTime<Utc> {
     let midnight = local_date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
     match Local.from_local_datetime(&midnight) {
         // Single or ambiguous (DST fall-back): use the earlier time
@@ -128,6 +129,7 @@ pub fn get_period_boundaries(period: Period, today: NaiveDate) -> (DateTime<Utc>
         Period::LastWeek => last_week_boundaries(today),
         Period::Day => day_boundaries(today),
         Period::LastDay => last_day_boundaries(today),
+        Period::Custom(start, end) => (start, end),
     }
 }
 
@@ -287,12 +289,39 @@ pub fn generate_report_data_for_date(
     let period_type = match period {
         Period::Week | Period::LastWeek => PeriodType::Week,
         Period::Day | Period::LastDay => PeriodType::Day,
+        Period::Custom(_, _) => PeriodType::Day,
     };
 
     // Get events within the period
-    let events = db
+    let mut events = db
         .get_events_in_range(period_start, period_end)
         .context("failed to get events in period")?;
+
+    let session_ids_with_starts: BTreeSet<&str> = events
+        .iter()
+        .filter(|event| {
+            event.event_type == EventType::AgentSession
+                && event.action.as_deref() == Some("started")
+        })
+        .filter_map(|event| event.session_id.as_deref())
+        .collect();
+    let missing_session_ids: Vec<String> = events
+        .iter()
+        .filter(|event| event.event_type == EventType::AgentToolUse)
+        .filter_map(|event| event.session_id.as_deref())
+        .filter(|session_id| !session_ids_with_starts.contains(*session_id))
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    if !missing_session_ids.is_empty() {
+        let mut start_events = db
+            .get_agent_session_start_events(&missing_session_ids)
+            .context("failed to get agent session starts for period")?;
+        start_events.append(&mut events);
+        events = start_events;
+    }
 
     // Calculate time from events using the allocation algorithm
     let config = AllocationConfig::default();
@@ -830,7 +859,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use insta::assert_snapshot;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tt_core::session::{SessionSource, SessionType};
 
     // ========== Period Date Calculation Tests ==========
@@ -1022,6 +1051,37 @@ mod tests {
             tool_call_count: 0,
             user_message_timestamps: Vec::new(),
             tool_call_timestamps: Vec::new(),
+        }
+    }
+
+    fn make_agent_event(
+        id: &str,
+        timestamp: DateTime<Utc>,
+        event_type: tt_core::EventType,
+        session_id: &str,
+        stream_id: &str,
+        action: Option<&str>,
+    ) -> tt_db::StoredEvent {
+        tt_db::StoredEvent {
+            id: id.to_string(),
+            timestamp,
+            event_type,
+            source: "remote.agent".to_string(),
+            machine_id: None,
+            schema_version: 1,
+            pane_id: None,
+            tmux_session: None,
+            window_index: None,
+            git_project: None,
+            git_workspace: None,
+            status: None,
+            idle_duration_ms: None,
+            action: action.map(ToString::to_string),
+            cwd: Some("/home/sami/time-tracker/default".to_string()),
+            session_id: Some(session_id.to_string()),
+            stream_id: Some(stream_id.to_string()),
+            assignment_source: None,
+            data: json!({}),
         }
     }
 
@@ -1709,5 +1769,108 @@ Delegated time: 3h 13m (36%)
             data.streams.is_empty(),
             "zero-time streams should be excluded"
         );
+    }
+
+    #[test]
+    fn test_day_report_seeds_cross_boundary_agent_session_starts() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        let reference_date = NaiveDate::from_ymd_opt(2025, 1, 29).unwrap();
+        let (period_start, period_end) = get_period_boundaries(Period::Day, reference_date);
+        let session_id = "session-cross-boundary";
+        let stream_id = "stream-cross-boundary";
+        let stream_created_at = period_start - chrono::Duration::hours(2);
+
+        db.insert_stream(&tt_db::Stream {
+            id: stream_id.to_string(),
+            name: Some("cross-boundary stream".to_string()),
+            created_at: stream_created_at,
+            updated_at: stream_created_at,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: false,
+        })
+        .unwrap();
+
+        let session_start = period_start - chrono::Duration::hours(1);
+        let first_tool_use =
+            period_start + chrono::Duration::hours(9) + chrono::Duration::minutes(10);
+        let second_tool_use = first_tool_use + chrono::Duration::minutes(30);
+        let session_end = second_tool_use + chrono::Duration::minutes(20);
+        let expected_delegated_ms = (session_end - first_tool_use).num_milliseconds();
+
+        let start_event = make_agent_event(
+            "session-start",
+            session_start,
+            tt_core::EventType::AgentSession,
+            session_id,
+            stream_id,
+            Some("started"),
+        );
+        let first_tool_event = make_agent_event(
+            "tool-use-1",
+            first_tool_use,
+            tt_core::EventType::AgentToolUse,
+            session_id,
+            stream_id,
+            None,
+        );
+        let second_tool_event = make_agent_event(
+            "tool-use-2",
+            second_tool_use,
+            tt_core::EventType::AgentToolUse,
+            session_id,
+            stream_id,
+            None,
+        );
+        let end_event = make_agent_event(
+            "session-end",
+            session_end,
+            tt_core::EventType::AgentSession,
+            session_id,
+            stream_id,
+            Some("ended"),
+        );
+
+        for event in [
+            &start_event,
+            &first_tool_event,
+            &second_tool_event,
+            &end_event,
+        ] {
+            db.insert_event(event).unwrap();
+        }
+
+        let period_events = db.get_events_in_range(period_start, period_end).unwrap();
+        let config = AllocationConfig::default();
+
+        let without_seed =
+            allocate_time(&period_events, &config, Some(period_end), &HashMap::new());
+        assert_eq!(without_seed.stream_times.len(), 0);
+
+        let mut seeded_events = Vec::with_capacity(period_events.len() + 1);
+        seeded_events.push(start_event);
+        seeded_events.extend(period_events);
+        let with_seed = allocate_time(&seeded_events, &config, Some(period_end), &HashMap::new());
+        assert_eq!(with_seed.stream_times.len(), 1);
+        assert_eq!(with_seed.stream_times[0].stream_id, stream_id);
+        assert_eq!(
+            with_seed.stream_times[0].time_delegated_ms,
+            expected_delegated_ms
+        );
+
+        let data = generate_report_data_for_date(
+            &db,
+            Period::Day,
+            period_end + chrono::Duration::hours(1),
+            reference_date,
+            "Etc/UTC".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(data.streams.len(), 1);
+        assert_eq!(data.streams[0].id, stream_id);
+        assert_eq!(data.streams[0].time_delegated_ms, expected_delegated_ms);
     }
 }
