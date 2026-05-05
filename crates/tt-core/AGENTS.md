@@ -8,7 +8,7 @@ Core algorithms and types for time tracking. Pure computation + session parsing 
 |--------|-------|------|
 | `allocation.rs` | 1366 | Time allocation algorithm (direct + delegated) |
 | `session.rs` | 980 | Claude Code session scanning/parsing |
-| `opencode.rs` | ~790 | OpenCode session scanning from SQLite (`opencode.db`) |
+| `opencode.rs` | ~880 | OpenCode session scanning. Reads `session` from monolithic `opencode.db`; reads `message`/`part` from per-session shard at `sessions/<id>.db` when present, else from monolithic. |
 | `project.rs` | ~50 | Git remote → project name extraction |
 
 ## Allocation Algorithm (`allocation.rs`)
@@ -44,7 +44,7 @@ Computes direct (human focus) and delegated (agent) time per stream.
 
 ## Session Scanning (`session.rs` + `opencode.rs`)
 
-Parses Claude Code (`~/.claude/projects/`) JSONL session files and OpenCode (`~/.local/share/opencode/opencode.db`) SQLite database.
+Parses Claude Code (`~/.claude/projects/`) JSONL session files and OpenCode (`~/.local/share/opencode/opencode.db`) SQLite database. The user's OpenCode fork shards messages/parts into per-session SQLite files at `~/.local/share/opencode/sessions/<id>.db`; `build_agent_session` opens the shard when present and falls back to the monolithic connection when not (schema is identical between the two). Corrupt or non-SQLite shards trigger a logged warning and the same fallback.
 
 ### Key Types
 
