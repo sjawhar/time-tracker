@@ -35,6 +35,7 @@ The file will be created if it doesn't exist. Data is appended (one JSON object 
 5. **Structure**: Present filled form, highlight actual vs perceived gaps
 6. **Challenge**: Red team pushes back on patterns and blind spots
 7. **Save**: Append to JSONL file
+8. **Post-review actions** *(optional)*: Run user-configured follow-up instructions (e.g. 1-on-1 prep, standup draft) defined in `weekly-review.toml` `[post_review_actions]`
 
 ## Critical Constraints
 
@@ -66,6 +67,7 @@ The JSONL path is passed as the skill's `args` parameter:
 - `[goals]` — checkbox items
 - `[ratings]` — rating dimensions and scale
 - `[review]` — output path, week start day
+- `[post_review_actions]` — user-defined freeform instructions for Phase 8
 
 **Ontology config**: Read `~/.config/time-tracker/ontology.toml` for:
 - `projects.names[]` — valid project tags
@@ -349,6 +351,54 @@ On track (personal): Unsure
 
 4. **Show summary**: "Week of Jan 12-18 saved. Review #31."
 
+## Phase 8: Post-Review Actions (optional)
+
+Run any user-configured follow-up actions defined in `~/.config/time-tracker/weekly-review.toml` under `[post_review_actions]`. This is the user's customizable extension point for things they always want to do at the end of a review (1-on-1 prep, drafting standup notes, queuing emails, journaling prompts, etc.).
+
+**This phase is OPTIONAL.** Skip it cleanly if there's no config or the user declines.
+
+### Step 1: Check for config
+
+Look for a `[post_review_actions]` section in `~/.config/time-tracker/weekly-review.toml`. The expected shape is a single freeform `instructions` field:
+
+```toml
+[post_review_actions]
+instructions = """
+<freeform markdown the agent should treat as instructions>
+"""
+```
+
+If the section is missing, empty, or whitespace-only: **skip Phase 8 entirely.** Do not prompt the user. Do not ask them to configure it. Just end the review.
+
+### Step 2: Confirm with the user
+
+If `instructions` is present and non-empty, show a one-line confirmation:
+
+> "Post-review actions configured. Run them now? (y / skip)"
+
+If the user says skip, no, or anything other than affirmative: **end the review.** Do not run the instructions. Do not save the skip anywhere.
+
+### Step 3: Run the instructions
+
+Treat the `instructions` field as a freeform brief from the user about what to do after the review is saved. Read it carefully and execute as written.
+
+**Context the agent has available** (the user can reference any of these in their instructions):
+- The full JSONL entry just saved (last line of the JSONL file)
+- Historical JSONL entries (last 8+ weeks of `reflection`, `ratings`, `red_team`, `next_week`)
+- The `[goals]`, `[ratings]`, and `[prompts]` config
+- The `ontology.toml` taxonomy
+- tt data (run `tt report`, `tt classify` etc. if needed)
+
+**Behavioral guarantees**:
+- Output is **ephemeral** (chat only). Do NOT save action outputs to JSONL. Do NOT modify the just-saved review entry.
+- The freeform instructions are user intent. Follow them as faithfully as the rest of the skill, but do not invent additional follow-ups not requested.
+- If instructions ask for confirmation/iteration with the user, do that.
+- If instructions are unclear or contradict earlier review phases, ask the user to clarify rather than guessing.
+
+### Step 4: Final summary
+
+After completing the actions: "Post-review actions complete." Then end.
+
 ## JSONL Schema
 
 Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.opencode/skills/weekly-review/example.json`.
@@ -401,10 +451,13 @@ Other:        ██████████ 20%
 If `~/.config/time-tracker/weekly-review.toml` is missing:
 - Use built-in defaults for reflection questions, goals, ratings
 - Log a note: "No config found — using defaults"
-
 If `~/.config/time-tracker/ontology.toml` is missing:
 - Skip ontology-based organization in Phase 3
 - Present raw tt report data without project/activity grouping
+
+### Post-Review Actions Missing or Skipped (Phase 8)
+If `[post_review_actions]` is absent or `instructions` is empty: skip Phase 8 silently — no prompt, no warning. Phase 8 is optional by design.
+If user declines to run them at the confirmation prompt: end the review without running. Do not save the skip.
 
 ## Edge Cases
 
@@ -435,6 +488,10 @@ If `~/.config/time-tracker/ontology.toml` is missing:
 | Rushing through narration | Let the user talk. Brief acknowledgments only. Don't lead or suggest what they should say. |
 | Including reflect-style analysis | Session pattern analysis is a separate skill. Weekly review focuses on time, goals, and reflection. |
 | Using `tt classify --json` for time data | `classify` shows sessions and clusters, not period-scoped time. Use `tt report` for time within a specific period. |
+| Running Phase 8 instructions without user confirmation | **Always** ask "Run them now? (y / skip)" before executing the freeform instructions. The instructions are opt-in per-review. |
+| Saving Phase 8 action output to JSONL | Phase 8 outputs are **ephemeral**. The just-saved review entry must remain untouched. If the user wants persistence, they update their instructions to write to a different file. |
+| Treating absent `[post_review_actions]` as an error | It's optional. Skip silently. Don't prompt the user to configure it. |
+| Inventing follow-ups beyond user instructions | Phase 8 only does what the freeform `instructions` say. Don't add suggestions, summaries, or actions not requested. |
 
 ## Goal Tracking Checkboxes
 
