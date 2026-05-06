@@ -52,7 +52,7 @@ echo "Binary deployed to ~/.dotfiles/bin/tt"
 # Verify deployment
 echo ""
 echo "Verifying installation..."
-ssh "$REMOTE" '~/.local/bin/tt --version'
+ssh "$REMOTE" '~/.dotfiles/bin/tt --version'
 
 # Configure tmux hook if requested
 if [ "$CONFIGURE_TMUX" = true ]; then
