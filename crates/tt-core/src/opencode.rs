@@ -17,6 +17,56 @@ fn unix_ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
+/// Open a read-only connection to the per-session message/part shard if it exists.
+///
+/// The user's `OpenCode` fork shards messages and parts out of the monolithic
+/// `opencode.db` into per-session `SQLite` files at `<sessions_dir>/<session_id>.db`.
+/// Returns `None` if `sessions_dir` is unknown, the shard file is missing, the shard
+/// fails to open, or the file isn't a valid `SQLite` database. Callers should fall
+/// back to the monolithic connection.
+fn open_session_shard(sessions_dir: Option<&Path>, session_id: &str) -> Option<Connection> {
+    let path = sessions_dir?.join(format!("{session_id}.db"));
+    if !path.exists() {
+        return None;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match Connection::open_with_flags(&path, flags) {
+        Ok(conn) => {
+            if let Err(err) = conn.busy_timeout(Duration::from_secs(5)) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %err,
+                    "failed to set OpenCode shard timeout"
+                );
+                return None;
+            }
+            // SQLite validates the file header lazily — a non-database file opens
+            // successfully but fails on first query. Probe sqlite_master so corrupt
+            // shards fall back to the monolithic connection instead of skipping the
+            // session entirely.
+            if let Err(err) = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
+                tracing::warn!(
+                    path = ?path,
+                    error = %err,
+                    "OpenCode session shard is not a valid SQLite database"
+                );
+                return None;
+            }
+            Some(conn)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = ?path,
+                error = %err,
+                "failed to open OpenCode session shard"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SessionRow {
     id: String,
@@ -37,6 +87,10 @@ struct MessageStats {
     last_message_time: Option<i64>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "two near-identical match arms for since/no-since are kept inline; refactoring would obscure the SQL"
+)]
 pub fn scan_opencode_sessions(
     db_path: &Path,
     since: Option<DateTime<Utc>>,
@@ -56,6 +110,7 @@ pub fn scan_opencode_sessions(
         return Ok(Vec::new());
     }
 
+    let sessions_dir = db_path.parent().map(|p| p.join("sessions"));
     let mut sessions = Vec::new();
 
     if let Some(ts) = since {
@@ -85,7 +140,8 @@ pub fn scan_opencode_sessions(
                     match session_row {
                         Ok(row) => {
                             if let Err(err) =
-                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                                build_agent_session(&conn, sessions_dir.as_deref(), row)
+                                    .map(|s| sessions.push(s))
                             {
                                 tracing::warn!(error = %err, "skipping invalid OpenCode session");
                             }
@@ -127,7 +183,8 @@ pub fn scan_opencode_sessions(
                     match session_row {
                         Ok(row) => {
                             if let Err(err) =
-                                build_agent_session(&conn, row).map(|s| sessions.push(s))
+                                build_agent_session(&conn, sessions_dir.as_deref(), row)
+                                    .map(|s| sessions.push(s))
                             {
                                 tracing::warn!(error = %err, "skipping invalid OpenCode session");
                             }
@@ -150,16 +207,19 @@ pub fn scan_opencode_sessions(
 }
 
 fn build_agent_session(
-    conn: &Connection,
+    main_conn: &Connection,
+    sessions_dir: Option<&Path>,
     session_row: SessionRow,
 ) -> Result<AgentSession, SessionError> {
     if session_row.id.is_empty() {
         return Err(SessionError::EmptySessionId);
     }
 
-    let message_stats = collect_message_stats(conn, &session_row.id)?;
-    let tool_call_count = count_tool_calls(conn, &session_row.id)?;
-    let tool_call_timestamps = collect_tool_call_timestamps(conn, &session_row.id)?;
+    let shard_conn = open_session_shard(sessions_dir, &session_row.id);
+    let stats_conn = shard_conn.as_ref().unwrap_or(main_conn);
+    let message_stats = collect_message_stats(stats_conn, &session_row.id)?;
+    let tool_call_count = count_tool_calls(stats_conn, &session_row.id)?;
+    let tool_call_timestamps = collect_tool_call_timestamps(stats_conn, &session_row.id)?;
     let message_count = message_stats
         .user_message_count
         .saturating_add(message_stats.assistant_message_count);
@@ -469,6 +529,37 @@ mod tests {
         .unwrap();
     }
 
+    /// Create a per-session shard db at `<base_dir>/sessions/<session_id>.db` with the
+    /// `message` and `part` tables (no `session` table — that lives in the monolithic db).
+    fn create_test_shard(base_dir: &Path, session_id: &str) -> std::path::PathBuf {
+        let sessions_dir = base_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let shard_path = sessions_dir.join(format!("{session_id}.db"));
+        let conn = Connection::open(&shard_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX message_session_idx ON message(session_id);
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER,
+                time_updated INTEGER,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX part_message_idx ON part(message_id);
+            CREATE INDEX part_session_idx ON part(session_id);",
+        )
+        .unwrap();
+        shard_path
+    }
+
     #[test]
     fn test_basic_session() {
         let (_temp, db_path) = create_test_db();
@@ -557,6 +648,219 @@ mod tests {
         assert_eq!(session.starting_prompt.as_deref(), Some("hello world"));
         assert_eq!(session.user_message_timestamps.len(), 1);
         assert!(session.end_time.is_some());
+    }
+
+    #[test]
+    fn test_messages_and_parts_read_from_shard_when_present() {
+        let (temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_shard",
+            "/home/user/project",
+            "Sharded session",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        // Note: NO messages/parts inserted into the monolithic db — the shard owns them.
+
+        let shard_path = create_test_shard(temp.path(), "ses_shard");
+        insert_message(
+            &shard_path,
+            "msg_u1",
+            "ses_shard",
+            "user",
+            1_700_000_001_000,
+        );
+        insert_part(
+            &shard_path,
+            "prt_u1",
+            "msg_u1",
+            "ses_shard",
+            "text",
+            Some("hello from shard"),
+            1_700_000_001_000,
+        );
+        insert_message(
+            &shard_path,
+            "msg_a1",
+            "ses_shard",
+            "assistant",
+            1_700_000_002_000,
+        );
+        insert_part(
+            &shard_path,
+            "prt_a1_tool",
+            "msg_a1",
+            "ses_shard",
+            "tool",
+            None,
+            1_700_000_002_000,
+        );
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.session_id == "ses_shard")
+            .expect("session should be found");
+
+        assert_eq!(session.tool_call_count, 1);
+        assert_eq!(session.assistant_message_count, 1);
+        assert_eq!(session.user_prompts, vec!["hello from shard"]);
+        assert_eq!(session.starting_prompt.as_deref(), Some("hello from shard"));
+    }
+
+    #[test]
+    fn test_falls_back_to_monolithic_when_no_shard() {
+        // Regression coverage for the absence path: when no shard file exists,
+        // build_agent_session must read messages/parts from the monolithic db.
+        let (temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_mono",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_message(&db_path, "msg_u1", "ses_mono", "user", 1_700_000_001_000);
+        insert_part(
+            &db_path,
+            "prt_u1",
+            "msg_u1",
+            "ses_mono",
+            "text",
+            Some("from monolithic"),
+            1_700_000_001_000,
+        );
+
+        // Confirm no shard file exists at the expected path.
+        assert!(!temp.path().join("sessions").join("ses_mono.db").exists());
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.session_id == "ses_mono")
+            .expect("session should be found");
+        assert_eq!(session.user_prompts, vec!["from monolithic"]);
+    }
+
+    #[test]
+    fn test_shard_takes_precedence_over_monolithic_when_both_exist() {
+        // If a shard exists, it owns the messages/parts for that session_id.
+        // Decoy data in the monolithic db must be ignored — we are NOT a UNION.
+        let (temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_both",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        // Decoy: monolithic has a user prompt AND a tool call.
+        insert_message(
+            &db_path,
+            "msg_mono_u",
+            "ses_both",
+            "user",
+            1_700_000_001_000,
+        );
+        insert_part(
+            &db_path,
+            "prt_mono_text",
+            "msg_mono_u",
+            "ses_both",
+            "text",
+            Some("decoy from monolithic"),
+            1_700_000_001_000,
+        );
+        insert_message(
+            &db_path,
+            "msg_mono_a",
+            "ses_both",
+            "assistant",
+            1_700_000_001_500,
+        );
+        insert_part(
+            &db_path,
+            "prt_mono_tool",
+            "msg_mono_a",
+            "ses_both",
+            "tool",
+            None,
+            1_700_000_001_500,
+        );
+
+        // Authoritative: shard has just one user text message and zero tool calls.
+        let shard_path = create_test_shard(temp.path(), "ses_both");
+        insert_message(
+            &shard_path,
+            "msg_shard_u",
+            "ses_both",
+            "user",
+            1_700_000_002_000,
+        );
+        insert_part(
+            &shard_path,
+            "prt_shard_text",
+            "msg_shard_u",
+            "ses_both",
+            "text",
+            Some("authoritative from shard"),
+            1_700_000_002_000,
+        );
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.session_id == "ses_both")
+            .expect("session should be found");
+
+        // Shard wins on both axes: prompts and tool count.
+        assert_eq!(session.user_prompts, vec!["authoritative from shard"]);
+        assert_eq!(session.tool_call_count, 0);
+        assert_eq!(session.assistant_message_count, 0);
+    }
+
+    #[test]
+    fn test_corrupt_shard_falls_back_to_monolithic() {
+        // A non-SQLite "shard" file must not break the scan or drop the session.
+        // We log a warning and degrade to reading from the monolithic db.
+        let (temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_corrupt",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_message(&db_path, "msg_u1", "ses_corrupt", "user", 1_700_000_001_000);
+        insert_part(
+            &db_path,
+            "prt_u1",
+            "msg_u1",
+            "ses_corrupt",
+            "text",
+            Some("from monolithic"),
+            1_700_000_001_000,
+        );
+
+        // Write garbage to the expected shard path.
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(sessions_dir.join("ses_corrupt.db"), b"not a sqlite db").unwrap();
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.session_id == "ses_corrupt")
+            .expect("session should be found despite corrupt shard");
+        assert_eq!(session.user_prompts, vec!["from monolithic"]);
     }
 
     #[test]
@@ -1040,7 +1344,7 @@ mod tests {
             time_updated: i64::MAX,
         };
 
-        let result = build_agent_session(&conn, session_row);
+        let result = build_agent_session(&conn, None, session_row);
         assert!(result.is_err());
         assert!(
             matches!(result.unwrap_err(), SessionError::InvalidTimestamp(ts) if ts == i64::MAX)
@@ -1060,7 +1364,7 @@ mod tests {
             time_updated: 1_700_000_000_000,
         };
 
-        let session = build_agent_session(&conn, session_row).unwrap();
+        let session = build_agent_session(&conn, None, session_row).unwrap();
         assert!(session.end_time.is_none());
     }
 
@@ -1103,7 +1407,7 @@ mod tests {
             time_created: 1_700_000_000_000,
             time_updated: 1_700_000_010_000,
         };
-        let session = build_agent_session(&conn, session_row).unwrap();
+        let session = build_agent_session(&conn, None, session_row).unwrap();
         // end_time should be from last message (20s), not session.updated (10s)
         assert_eq!(session.end_time, unix_ms_to_datetime(1_700_000_020_000));
     }
@@ -1215,7 +1519,7 @@ mod tests {
             time_created: 1_700_000_000_000,
             time_updated: 1_700_000_002_000,
         };
-        let session = build_agent_session(&conn, session_row).unwrap();
+        let session = build_agent_session(&conn, None, session_row).unwrap();
 
         // end_time should be the last message's timestamp
         assert_eq!(session.end_time, unix_ms_to_datetime(1_700_000_005_000));
@@ -1234,7 +1538,7 @@ mod tests {
             time_updated: 1_699_999_000_000,
         };
 
-        let session = build_agent_session(&conn, session_row).unwrap();
+        let session = build_agent_session(&conn, None, session_row).unwrap();
         assert!(
             session.end_time.is_none(),
             "end_time should be None when updated is before created"
@@ -1254,7 +1558,7 @@ mod tests {
             time_updated: 1_700_000_000_000,
         };
 
-        let result = build_agent_session(&conn, session_row);
+        let result = build_agent_session(&conn, None, session_row);
         assert!(matches!(result, Err(SessionError::EmptySessionId)));
     }
 
