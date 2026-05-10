@@ -13,11 +13,11 @@ Identify work streams from time-tracker data, persist them in tt's database, and
 
 | Concept | Definition | Example |
 |---------|-----------|---------|
-| **Project** | A codebase/repository. Subdirectories are the SAME project. | `/home/sami/pivot/agents` → `pivot` |
-| **Stream** | A specific task/feature/PR within a project. Spans hours to 2-3 days. | "pivot: engine refactor", "legion: LEG-125" |
+| **Project** | A codebase/repository. Subdirectories are the SAME project. | `~/code/webapp/agents` → `webapp` |
+| **Stream** | A specific task/feature/PR within a project. Spans hours to 2-3 days. | "webapp: engine refactor", "cli-tool: WRK-125" |
 
-**BAD names:** "pivot work", "legion development" (too coarse)
-**GOOD names:** "pivot: pipeline API redesign", "legion: controller-worker separation"
+**BAD names:** "webapp work", "cli-tool development" (too coarse)
+**GOOD names:** "webapp: pipeline API redesign", "cli-tool: controller-worker separation"
 
 ## Arguments
 
@@ -130,12 +130,12 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 
 | Project | Stream | Direct | Delegated |
 |---------|--------|--------|-----------|
-| pivot | engine refactor | 2h 15m | 72.9h |
-| legion | opencode-plugin | 43m | 38.3h |
+| webapp | engine refactor | 2h 15m | 72.9h |
+| cli-tool | auth-plugin | 43m | 38.3h |
 | **TOTAL** | | **X hrs** | **Y hrs** |
 
 ### Stream Details
-- **pivot: engine refactor** — Sessions: ses_abc, ses_def. Engine/scheduler cleanup.
+- **webapp: engine refactor** — Sessions: ses_abc, ses_def. Engine/scheduler cleanup.
 
 ### Unassigned Events
 {Any events that couldn't be classified — should be zero}
@@ -153,8 +153,8 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 | Reporting partial results | **Never** show a report or time number if remotes haven't been synced or events are unassigned. Incomplete data = wrong answer. |
 | Starting from "8 hours ago" | Check `tt streams list` — start from where streams end. |
 | Treating project as stream | Project = repo. Stream = task/feature. |
-| Splitting subdirectories | `/pivot/agents` is part of `pivot`. |
-| Streams too coarse | "pivot work" → "pivot: pipeline API redesign". |
+| Splitting subdirectories | `/webapp/agents` is part of `webapp`. |
+| Streams too coarse | "webapp work" → "webapp: pipeline API redesign". |
 | Leaving events unassigned | Everything gets assigned. Use "misc: {activity}" for unclear. |
 | Stopping after classify --apply | `tt classify --apply` runs recompute automatically. No separate step needed. |
 
