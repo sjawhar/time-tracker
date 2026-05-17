@@ -202,8 +202,8 @@ Time by Tag (from tt report):
 
 Projects:
   time-tracker:  12.5h direct | 8.2h delegated  (35%)
-  pivot:          5.0h direct | 15.0h delegated  (28%)
-  legion:         2.0h direct | 3.5h delegated   (8%)
+  webapp:         5.0h direct | 15.0h delegated  (28%)
+  cli-tool:       2.0h direct | 3.5h delegated   (8%)
   [untagged]:     1.5h direct | 0.5h delegated   (3%)
 
 Activities:
@@ -221,7 +221,7 @@ Agent Sessions (Mon-Sun):
   By type: User 30, Subagent 17
 
   Top sessions by duration:
-    1. "Implement TUI extraction" (pivot, 4.2h)
+    1. "Refactor data layer" (webapp, 4.2h)
     2. "Weekly review feature plan" (time-tracker, 2.1h)
     3. ...
 ```
@@ -274,7 +274,7 @@ Agent Sessions (Mon-Sun):
 
 ### Projects (perceived → actual)
 - time-tracker: 40-50% (tt: 35%)
-- pivot: 20-30% (tt: 28%)
+- webapp: 20-30% (tt: 28%)
 ...
 
 ### Direct vs Delegated Time
@@ -532,7 +532,7 @@ Before fully switching from Toggl to tt, you may want to compare time tracking f
 | Project | Toggl | tt (direct + delegated) | Difference |
 |---------|-------|-------------------------|------------|
 | time-tracker | 8.5h | 9.2h | +0.7h |
-| legion | 4.2h | 3.8h | -0.4h |
+| cli-tool | 4.2h | 3.8h | -0.4h |
 | meetings | 2.0h | 2.1h | +0.1h |
 
 ### Allocation Parameters

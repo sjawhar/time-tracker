@@ -9,8 +9,8 @@
     "training": "0", "writing": "5-10", "other": "0"
   },
   "projects": {
-    "time-tracker": "30-40", "pivot": "20-30",
-    "legion": "5-10", "dotfiles": "0-5",
+    "time-tracker": "30-40", "webapp": "20-30",
+    "cli-tool": "5-10", "dotfiles": "0-5",
     "other": "0"
   },
   "tt": {
@@ -18,7 +18,7 @@
       "development": {"direct_ms": 54000000, "delegated_ms": 79200000},
       "code_review": {"direct_ms": 10800000, "delegated_ms": 0},
       "time-tracker": {"direct_ms": 45000000, "delegated_ms": 29520000},
-      "pivot": {"direct_ms": 18000000, "delegated_ms": 54000000}
+      "webapp": {"direct_ms": 18000000, "delegated_ms": 54000000}
     },
     "totals": {"direct_ms": 75600000, "delegated_ms": 97920000},
     "agent_sessions": {"total": 47, "by_source": {"claude": 12, "opencode": 35}},
