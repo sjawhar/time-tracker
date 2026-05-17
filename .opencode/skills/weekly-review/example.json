@@ -26,11 +26,11 @@
   },
   "goals": {
     "completed": ["paired_engineer", "read_writeups", "left_comments"],
-    "notes": "Paired with Thomas on the auth bug"
+    "notes": "Paired with a teammate on the auth bug"
   },
   "reflection": {
     "successes": "The foobar feature went really well, users are really happy with it. I think we...",
-    "mistakes": "I should have been more patient with Jaime when they asked about timelines. Maybe I could...",
+    "mistakes": "I should have been more patient with a colleague when they asked about timelines. Maybe I could...",
     "bottlenecks": "Waiting on PR reviews blocked me for a day. The auth PR has been open for a week now...",
     "bottleneck_action": "Set up office hours for quick reviews",
     "priorities_check": "Yes, working on the highest impact item",
@@ -41,7 +41,7 @@
     "time_mgmt": 4, "engagement": 5, "overall": 5
   },
   "next_week": {
-    "priorities": ["Ship viewer", "Onboard Rafael", "Plan Q1"],
+    "priorities": ["Ship viewer", "Onboard new hire", "Plan Q1"],
     "on_track_project": "yes",
     "on_track_personal": "unsure"
   },

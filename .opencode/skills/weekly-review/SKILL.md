@@ -240,7 +240,7 @@ Agent Sessions (Mon-Sun):
 **Let the user speak/type freely.** Track and map to form sections:
 
 - **Time corrections**: "Actually spent more time on Ops than tt shows" → adjust activities
-- **Goal tracking**: "I paired with Thomas on Tuesday" → mark checkbox
+- **Goal tracking**: "I paired with a teammate on Tuesday" → mark checkbox
 - **Reflections**: "The deploy went smoothly" → successes; "Should have communicated earlier" → mistakes
 - **Ratings**: "Productivity was maybe a 5" → track rating
 - **Priorities**: "Next week I need to focus on the viewer" → next_week.priorities
@@ -286,7 +286,7 @@ Agent Sessions (Mon-Sun):
 ✓ Paired with an engineer
 ✓ Left comments on writeups
 ✗ Read team writeups
-Notes: "Paired with Thomas on the auth bug"
+Notes: "Paired with a teammate on the auth bug"
 
 ## Reflection
 Successes: Got the feature shipped ahead of schedule...
@@ -301,7 +301,7 @@ Mental: 5  Productivity: 6  Prioritization: 5
 Time mgmt: 4  Engagement: 5  Overall: 5
 
 ## Next Week
-Priorities: 1. Ship viewer  2. Onboard Rafael  3. Plan Q1
+Priorities: 1. Ship viewer  2. Onboard new hire  3. Plan Q1
 On track (project): Yes
 On track (personal): Unsure
 ```
