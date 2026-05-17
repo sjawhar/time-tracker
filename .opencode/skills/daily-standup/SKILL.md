@@ -9,32 +9,33 @@ Generate and post a daily standup to Slack using time-tracker activity data.
 
 ## Phase 0: Load Personal Config
 
-User-specific audience, scope, repos, and timezone live in a private config file (not in this repo). Load it at the start of every run:
+User-specific audience, scope, repos, timezone, and formatting preferences live in a private markdown file (not in this repo). Load it at the start of every run:
 
 ```bash
-CONFIG=~/.config/time-tracker/standup.toml
+CONFIG=~/.config/time-tracker/standup.md
 [ -f "$CONFIG" ] || { echo "Missing $CONFIG — see Setup below"; exit 1; }
 cat "$CONFIG"
 ```
 
-The config defines (all required):
+The config covers (in prose):
 
-- `[audience]` — `channel`, `channel_id`, `description` (one-line audience description used to calibrate tone)
-- `[scope]` — `include` and `exclude` arrays of logical projects/themes
-- `[repos.private]` — private repos to look up PRs in via local clone (since `gh search prs --author=@me` can't see private org repos)
-- `[remotes]` — `skip` list (machines NOT to sync — e.g., transcription-only machines)
-- `[timezone]` — `zone` and `utc_offset_hours` for day boundaries
-- `[known_streams]` — recurring streams to pre-load for faster classification
+- **Audience** — channel, channel ID, who reads it, what they care about
+- **Scope** — logical projects to include; categories/themes to drop by default
+- **Repos** — local clone paths for private repos (since `gh search prs --author=@me` can't see them)
+- **Timezone** — day-boundary anchor
+- **Remotes** — which machines to sync, which to skip
+- **Stream conventions** — commonly reused stream names worth pre-loading
+- **Tone/format preferences** — user-specific style notes that apply every day
 
-**If the config is missing**, ask the user to create one before proceeding. See the Setup section at the bottom.
+**If the config is missing**, ask the user to create one before proceeding. See the Setup section at the bottom for a template.
 
-**Everything downstream — audience filtering, tone, PR lookup, sync, dates — derives from this file.** The skill is generic; the config makes it yours.
+**Everything downstream — audience filtering, tone, PR lookup, sync, dates — derives from this file.** The skill is the workflow; the config makes it yours.
 
 ## Audience & Tone (read this first — it controls everything)
 
-**Audience** is defined in `[audience].description` of your config. Tone is calibrated to that group.
+**Audience** is described in the "Audience" section of your config. Tone is calibrated to that group.
 
-**Include** only what's in `[scope].include`. **Drop everything in `[scope].exclude`.** If a stream doesn't clearly match an include entry, leave it out — the user can ask for it to be added.
+**Include** only what's in the config's "What the team cares about" section. **Drop everything in the "What the team does NOT care about" section.** If a stream doesn't clearly match an included project, leave it out — the user can ask for it to be added.
 
 **Tone rules (universal):**
 
@@ -47,8 +48,8 @@ The config defines (all required):
 
 ## Arguments
 
-- `channel`: Optional. Defaults to `[audience].channel` from config.
-- `date`: Optional. Day to report on (default: yesterday in `[timezone].zone`). Natural language ok ("yesterday", "Sat May 16", ISO 8601).
+- `channel`: Optional. Defaults to the channel specified in your config.
+- `date`: Optional. Day to report on (default: yesterday in the timezone from your config). Natural language ok ("yesterday", "Sat May 16", ISO 8601).
 
 ## Workflow
 
@@ -57,14 +58,14 @@ digraph standup {
   rankdir=TB;
   node [shape=box];
 
-  cfg [label="0. Load personal config\n(~/.config/time-tracker/standup.toml)" shape=ellipse];
+  cfg [label="0. Load personal config\n(~/.config/time-tracker/standup.md)" shape=ellipse];
   start [label="1. Parse date in user's timezone"];
   ingest [label="2. Ingest + sync remotes\n(skip per config)"];
   gather [label="3. Gather context\ntt classify --json"];
   analyze [label="4. Create streams\n(infer-streams)"];
   compute [label="5. Get computed time\ntt report --last-day --json"];
   prs [label="6. Look up PRs\n(private repos via local clone)"];
-  filter [label="7. Filter to audience\n([scope].include / .exclude)"];
+  filter [label="7. Filter to audience\n(include/exclude from config)"];
   ask [label="8. Ask user\n(theme song? plans? blockers?)"];
   draft [label="9. Draft + show user"];
   iterate [label="10. Iterate to user-approved"];
@@ -76,14 +77,14 @@ digraph standup {
 
 ## Phase 1: Parse Date (user's timezone)
 
-Use `[timezone].zone` from config. Compute the standup day boundary at midnight in that zone.
+Use the timezone from your config (Timezone section). Compute the standup day boundary at midnight in that zone.
 
 ```bash
-TZ=$(toml-get standup.toml timezone.zone)                # or read manually
-OFFSET=$(toml-get standup.toml timezone.utc_offset_hours)
+# Read the user's local timezone offset from the config (or just check the markdown).
 # Yesterday in user's local timezone, converted to UTC:
-START=$(date -u -d "yesterday 00:00 ${OFFSET:+UTC+}$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
-END=$(date -u -d "today 00:00 ${OFFSET:+UTC+}$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
+OFFSET=8  # for Asia/Singapore (UTC+8); read from config
+START=$(date -u -d "yesterday 00:00 UTC+$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
+END=$(date -u -d "today 00:00 UTC+$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 If your zone is UTC+8: yesterday 00:00 local = previous day 16:00 UTC.
@@ -96,7 +97,7 @@ If your zone is UTC+8: yesterday 00:00 local = previous day 16:00 UTC.
 cargo build 2>/dev/null && cargo run -- ingest sessions
 ```
 
-Sync remotes, skipping any in `[remotes].skip`:
+Sync remotes, skipping any in the config's "Remotes to sync" section's skip list:
 
 ```bash
 tt machines                   # See what's registered
@@ -135,7 +136,7 @@ jq -r '[.sessions[] | select(
 Skill("infer-streams")
 ```
 
-Use `[known_streams].common` from your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions, then:
+Use the "Streams I recognize across days" section of your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions, then:
 
 ```bash
 cargo run -- classify --apply /tmp/standup-assignments.json
@@ -172,16 +173,15 @@ jq '.by_tag[] | {tag, h_direct: (.time_direct_ms / 3600000 * 10 | floor / 10), h
 
 ## Phase 6: Look Up PRs
 
-For private repos listed in `[repos.private]`, use the local clone (since `gh search prs --author=@me` can't see them):
+For private repos listed in the "Repos to look up PRs in" section of your config, use the local clone (since `gh search prs --author=@me` can't see them):
 
 ```bash
-for clone in $(toml-get-array standup.toml repos.private.clone_path); do
-  cd $(eval echo "$clone")
-  gh pr list --author=@me --state=merged --search "merged:>=$(date -u -d "yesterday" +%Y-%m-%d)" --limit 30 \
-    --json url,title,state,updatedAt
-  gh pr list --author=@me --state=open --limit 30 \
-    --json url,title,state,updatedAt
-done
+# Iterate the private clone paths from your config
+cd ~/Code/<your-private-repo>
+gh pr list --author=@me --state=merged --search "merged:>=$(date -u -d "yesterday" +%Y-%m-%d)" --limit 30 \
+  --json url,title,state,updatedAt
+gh pr list --author=@me --state=open --limit 30 \
+  --json url,title,state,updatedAt
 ```
 
 For public/global repos, use the broader search:
@@ -198,7 +198,7 @@ gh search prs --author=@me --updated=">=$(date -u -d "yesterday" +%Y-%m-%d)" --j
 
 ## Phase 7: Filter to Audience
 
-Use `[scope].include` and `[scope].exclude` from the config. After classification:
+Use the include/exclude guidance from your config. After classification:
 
 1. Drop any stream that matches an `exclude` entry by name or theme.
 2. Keep only streams that map to an `include` entry.
@@ -290,7 +290,7 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 
 | Mistake | Fix |
 |---------|-----|
-| Mentioning anything in `[scope].exclude` | **Drop it.** Audience doesn't care. If unsure, leave out. |
+| Mentioning anything in the config's exclude list | **Drop it.** Audience doesn't care. If unsure, leave out. |
 | "from my side" / "on my end" / first-person framing | Use team language: "we", "ready for the team", "X is usable now" |
 | Internal jargon (project-internal codenames, bucket labels, etc.) | Translate to plain description of what was actually done |
 | Giant raw URLs in post | Hyperlink friendly description: `<url|short outcome>` |
@@ -298,14 +298,14 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 | `content_type: "text/markdown"` | Use `"text/plain"` — markdown content type breaks editability |
 | `**bold**` (double asterisk) | Use `*bold*` (single asterisk) — Slack mrkdwn |
 | `## headers` | Slack mrkdwn has no headers. Use bold lines. |
-| `gh search prs --author=@me` for private repos | Use local clone per `[repos.private]` config |
+| `gh search prs --author=@me` for private repos | Use local clones from your config |
 | Hyperlinking `#NNNN` instead of description | Hyperlink the **outcome description**, not the number |
 | Inferring/upgrading today's plans | Copy user's framing verbatim. "might do" stays "may do". |
 | Skipping ingestion or remote sync | Run full pipeline every time. Partial = wrong. |
 | Estimating time from session metadata | Always use `tt report` ms values. Estimates are 2x+ wrong. |
-| Syncing machines in `[remotes].skip` | Skip them by default — only sync if user explicitly asks |
-| Reporting by repo (`dotfiles`, `home`) | Group by logical project per `[scope].include` |
-| Wrong day boundary | Use `[timezone].zone` from config, not UTC or Pacific by default |
+| Syncing machines in the config's skip list | Skip them by default — only sync if user explicitly asks |
+| Reporting by repo (`dotfiles`, `home`) | Group by logical project per the config's include list |
+| Wrong day boundary | Use the timezone from your config, not UTC or Pacific by default |
 | Posting without confirming | Always show draft → wait for explicit go-ahead |
 | Annotating "(excluding personal)" | Don't draw attention to what was dropped. Just omit. |
 
@@ -340,41 +340,46 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 
 ## Setup (first run)
 
-If `~/.config/time-tracker/standup.toml` doesn't exist, create it from this template:
+If `~/.config/time-tracker/standup.md` doesn't exist, create one as natural-language guidance for the agent. Suggested structure (adapt freely — no parser, just prose):
 
-```toml
-[audience]
-channel = "#your-standup-channel"
-channel_id = "C0XXXXXXXXX"
-description = "Your team / who reads this"
+```markdown
+# Daily Standup — Personal Config
 
-[scope]
-include = [
-  "Project A (sub-area-1, sub-area-2)",
-  "Project B",
-]
-exclude = [
-  "personal projects",
-  "tooling rabbit-holes you don't ship",
-  "any theme/codename you never want to surface",
-]
+## Audience
 
-[[repos.private]]
-clone_path = "~/Code/your-private-repo"
-full_name = "your-org/your-private-repo"
+Which Slack channel and channel ID; who reads it (names, roles); what they care about; what tone fits.
 
-[remotes]
-skip = ["machine-name-to-skip"]
+## What the team cares about
 
-[timezone]
-zone = "America/Los_Angeles"
-utc_offset_hours = -8
+Logical projects to include. Describe each in plain language with examples of what kinds of work fall under it. Add subgrouping cues (e.g., "anything in `/path/x/` belongs to project Y").
 
-[known_streams]
-common = [
-  "Project A: feature X",
-  "Project B: refactor Y",
-]
+## What the team does NOT care about (default-drop)
+
+Categories/themes to omit unless explicitly requested. Be specific: name personal projects, tooling rabbit-holes, internal-only work, etc.
+
+## Repos to look up PRs in
+
+Local clone paths for private repos (so `gh pr list` works). Note which repos are personal vs work — personal repo PRs should not surface in the standup.
+
+## Timezone
+
+Local timezone for day boundaries (e.g., "Asia/Singapore (UTC+8)").
+
+## Remotes to sync
+
+Which `tt sync <label>` machines to pull from; which to skip by default.
+
+## Streams I recognize across days
+
+Stream names you commonly reuse — the agent should match these before creating new ones.
+
+## Format / tone preferences
+
+Theme song handling, tone rules (e.g., team perspective), formatting preferences, anything else style-related.
+
+## Examples of past blockers worth surfacing
+
+Optional. The kinds of things you'll actually call out as a blocker.
 ```
 
 Save it, then re-run the skill.
