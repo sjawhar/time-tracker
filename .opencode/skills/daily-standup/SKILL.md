@@ -66,9 +66,9 @@ digraph standup {
   compute [label="5. Get computed time\ntt report --last-day --json"];
   prs [label="6. Look up PRs\n(private repos via local clone)"];
   filter [label="7. Filter to audience\n(include/exclude from config)"];
-  ask [label="8. Ask user\n(theme song? plans? blockers?)"];
+  ask [label="8. Ask user\n(plans? blockers?)"];
   draft [label="9. Draft + show user"];
-  iterate [label="10. Iterate to user-approved"];
+  iterate [label="10. Iterate with user"];
   post [label="11. Post as text/plain\nwith Slack mrkdwn"];
 
   cfg -> start -> ingest -> gather -> analyze -> compute -> prs -> filter -> ask -> draft -> iterate -> post;
@@ -208,22 +208,21 @@ If filtering drops significant time (e.g. several hours of excluded work): **do 
 
 If you're unsure whether a stream belongs: **leave it out**. The user can ask to add it back during iteration.
 
-## Phase 8: Ask the User Three Things
+## Phase 8: Ask the User Two Things
 
 Before drafting, ask:
 
-1. **Theme song?** — If the user often includes a Suno/song link, format as `:musical_note: <song-url|Song Title>` placed right after the date heading. Don't fabricate if not provided.
-2. **Today's plans?** — Time-tracker can't see the future. Get plans verbatim. If user says "might do X" or "back-burner Y", reflect THAT EXACT framing — never upgrade "maybe" to "will".
-3. **Blockers?** — Default "None" unless user says otherwise. Phrase as a team statement ("None — Y is unblocked for the team"), not personal ("nothing blocking me").
+1. **Today's plans?** — Time-tracker can't see the future. Get plans verbatim. If user says "might do X" or "back-burner Y", reflect THAT EXACT framing — never upgrade "maybe" to "will".
+2. **Blockers?** — Default "None" unless user says otherwise. Phrase as a team statement ("None — Y is unblocked for the team"), not personal ("nothing blocking me").
 
-If user gave plans/song in their initial invocation, skip the question.
+If user gave plans in their initial invocation, skip the question.
 
 ## Phase 9: Draft
 
 **Template (Slack mrkdwn — `*single asterisk*` for bold, `<url|text>` for links, `•` for bullets):**
 
 ```
-*Standup - {DayOfWeek} {Date}* :musical_note: <{suno_url}|{Song Title}>
+*Standup - {DayOfWeek} {Date}*
 
 *Yesterday*
 
@@ -252,7 +251,7 @@ If user gave plans/song in their initial invocation, skip the question.
 - Bullets: `•` (Unicode), four spaces indent for sub-bullets.
 - Time: copy ms→h from `tt report` exactly. Use 1 decimal (`9h`, `2.5h`, `~30m`).
 - Bold uses `*…*` (Slack mrkdwn). `**…**` renders as literal asterisks.
-- Skip the song line if user didn't provide one. Don't fabricate.
+- Apply any user-specific layers from the personal config's *Format / tone preferences* section (e.g., extra header decorations, post-content additions). The skill template above is the generic baseline.
 
 ## Phase 10: Iterate with User
 
@@ -261,10 +260,11 @@ Show the draft and ask for edits. **Expect 1–3 rounds** — common revisions:
 - Drop a project they want omitted
 - Reword a project name or description
 - Fix today's plan phrasing
-- Add/swap theme song
+- Reorder / rename / drop a sub-bullet
 
-Each iteration, re-show the full draft (not a diff). Don't post until user says "post" / "yes" / "send it" / similar explicit go-ahead.
+Each iteration, re-show the full draft (not a diff). Don't post until the user has explicitly approved the content.
 
+After content approval, apply any post-approval steps your personal config defines under *Format / tone preferences* before moving to Phase 11. The skill stops at content; the config owns the personal layers.
 ## Phase 11: Post to Slack
 
 **Use `conversations_add_message` with `content_type: "text/plain"`.** Critical: `text/markdown` content type makes the message uneditable in Slack UI. `text/plain` with Slack mrkdwn syntax renders correctly AND stays editable.
@@ -312,7 +312,7 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 ## Example Output (Slack mrkdwn, generic shape)
 
 ```
-*Standup - Wed Mar 12* :musical_note: <https://example.com/song|Theme Song>
+*Standup - Wed Mar 12*
 
 *Yesterday*
 
@@ -375,7 +375,7 @@ Stream names you commonly reuse — the agent should match these before creating
 
 ## Format / tone preferences
 
-Theme song handling, tone rules (e.g., team perspective), formatting preferences, anything else style-related.
+Tone rules (e.g., team perspective), formatting preferences, and any user-specific layers that ride on top of the generic workflow (e.g., extra post-content steps, custom decorations on the final message, etc.). The skill workflow is generic; this section is where user-specific additions live.
 
 ## Examples of past blockers worth surfacing
 
