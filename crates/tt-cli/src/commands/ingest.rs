@@ -13,6 +13,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tt_core::project::ProjectIdentity;
 
+use crate::commands::import;
+
 /// An event to be ingested and written to the events file.
 ///
 /// This is a flat structure representing a tmux pane focus event.
@@ -431,6 +433,18 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         println!("  ... and {} more projects", project_list.len() - 10);
     }
 
+    // Drain local events.jsonl (tmux pane focus events) into the DB. The local
+    // tmux hook appends to events.jsonl but no automated mechanism moves those
+    // events into the DB — `tt sync` pulls from remotes only. Without this
+    // call, local laptop focus events accumulate in JSONL but never appear in
+    // reports. Must run before `auto_assign_events_to_streams` so the freshly
+    // imported tmux focus events get routed to streams by cwd.
+    let drained = import_local_events(db, &default_data_dir())
+        .context("failed to drain local events.jsonl into DB")?;
+    if drained > 0 {
+        println!("Drained {drained} local events from events.jsonl");
+    }
+
     // Auto-assign unassigned events to existing streams based on cwd matching.
     let assigned =
         auto_assign_events_to_streams(db).context("failed to auto-assign events to streams")?;
@@ -663,6 +677,37 @@ fn read_events_from(data_dir: &Path) -> Result<Vec<IngestEvent>> {
     }
 
     Ok(events)
+}
+
+/// Imports events from the local `events.jsonl` (and rotated `events.jsonl.1`)
+/// into the database. Returns the number of newly inserted events.
+///
+/// This closes a gap in the sync model: the local tmux hook writes events to
+/// `events.jsonl` but no automated mechanism moves them into the DB. `tt sync`
+/// pulls events from remote machines via SSH; the local laptop's own JSONL is
+/// never read. Without this function, local tmux pane focus events accumulate
+/// in JSONL but are invisible to reports.
+///
+/// Idempotent: re-running is safe because event IDs are deterministic and the
+/// database uses `INSERT OR IGNORE`.
+pub fn import_local_events(db: &tt_db::Database, data_dir: &Path) -> Result<usize> {
+    let mut total_inserted = 0;
+    // Read rotated file first so newer events from events.jsonl can still
+    // appear later in the import stream (ordering is not required for
+    // correctness — INSERT OR IGNORE is set-based — but it matches the
+    // natural temporal order).
+    for filename in ["events.jsonl.1", "events.jsonl"] {
+        let path = data_dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+        let file =
+            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let result = import::import_from_reader(db, file)
+            .with_context(|| format!("failed to import events from {}", path.display()))?;
+        total_inserted += result.inserted;
+    }
+    Ok(total_inserted)
 }
 
 #[cfg(test)]
@@ -1536,4 +1581,72 @@ fn test_subagent_session_skips_user_message_events() {
     // Should have only session_start — no UserMessage, no end
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, tt_core::EventType::AgentSession);
+}
+
+#[test]
+fn test_import_local_events_drains_jsonl_into_db() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path();
+    let events_file = data_dir.join("events.jsonl");
+
+    let event_line = r#"{"id":"a59fae83-37bb-46c3-8a65-70962c28005a:remote.tmux:tmux_pane_focus:2026-05-17T00:00:00.000Z:%1","source":"remote.tmux","type":"tmux_pane_focus","timestamp":"2026-05-17T00:00:00.000Z","cwd":"/home/sami/test","pane_id":"%1","tmux_session":"dev","window_index":1}"#;
+    fs::write(&events_file, format!("{event_line}\n")).unwrap();
+
+    let db = tt_db::Database::open_in_memory().unwrap();
+
+    let inserted = import_local_events(&db, data_dir).unwrap();
+
+    assert_eq!(inserted, 1, "should import 1 event from local events.jsonl");
+
+    let stored = db.get_events(None, None).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].event_type, tt_core::EventType::TmuxPaneFocus);
+    assert_eq!(
+        stored[0].machine_id.as_deref(),
+        Some("a59fae83-37bb-46c3-8a65-70962c28005a"),
+        "machine_id should be extracted from event id prefix"
+    );
+}
+
+#[test]
+fn test_import_local_events_reads_rotated_jsonl() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path();
+    let rotated = data_dir.join("events.jsonl.1");
+
+    let event_line = r#"{"id":"a59fae83-37bb-46c3-8a65-70962c28005a:remote.tmux:tmux_pane_focus:2026-04-01T00:00:00.000Z:%1","source":"remote.tmux","type":"tmux_pane_focus","timestamp":"2026-04-01T00:00:00.000Z","cwd":"/home/sami","pane_id":"%1","tmux_session":"dev","window_index":1}"#;
+    fs::write(&rotated, format!("{event_line}\n")).unwrap();
+
+    let db = tt_db::Database::open_in_memory().unwrap();
+
+    let inserted = import_local_events(&db, data_dir).unwrap();
+    assert_eq!(inserted, 1, "should import from rotated events.jsonl.1");
+}
+
+#[test]
+fn test_import_local_events_handles_missing_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path();
+
+    let db = tt_db::Database::open_in_memory().unwrap();
+
+    let inserted = import_local_events(&db, data_dir).unwrap();
+    assert_eq!(inserted, 0, "should handle missing JSONL files gracefully");
+}
+
+#[test]
+fn test_import_local_events_is_idempotent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path();
+    let events_file = data_dir.join("events.jsonl");
+    let event_line = r#"{"id":"a59fae83-37bb-46c3-8a65-70962c28005a:remote.tmux:tmux_pane_focus:2026-05-17T00:00:00.000Z:%1","source":"remote.tmux","type":"tmux_pane_focus","timestamp":"2026-05-17T00:00:00.000Z","cwd":"/home/sami","pane_id":"%1","tmux_session":"dev","window_index":1}"#;
+    fs::write(&events_file, format!("{event_line}\n")).unwrap();
+
+    let db = tt_db::Database::open_in_memory().unwrap();
+
+    let first = import_local_events(&db, data_dir).unwrap();
+    let second = import_local_events(&db, data_dir).unwrap();
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 0, "re-import should not duplicate events");
 }
