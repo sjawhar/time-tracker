@@ -328,3 +328,6 @@ $RECYCLE.BIN/
 !.sisyphus/rules/
 
 /ignore
+
+### Agent scratch / OhMyOpenCode tooling
+.omo/
