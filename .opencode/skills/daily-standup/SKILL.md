@@ -9,7 +9,7 @@ Generate and post a daily standup to Slack using time-tracker activity data.
 
 ## Phase 0: Load Personal Config
 
-User-specific audience, scope, repos, timezone, and formatting preferences live in a private markdown file (not in this repo). Load it at the start of every run — it's natural language, no parser needed:
+User-specific audience, scope, repos, timezone, and formatting preferences live in a private markdown file (not in this repo). Load it at the start of every run:
 
 ```bash
 CONFIG=~/.config/time-tracker/standup.md
