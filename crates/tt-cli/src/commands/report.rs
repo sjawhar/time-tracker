@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 use tt_core::session::AgentSession;
-use tt_core::{AllocationConfig, EventType, allocate_time};
+use tt_core::{AllocationConfig, EventType, SessionType, allocate_time};
 use tt_db::Database;
 
 /// Report period type.
@@ -322,9 +322,25 @@ pub fn generate_report_data_for_date(
         events = start_events;
     }
 
+    // Fetch agent sessions overlapping the period — needed both for session_type
+    // filtering during allocation and for the report's session summary at the end.
+    let agent_sessions = db
+        .agent_sessions_in_range(period_start, period_end)
+        .context("failed to get agent sessions in period")?;
+    let session_types: HashMap<String, SessionType> = agent_sessions
+        .iter()
+        .map(|session| (session.session_id.clone(), session.session_type))
+        .collect();
+
     // Calculate time from events using the allocation algorithm
     let config = AllocationConfig::default();
-    let result = allocate_time(&events, &config, Some(period_end), &HashMap::new());
+    let result = allocate_time(
+        &events,
+        &config,
+        Some(period_end),
+        &HashMap::new(),
+        &session_types,
+    );
 
     // Get stream metadata (names) for display
     let all_streams = db.get_streams().context("failed to get streams")?;
@@ -336,10 +352,6 @@ pub fn generate_report_data_for_date(
         .context("failed to get stream tags")?
         .into_iter()
         .collect();
-
-    let agent_sessions = db
-        .agent_sessions_in_range(period_start, period_end)
-        .context("failed to get agent sessions in period")?;
 
     // Convert allocation results to report format, excluding zero-time streams
     let streams: Vec<ReportStreamTime> = result
@@ -1771,6 +1783,10 @@ Delegated time: 3h 13m (36%)
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single integration scenario; splitting hurts readability"
+    )]
     fn test_day_report_seeds_cross_boundary_agent_session_starts() {
         let db = tt_db::Database::open_in_memory().unwrap();
         let reference_date = NaiveDate::from_ymd_opt(2025, 1, 29).unwrap();
@@ -1844,14 +1860,25 @@ Delegated time: 3h 13m (36%)
         let period_events = db.get_events_in_range(period_start, period_end).unwrap();
         let config = AllocationConfig::default();
 
-        let without_seed =
-            allocate_time(&period_events, &config, Some(period_end), &HashMap::new());
+        let without_seed = allocate_time(
+            &period_events,
+            &config,
+            Some(period_end),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(without_seed.stream_times.len(), 0);
 
         let mut seeded_events = Vec::with_capacity(period_events.len() + 1);
         seeded_events.push(start_event);
         seeded_events.extend(period_events);
-        let with_seed = allocate_time(&seeded_events, &config, Some(period_end), &HashMap::new());
+        let with_seed = allocate_time(
+            &seeded_events,
+            &config,
+            Some(period_end),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(with_seed.stream_times.len(), 1);
         assert_eq!(with_seed.stream_times[0].stream_id, stream_id);
         assert_eq!(

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tt_core::{AllocationConfig, allocate_time};
+use tt_core::{AllocationConfig, SessionType, allocate_time};
 use tt_db::Database;
 
 /// Run time recomputation for streams.
@@ -70,23 +70,31 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
     // Load session end times for accurate delegated time calculation.
     // When a session has a known end_time, the algorithm uses it instead of the
     // timeout heuristic (which undercounts delegated time for gappy sessions).
+    // Also load session_types so allocation can skip subagent user_message events
+    // (the parent agent's delegation, not human attention).
     let earliest = events.first().map_or_else(Utc::now, |e| e.timestamp);
     let latest = events.last().map_or_else(Utc::now, |e| e.timestamp);
-    let session_end_times: HashMap<String, DateTime<Utc>> = db
+    let agent_sessions = db
         .agent_sessions_in_range(earliest, latest)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|s| s.end_time.map(|end| (s.session_id, end)))
+        .unwrap_or_default();
+    let session_end_times: HashMap<String, DateTime<Utc>> = agent_sessions
+        .iter()
+        .filter_map(|s| s.end_time.map(|end| (s.session_id.clone(), end)))
+        .collect();
+    let session_types: HashMap<String, SessionType> = agent_sessions
+        .iter()
+        .map(|s| (s.session_id.clone(), s.session_type))
         .collect();
 
     tracing::debug!(
         sessions_with_end_time = session_end_times.len(),
-        "loaded session end times"
+        sessions_with_type = session_types.len(),
+        "loaded session metadata"
     );
 
     // Run the allocation algorithm
     let config = AllocationConfig::default();
-    let result = allocate_time(&events, &config, None, &session_end_times);
+    let result = allocate_time(&events, &config, None, &session_end_times, &session_types);
 
     tracing::debug!(
         stream_count = result.stream_times.len(),
