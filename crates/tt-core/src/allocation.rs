@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::EventType;
+use crate::{EventType, SessionType};
 
 /// Configuration for time allocation.
 #[derive(Debug, Clone)]
@@ -155,6 +155,8 @@ impl Interval {
 /// * `period_end` - Where to close open intervals. If None, uses last event + `attention_window`
 /// * `session_end_times` - Known end times for agent sessions (from `agent_sessions` table).
 ///   When a session has a known `end_time`, the algorithm uses it instead of the timeout heuristic.
+/// * `session_types` - Known session types (from `agent_sessions` table). `UserMessage` events
+///   originating from non-`User` sessions (e.g. subagents) are skipped so they do not establish
 ///
 /// # Returns
 ///
@@ -165,6 +167,7 @@ pub fn allocate_time<E: AllocatableEvent>(
     config: &AllocationConfig,
     period_end: Option<DateTime<Utc>>,
     session_end_times: &HashMap<String, DateTime<Utc>>,
+    session_types: &HashMap<String, SessionType>,
 ) -> AllocationResult {
     let mut focus_state = FocusState::Unfocused;
     let mut window_focus_state = WindowFocusState::default();
@@ -374,7 +377,16 @@ pub fn allocate_time<E: AllocatableEvent>(
             EventType::UserMessage => {
                 // User messages represent active work — sending a message to an
                 // agent IS direct work. Establish focus on the message's stream,
-                // just like switching to a tmux pane.
+                // just like switching to a tmux pane. Exception: user_message events
+                // emitted by a subagent (or any non-User session type) reflect the
+                // parent agent's delegation, not human attention, so they are skipped.
+                let is_subagent_message = event
+                    .session_id()
+                    .and_then(|session_id| session_types.get(session_id))
+                    .is_some_and(|session_type| *session_type != SessionType::User);
+                if is_subagent_message {
+                    continue;
+                }
                 if let Some(stream_id) = event.stream_id() {
                     // Close previous focus interval
                     if let FocusState::Focused { focus_start, .. } = &focus_state {
@@ -850,7 +862,13 @@ mod tests {
 
         let config = test_config();
         // Set period_end to cap the final attention window
-        let result = allocate_time(&events, &config, Some(ts(11)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(11)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time capped per attention window:
@@ -868,7 +886,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(20)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(20)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
@@ -889,7 +913,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(20)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(20)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time capped at attention window before AFK: 1 minute
@@ -907,7 +937,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(20)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(20)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time capped at attention window: 1 minute
@@ -924,7 +960,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(30)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Delegated: from first tool use (5) to end (30) = 25 minutes
@@ -941,7 +983,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(30)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // No tool use = no delegated time
         let stream_a = get_stream_time(&result, "A");
@@ -963,7 +1011,13 @@ mod tests {
             ..Default::default()
         };
 
-        let result = allocate_time(&events, &config, Some(ts(60)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(60)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Session times out at 5 + 30 = 35 minutes
@@ -984,7 +1038,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(30)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
@@ -1005,7 +1065,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(30)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
 
@@ -1027,7 +1093,13 @@ mod tests {
             attention_window_ms: 60_000, // 1 minute
             agent_timeout_ms: 30 * 60 * 1000,
         };
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time caps at attention window: 1 minute
@@ -1046,7 +1118,13 @@ mod tests {
             attention_window_ms: 60_000, // 1 minute
             agent_timeout_ms: 30 * 60 * 1000,
         };
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Focus at 0, scroll at 0:30, attention window from scroll = 1:30
@@ -1064,7 +1142,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Focus is on A the whole time. The scroll in B doesn't change focus state.
@@ -1090,7 +1174,13 @@ mod tests {
         }];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // No streams should have time
         assert!(
@@ -1114,7 +1204,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(30)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
 
@@ -1136,7 +1232,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(20)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(20)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Direct: [0, 1) = 1 min (attention window)
         // Delegated: [5, 20) = 15 min
@@ -1156,7 +1258,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(20)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(20)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Delegated: from first tool (5) to end (20) = 15 minutes
@@ -1176,7 +1284,13 @@ mod tests {
             attention_window_ms: 60_000,
             agent_timeout_ms: 30 * 60 * 1000,
         };
-        let result = allocate_time(&events, &config, Some(ts(5)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Focus at 0, user_message at 30s, attention window extends to 1:30
@@ -1189,7 +1303,7 @@ mod tests {
     fn test_empty_events() {
         let events: Vec<TestEvent> = vec![];
         let config = test_config();
-        let result = allocate_time(&events, &config, None, &HashMap::new());
+        let result = allocate_time(&events, &config, None, &HashMap::new(), &HashMap::new());
 
         assert!(result.stream_times.is_empty());
         assert_eq!(result.total_tracked_ms, 0);
@@ -1204,7 +1318,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Window focus + tmux focus on same stream = 1 minute (attention window)
@@ -1219,7 +1339,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(10)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Browser tab alone doesn't grant direct time without window focus
         // This test verifies the event is parsed without error
@@ -1238,7 +1364,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(6)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(6)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Terminal window focus + tmux focus = time goes to tmux stream A, capped per window
@@ -1254,7 +1386,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(6)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(6)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
         // Browser window focus + browser tab = time goes to browser stream B, capped per window
@@ -1270,7 +1408,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(5)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Direct time capped at attention window: 1 minute
@@ -1287,7 +1431,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         assert_eq!(
             stream_a.time_direct_ms, 60_000,
@@ -1310,7 +1460,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         // First interval 0→1min capped, scroll resets window, second interval 120→121min = 60s
         assert_eq!(
@@ -1329,7 +1485,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         assert_eq!(
             stream_a.time_direct_ms, 60_000,
@@ -1348,7 +1510,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         assert_eq!(
             stream_a.time_direct_ms, 60_000,
@@ -1372,7 +1540,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         // First interval: 0→30s (NOT capped, within window)
         // Second interval: 30s→30s+60s=90s (capped at attention window from scroll to next focus switch at ts(120))
@@ -1393,7 +1567,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(241)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(241)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         let stream_b = get_stream_time(&result, "stream-b").expect("stream-b should exist");
         let stream_c = get_stream_time(&result, "stream-c").expect("stream-c should exist");
@@ -1416,7 +1596,13 @@ mod tests {
             attention_window_ms: 60_000,
             ..Default::default()
         };
-        let result = allocate_time(&events, &config, Some(ts(121)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(121)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let stream_a = get_stream_time(&result, "stream-a").expect("stream-a should exist");
         // idle_start = ts(90), end_time = max(ts(90), ts(0)) = ts(90)
         // But capped: max_end = ts(0) + 60s = ts(1), capped_end = min(ts(90), ts(1)) = ts(1)
@@ -1436,7 +1622,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(6)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(6)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // First user_message at ts(1) establishes focus on A.
@@ -1455,7 +1647,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(5)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
@@ -1478,7 +1676,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(7)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(7)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // msg@0 establishes focus
@@ -1500,7 +1704,13 @@ mod tests {
         ];
 
         let config = test_config();
-        let result = allocate_time(&events, &config, Some(ts(5)), &HashMap::new());
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         let stream_b = get_stream_time(&result, "B").expect("Stream B should exist");
@@ -1509,5 +1719,54 @@ mod tests {
         // A: tmux_focus [4, min(5, 4+1min)] = [4, 5] = 1min
         assert_eq!(stream_a.time_direct_ms, 2 * 60_000);
         assert_eq!(stream_b.time_direct_ms, 60_000);
+    }
+
+    // Test: UserMessage from a subagent session is not treated as human attention.
+    // Without this filter, a parent agent dispatching a Task subagent would have
+    // the subagent's prompt counted as direct user time on the subagent's stream.
+    #[test]
+    fn test_user_message_from_subagent_session_does_not_establish_focus() {
+        let events = vec![
+            TestEvent::user_message(ts(1), "sess1", "A"),
+            TestEvent::user_message(ts(2), "sess1", "A"),
+        ];
+        let session_types = HashMap::from([(String::from("sess1"), SessionType::Subagent)]);
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &session_types,
+        );
+
+        // The subagent's user_message events are skipped, so no focus is established.
+        assert!(result.stream_times.is_empty());
+    }
+
+    // Test: UserMessage from a User session still establishes focus when session_types
+    // is populated. Guards against the subagent filter accidentally suppressing real work.
+    #[test]
+    fn test_user_message_from_user_session_still_establishes_focus() {
+        let events = vec![
+            TestEvent::user_message(ts(1), "sess1", "A"),
+            TestEvent::user_message(ts(2), "sess1", "A"),
+        ];
+        let session_types = HashMap::from([(String::from("sess1"), SessionType::User)]);
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &session_types,
+        );
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // msg@1 establishes focus; msg@2 closes [1, min(2, 1+1min)]=[1,2]=1min, reopens at 2;
+        // finalize closes [2, min(5, 2+1min)]=[2,3]=1min. Total: 2min.
+        assert_eq!(stream_a.time_direct_ms, 2 * 60_000);
     }
 }

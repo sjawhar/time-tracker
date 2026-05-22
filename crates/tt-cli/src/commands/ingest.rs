@@ -1149,7 +1149,7 @@ mod tests {
         events.sort_by_key(|event| event.timestamp);
 
         let config = AllocationConfig::default();
-        let result = allocate_time(&events, &config, None, &HashMap::new());
+        let result = allocate_time(&events, &config, None, &HashMap::new(), &HashMap::new());
         let stream = result
             .stream_times
             .iter()

@@ -727,6 +727,7 @@ fn test_delegated_time_from_agent_session_events() {
         &AllocationConfig::default(),
         Some(base + Duration::seconds(180)),
         &HashMap::new(),
+        &HashMap::new(),
     );
     let stream_time = result
         .stream_times
