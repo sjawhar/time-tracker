@@ -417,6 +417,7 @@ Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.
 - `next_week.on_track_*`: "yes", "no", or "unsure".
 - **`optional`**: For ad-hoc reflection prompts. The `prompt` field is the question asked, `response` is the user's answer.
 - **`week.start` and `week.end`**: Always fill these (YYYY-MM-DD format) — don't leave empty.
+- **`delivered[]`**: Objective list of artifacts shipped this week. Separate from `reflection.successes` (which is subjective). Items have shape `{ id, title, url, kind }`. `kind` is one of `pr` | `doc` | `commit` | `decision` | `release`. Populate from PRs merged in the week window, decisions made, releases cut, etc. Future weeks should always include this field — empty array if nothing shipped.
 
 ## Fallback Handling
 

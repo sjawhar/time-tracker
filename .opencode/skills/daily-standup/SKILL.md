@@ -69,7 +69,7 @@ digraph standup {
   ask [label="8. Ask user\n(plans? blockers?)"];
   draft [label="9. Draft + show user"];
   iterate [label="10. Iterate with user"];
-  post [label="11. Post as text/plain\nwith Slack mrkdwn"];
+  post [label="11. Post via blocks\n(slack-bot MCP)"];
 
   cfg -> start -> ingest -> gather -> analyze -> compute -> prs -> filter -> ask -> draft -> iterate -> post;
 }
@@ -219,39 +219,36 @@ If user gave plans in their initial invocation, skip the question.
 
 ## Phase 9: Draft
 
-**Template (Slack mrkdwn — `*single asterisk*` for bold, `<url|text>` for links, `•` for bullets):**
+Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 11).
+
+**Template:**
 
 ```
 *Standup - {DayOfWeek} {Date}*
 
 *Yesterday*
-
-• *{Logical Project 1}* — {direct}h direct / {delegated}h delegated
-    • {Outcome 1 with hyperlinked PR description}
-    • {Outcome 2}
-
-• *{Logical Project 2}* — {direct}h direct / {delegated}h delegated
-    • {Outcome with hyperlinked PR}
-
-• *Misc tooling* — ~{direct}m direct / ~{delegated}h delegated
-    • {one-line summary of small bits, no sub-bullets}
-
+- *{Logical Project 1}* {— optional Nh direct / Mh delegated}
+  - {Outcome 1 with hyperlinked PR description}
+  - {Outcome 2}
+- *{Logical Project 2}*
+  - {Outcome with hyperlinked PR}
+- *Misc tooling*
+  - {one-line summary of small bits}
 *Today*
-
-• {Plan item, verbatim from user, with caveats preserved}
-• {Plan item}
-
+- {Plan item, verbatim from user, with caveats preserved}
+- {Plan item}
 *Blockers*
-
-• {Blocker or "None"}
+- {Blocker or "None"}
 ```
 
 **Writing rules:**
 
-- Bullets: `•` (Unicode), four spaces indent for sub-bullets.
-- Time: copy ms→h from `tt report` exactly. Use 1 decimal (`9h`, `2.5h`, `~30m`).
-- Bold uses `*…*` (Slack mrkdwn). `**…**` renders as literal asterisks.
-- Apply any user-specific layers from the personal config's *Format / tone preferences* section (e.g., extra header decorations, post-content additions). The skill template above is the generic baseline.
+- Top-level bullets: `-` flush left. Sub-bullets: two-space indent then `-`. This maps to `rich_text_list` with `indent: 0` and `indent: 1` (see Phase 11).
+- Exactly one blank line after the header line (`*Standup - ...*`). **No blank lines elsewhere** — sections (`*Yesterday*`, `*Today*`, `*Blockers*`) and projects flow directly without spacing.
+- Bold: `*…*` (single asterisks). `**…**` renders as literal asterisks in Slack mrkdwn.
+- Hyperlinks: `<url|friendly outcome description>`. Never bare URLs, never `<url|#NNNN>`.
+- Time: copy ms→h from `tt report` exactly. Use 1 decimal (`9h`, `2.5h`, `~30m`). Drop the time annotation entirely when the user says times are wrong or unreliable.
+- Apply any user-specific layers from the personal config's *Format / tone preferences* section (e.g., theme song line, post-content additions). The skill template above is the generic baseline.
 
 ## Phase 10: Iterate with User
 
@@ -267,18 +264,46 @@ Each iteration, re-show the full draft (not a diff). Don't post until the user h
 After content approval, apply any post-approval steps your personal config defines under *Format / tone preferences* before moving to Phase 11. The skill stops at content; the config owns the personal layers.
 ## Phase 11: Post to Slack
 
-**Use `conversations_add_message` with `content_type: "text/plain"`.** Critical: `text/markdown` content type makes the message uneditable in Slack UI. `text/plain` with Slack mrkdwn syntax renders correctly AND stays editable.
+**Use the slack-bot MCP `conversations_add_message` tool with the `blocks` parameter.** This bypasses the markdown converter and posts native Block Kit `rich_text`. Requires slack-mcp-server v1.3.0+. See the `slack-bot` skill for the full Block Kit reference — the short version follows.
+
+**Structure** (single `rich_text` block containing a sequence of `rich_text_section` and `rich_text_list` elements):
+
+| Draft line | Block element |
+|------------|---------------|
+| Header line `*Standup - Fri May 22*` + emoji + theme song link | First `rich_text_section`, ending with `\n\n` then bold section label `Yesterday` then `\n` |
+| Top-level bullet `- *{Project}*` | `rich_text_list` with `style: "bullet"`, `indent: 0`, one `rich_text_section` per top-level bullet |
+| Sub-bullet `  - {Outcome}` | Separate `rich_text_list` with `indent: 1`, placed directly after its parent list |
+| Section transition (`*Today*`, `*Blockers*`) | `rich_text_section` with `\n` + bold label + `\n` |
+| Inline hyperlink `<url|text>` | `{type: "link", url, text}` inside a `rich_text_section` |
+| Inline `*bold*` | `{type: "text", text, style: {bold: true}}` |
+
+**Important rendering rules:**
+
+- **No literal `•` / `◦` characters in the text.** Slack renders the bullet glyphs from the list structure. Including the characters yourself produces a visually-similar but semantically-broken message (breaks copy/paste, accessibility, search).
+- **No blank lines except after the header.** The `rich_text_section` transition elements between lists handle spacing.
+- Each indent level is its own `rich_text_list` block placed directly after its parent. Slack does not support nested-list-inside-list.
+
+**Send:**
 
 ```
-skill_mcp(mcp_name="slack", tool_name="conversations_add_message",
-  arguments='{"channel_id": "<from config>", "content_type": "text/plain", "payload": "<the full Slack mrkdwn message>"}')
+skill_mcp(mcp_name="slack", tool_name="conversations_add_message", arguments='{
+  "channel_id": "<from config>",
+  "text": "<one-line fallback: e.g. Standup - Fri May 22>",
+  "blocks": "[{\"type\":\"rich_text\",\"elements\":[ ... ]}]"
+}')
 ```
 
 **Verify after posting:**
-- Check the response shows the message timestamp.
-- If user says "I can't edit this" → you used the wrong `content_type`. Delete and repost as `text/plain`.
 
-**Delete (only on user request or to retry):**
+- The MCP response includes the message timestamp.
+- To confirm the structure rendered correctly (e.g. for debugging a format complaint), fetch the raw blocks via Slack's API (debug-only, not the send path):
+  ```bash
+  secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s "https://slack.com/api/conversations.history?channel=$CH&latest=$TS&oldest=$TS&inclusive=true&limit=1" -H "Authorization: Bearer $SLACK_MCP_XOXP_TOKEN"' | jq '.messages[0].blocks'
+  ```
+  A correctly-formatted standup is **one** `rich_text` block; if you see multiple `section` blocks the message was sent via the markdown path (wrong).
+
+**Delete a message** (only on user request or to retry):
+
 ```bash
 secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/chat.delete" \
   -H "Authorization: Bearer $SLACK_MCP_XOXP_TOKEN" \
@@ -295,7 +320,7 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 | Internal jargon (project-internal codenames, bucket labels, etc.) | Translate to plain description of what was actually done |
 | Giant raw URLs in post | Hyperlink friendly description: `<url|short outcome>` |
 | `[PR #N](url)` markdown syntax | Use Slack mrkdwn `<url|description>`. Markdown links DON'T render. |
-| `content_type: "text/markdown"` | Use `"text/plain"` — markdown content type breaks editability |
+| `content_type: "text/markdown"` for structured messages | Use the `blocks` parameter with `rich_text` block kit — markdown content_type creates fragmented `section` blocks (80-char wrap, breaks editability) |
 | `**bold**` (double asterisk) | Use `*bold*` (single asterisk) — Slack mrkdwn |
 | `## headers` | Slack mrkdwn has no headers. Use bold lines. |
 | `gh search prs --author=@me` for private repos | Use local clones from your config |
@@ -308,35 +333,70 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 | Wrong day boundary | Use the timezone from your config, not UTC or Pacific by default |
 | Posting without confirming | Always show draft → wait for explicit go-ahead |
 | Annotating "(excluding personal)" | Don't draw attention to what was dropped. Just omit. |
+| Literal `•` / `◦` characters in posted text | Use Block Kit `rich_text_list` with `indent: 0` / `indent: 1`. Slack renders the bullet glyphs from the list structure. Literal characters break copy/paste, accessibility, and search. |
+| Blank lines between sections (`*Yesterday*` → `*Today*`) | Only ONE blank line in the entire message: after the header line. Section transitions are `rich_text_section` elements with `\n` + bold label + `\n`. |
+| Sending the draft markdown text directly via `text` or `content_type: "text/plain"` | Convert the approved draft to Block Kit `rich_text` JSON and send via `blocks`. The draft's `-` / `  -` indentation maps to `rich_text_list` indent 0 / 1. |
 
-## Example Output (Slack mrkdwn, generic shape)
+## Example Output
+
+**Draft preview the user sees during iteration:**
 
 ```
 *Standup - Wed Mar 12*
 
 *Yesterday*
-
-• *Project A — milestone work* — 6h direct / 12h delegated
-    • Shipped <https://example.com/repo/pull/123|customer-facing fix for hover bug> (closes 3 reported issues)
-    • Landed supporting changes: <https://example.com/repo/pull/124|docs into agents/skills>, <https://example.com/repo/pull/125|error surfacing on infra failures>
-    • One cleanup ahead: noticed tests are taking the easy path; going to tighten the test-writing skill so agents stop doing that. *Not a blocker — Project A is usable for the next phase now.*
-
-• *Project B — consolidation* — 2h direct / 4h delegated
-    • Landed <https://example.com/repo/pull/130|combined three follow-up fixes into one PR>
-    • Plus <https://example.com/repo/pull/131|restore safety check> and <https://example.com/repo/pull/132|filter env contexts>
-
-• *Misc tooling* — ~30m direct / ~3h delegated
-    • CI workflow inputs, devbox connectivity recovery, standup pipeline sync improvements
-
+- *Project A — milestone work* — 6h direct / 12h delegated
+  - Shipped <https://example.com/repo/pull/123|customer-facing fix for hover bug> (closes 3 reported issues)
+  - Landed supporting changes: <https://example.com/repo/pull/124|docs into agents/skills>, <https://example.com/repo/pull/125|error surfacing on infra failures>
+- *Project B — consolidation* — 2h direct / 4h delegated
+  - Landed <https://example.com/repo/pull/130|combined three follow-up fixes into one PR>
+  - Plus <https://example.com/repo/pull/131|restore safety check> and <https://example.com/repo/pull/132|filter env contexts>
+- *Misc tooling* — ~30m direct / ~3h delegated
+  - CI workflow inputs, devbox connectivity recovery, standup pipeline sync improvements
 *Today*
-
-• Weekly review
-• May land the long-running refactor PR (might deploy to a test repo first as a precaution before submission)
-
+- Weekly review
+- May land the long-running refactor PR (might deploy to a test repo first as a precaution before submission)
 *Blockers*
-
-• None
+- None
 ```
+
+**What actually gets posted** (Block Kit `blocks` parameter, abbreviated):
+
+```json
+[
+  {
+    "type": "rich_text",
+    "elements": [
+      {"type": "rich_text_section", "elements": [
+        {"type": "text", "text": "Standup - Wed Mar 12", "style": {"bold": true}},
+        {"type": "text", "text": "\n\n"},
+        {"type": "text", "text": "Yesterday", "style": {"bold": true}},
+        {"type": "text", "text": "\n"}
+      ]},
+      {"type": "rich_text_list", "style": "bullet", "indent": 0, "elements": [
+        {"type": "rich_text_section", "elements": [
+          {"type": "text", "text": "Project A — milestone work", "style": {"bold": true}},
+          {"type": "text", "text": " — 6h direct / 12h delegated"}
+        ]}
+      ]},
+      {"type": "rich_text_list", "style": "bullet", "indent": 1, "elements": [
+        {"type": "rich_text_section", "elements": [
+          {"type": "text", "text": "Shipped "},
+          {"type": "link", "url": "https://example.com/repo/pull/123", "text": "customer-facing fix for hover bug"},
+          {"type": "text", "text": " (closes 3 reported issues)"}
+        ]}
+      ]},
+      {"type": "rich_text_section", "elements": [
+        {"type": "text", "text": "\n"},
+        {"type": "text", "text": "Today", "style": {"bold": true}},
+        {"type": "text", "text": "\n"}
+      ]}
+    ]
+  }
+]
+```
+
+See the `slack-bot` skill for the full Block Kit `rich_text` element reference.
 
 ## Setup (first run)
 
