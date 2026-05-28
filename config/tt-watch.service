@@ -1,0 +1,33 @@
+# systemd user service for the tt COSMIC window/idle watcher.
+#
+# Install (per machine, after `tt` is on PATH at ~/.local/bin/tt):
+#   cp config/tt-watch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tt-watch.service
+#   loginctl enable-linger "$USER"        # optional: keep running across logouts
+#
+# The watcher needs the graphical session env (Wayland socket + DBus). COSMIC's
+# session normally imports these into the user manager; if `tt watch` fails to
+# connect, ensure WAYLAND_DISPLAY is exported to systemd --user, e.g.:
+#   systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+# (XDG_RUNTIME_DIR is set automatically by the user manager.)
+#
+# This is a capture-only daemon: it writes window_focus / afk_change events
+# directly to the tt SQLite DB. It is COSMIC-only; on a non-COSMIC session
+# `tt watch` fails fast with a clear message (Restart=on-failure will retry).
+
+[Unit]
+Description=tt COSMIC window/idle activity watcher
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Give the compositor + env import a moment to settle on session start.
+ExecStartPre=/bin/sleep 5
+ExecStart=%h/.local/bin/tt watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

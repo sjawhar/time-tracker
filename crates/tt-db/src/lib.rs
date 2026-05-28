@@ -26,18 +26,20 @@
 //! ## Schema Versioning
 //!
 //! The database tracks its schema version in a `schema_info` table. On open,
-//! if the schema version doesn't match the expected version, the database
-//! fails fast rather than silently corrupting data.
+//! supported older versions are migrated forward additively; unsupported
+//! version mismatches fail fast rather than silently corrupting data.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Current schema version. Increment when making breaking schema changes.
-const SCHEMA_VERSION: i32 = 8;
+/// Current schema version. Increment when making schema changes.
+const SCHEMA_VERSION: i32 = 9;
+
+const EVENT_COLUMNS: &str = "id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source, window_app_id, window_title";
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -172,6 +174,14 @@ pub struct StoredEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_duration_ms: Option<i64>,
 
+    /// Active-window application id (for `window_focus` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_app_id: Option<String>,
+
+    /// Active-window title (for `window_focus` events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+
     /// Agent action (for `agent_session` events): "started", "ended", "`tool_use`".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
@@ -248,6 +258,12 @@ impl StoredEvent {
                 serde_json::Value::Number(v.into()),
             );
         }
+        if let Some(ref v) = self.window_app_id {
+            map.insert("app".to_string(), serde_json::Value::String(v.clone()));
+        }
+        if let Some(ref v) = self.window_title {
+            map.insert("title".to_string(), serde_json::Value::String(v.clone()));
+        }
         if let Some(ref v) = self.action {
             map.insert("action".to_string(), serde_json::Value::String(v.clone()));
         }
@@ -308,6 +324,7 @@ impl Database {
     /// If the database has an incompatible schema version, returns an error.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         // WAL + NORMAL: bulk ingest commits ~80k small transactions; the default
         // (rollback journal + synchronous=FULL) fsyncs twice per commit, which
         // dominated ingest time. WAL with synchronous=NORMAL only fsyncs at
@@ -325,6 +342,7 @@ impl Database {
     /// Useful for testing. The database is destroyed when the connection closes.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
@@ -348,8 +366,8 @@ impl Database {
 
     /// Initializes the database schema.
     ///
-    /// Checks schema version and creates tables if needed.
-    /// Old schema versions are not supported - the database must be recreated.
+    /// Checks schema version, applies additive migrations, and creates tables if needed.
+    /// Unsupported schema versions fail fast.
     #[expect(clippy::too_many_lines)]
     fn init(&self) -> Result<(), DbError> {
         // Enable foreign key constraints
@@ -364,12 +382,18 @@ impl Database {
             .ok();
 
         match existing_version {
-            Some(v) if v == SCHEMA_VERSION => {
-                // Schema already initialized and version matches
-                return Ok(());
+            Some(v) if v == SCHEMA_VERSION => {}
+            Some(8) => {
+                let tx = self.conn.unchecked_transaction()?;
+                tx.execute("ALTER TABLE events ADD COLUMN window_app_id TEXT", [])?;
+                tx.execute("ALTER TABLE events ADD COLUMN window_title TEXT", [])?;
+                tx.execute(
+                    "UPDATE schema_info SET version = ?1",
+                    params![SCHEMA_VERSION],
+                )?;
+                tx.commit()?;
             }
             Some(v) => {
-                // No migrations supported - schema v6 is a breaking change
                 return Err(DbError::SchemaVersionMismatch {
                     found: v,
                     expected: SCHEMA_VERSION,
@@ -407,6 +431,8 @@ impl Database {
                 session_id TEXT,
                 stream_id TEXT,
                 assignment_source TEXT DEFAULT 'inferred',
+                window_app_id TEXT,
+                window_title TEXT,
 
                 FOREIGN KEY (stream_id) REFERENCES streams(id) ON DELETE SET NULL
             );
@@ -475,11 +501,12 @@ impl Database {
             ",
         )?;
 
-        // Insert schema version
-        self.conn.execute(
-            "INSERT INTO schema_info (version) VALUES (?1)",
-            params![SCHEMA_VERSION],
-        )?;
+        if existing_version.is_none() {
+            self.conn.execute(
+                "INSERT INTO schema_info (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )?;
+        }
 
         Ok(())
     }
@@ -504,8 +531,8 @@ impl Database {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO events (id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                "INSERT OR IGNORE INTO events (id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source, window_app_id, window_title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )?;
 
             for event in events {
@@ -530,6 +557,8 @@ impl Database {
                     event.session_id,
                     event.stream_id,
                     event.assignment_source,
+                    event.window_app_id,
+                    event.window_title,
                 ])?;
 
                 count += rows;
@@ -555,10 +584,7 @@ impl Database {
         after: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
     ) -> Result<Vec<StoredEvent>, DbError> {
-        let mut sql = String::from(
-            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
-             FROM events WHERE 1=1",
-        );
+        let mut sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE 1=1");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ref after_ts) = after {
@@ -601,12 +627,12 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<StoredEvent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
-             FROM events
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events
              WHERE timestamp >= ?1 AND timestamp <= ?2
-             ORDER BY timestamp ASC",
-        )?;
+             ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let mut events = Vec::new();
         let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
@@ -634,8 +660,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
-             FROM events
+            "SELECT {EVENT_COLUMNS} FROM events
              WHERE type = 'agent_session' AND action = 'started' AND session_id IN ({placeholders})
              ORDER BY timestamp ASC"
         );
@@ -770,6 +795,42 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Assigns events with explicit IDs to a stream.
+    ///
+    /// Chunks updates to stay below `SQLite`'s variable limit. Skips events with
+    /// `assignment_source = 'user'`. Returns the number of events updated.
+    pub fn assign_events_by_ids(
+        &self,
+        ids: &[String],
+        stream_id: &str,
+        source: &str,
+    ) -> Result<u64, DbError> {
+        const CHUNK_SIZE: usize = 500;
+
+        let mut total = 0u64;
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE events SET stream_id = ?, assignment_source = ? \
+                 WHERE id IN ({placeholders}) \
+                 AND (assignment_source IS NULL OR assignment_source != 'user')"
+            );
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params_vec.push(&stream_id);
+            params_vec.push(&source);
+            params_vec.extend(chunk.iter().map(|id| id as &dyn rusqlite::ToSql));
+            total += self.conn.execute(&sql, params_from_iter(params_vec))? as u64;
+        }
+
+        Ok(total)
+    }
+
     /// Assigns events matching a CWD pattern and optional time range to a stream.
     ///
     /// Uses SQL LIKE for CWD matching (e.g., `%/agent-c/viewer%`).
@@ -820,10 +881,10 @@ impl Database {
     ///
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_by_stream(&self, stream_id: &str) -> Result<Vec<StoredEvent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
-             FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC",
-        )?;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id = ?1 ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let mut events = Vec::new();
         let mut rows = stmt.query(params![stream_id])?;
@@ -840,10 +901,10 @@ impl Database {
     ///
     /// Events are returned ordered by timestamp ascending.
     pub fn get_events_without_stream(&self) -> Result<Vec<StoredEvent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source
-             FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC",
-        )?;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE stream_id IS NULL ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let mut events = Vec::new();
         let mut rows = stmt.query([])?;
@@ -1090,7 +1151,7 @@ impl Database {
     /// Expects the row to have columns in this order:
     /// `id`, `timestamp`, `type`, `source`, `machine_id`, `schema_version`, `cwd`, `git_project`,
     /// `git_workspace`, `pane_id`, `tmux_session`, `window_index`, `status`, `idle_duration_ms`,
-    /// `action`, `session_id`, `stream_id`, `assignment_source`
+    /// `action`, `session_id`, `stream_id`, `assignment_source`, `window_app_id`, `window_title`
     ///
     /// Returns `None` if the row has malformed timestamp (with a warning logged).
     fn row_to_event(row: &rusqlite::Row<'_>) -> Result<Option<StoredEvent>, rusqlite::Error> {
@@ -1112,6 +1173,8 @@ impl Database {
         let session_id: Option<String> = row.get(15)?;
         let stream_id: Option<String> = row.get(16)?;
         let assignment_source: Option<String> = row.get(17)?;
+        let window_app_id: Option<String> = row.get(18)?;
+        let window_title: Option<String> = row.get(19)?;
 
         let timestamp = match DateTime::parse_from_rfc3339(&timestamp_str) {
             Ok(dt) => dt.with_timezone(&Utc),
@@ -1148,6 +1211,8 @@ impl Database {
             git_workspace,
             status,
             idle_duration_ms,
+            window_app_id,
+            window_title,
             action,
             cwd,
             session_id,
@@ -1540,6 +1605,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: Some("/home/sami/project-x".to_string()),
             session_id: None,
@@ -1574,6 +1641,8 @@ mod tests {
             git_workspace: Some("feature".to_string()),
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: Some("/home/sami/project".to_string()),
             session_id: Some("abc123".to_string()),
@@ -1601,6 +1670,32 @@ mod tests {
         assert_eq!(retrieved.git_workspace, Some("feature".to_string()));
         assert_eq!(retrieved.cwd, Some("/home/sami/project".to_string()));
         assert_eq!(retrieved.session_id, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_insert_event_stores_window_fields() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = Utc.with_ymd_and_hms(2026, 6, 14, 10, 0, 0).unwrap();
+        let mut event = make_event("win-1", ts, tt_core::EventType::WindowFocus);
+        event.source = "local.cosmic".to_string();
+        event.cwd = None;
+        event.pane_id = None;
+        event.tmux_session = None;
+        event.window_index = None;
+        event.window_app_id = Some("firefox".to_string());
+        event.window_title = Some("Proposal - Google Docs".to_string());
+
+        assert!(db.insert_event(&event).unwrap());
+        let events = db.get_events(None, None).unwrap();
+        let got = events.iter().find(|e| e.id == "win-1").unwrap();
+        assert_eq!(got.window_app_id.as_deref(), Some("firefox"));
+        assert_eq!(got.window_title.as_deref(), Some("Proposal - Google Docs"));
+        let data = got.build_data_json();
+        assert_eq!(data.get("app").and_then(|v| v.as_str()), Some("firefox"));
+        assert_eq!(
+            data.get("title").and_then(|v| v.as_str()),
+            Some("Proposal - Google Docs")
+        );
     }
 
     #[test]
@@ -1871,6 +1966,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: None,
             session_id: None,
@@ -2006,6 +2103,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_migration_v8_to_v9_adds_columns_preserves_rows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("v8.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_info (version INTEGER NOT NULL);
+                 INSERT INTO schema_info (version) VALUES (8);
+                 CREATE TABLE events (
+                   id TEXT PRIMARY KEY,
+                   timestamp TEXT NOT NULL,
+                   type TEXT NOT NULL,
+                   source TEXT NOT NULL,
+                   machine_id TEXT,
+                   schema_version INTEGER DEFAULT 1,
+                   cwd TEXT,
+                   git_project TEXT,
+                   git_workspace TEXT,
+                   pane_id TEXT,
+                   tmux_session TEXT,
+                   window_index INTEGER,
+                   status TEXT,
+                   idle_duration_ms INTEGER,
+                   action TEXT,
+                   session_id TEXT,
+                   stream_id TEXT,
+                   assignment_source TEXT DEFAULT 'inferred'
+                 );
+                 INSERT INTO events (id, timestamp, type, source)
+                 VALUES ('old-1','2026-06-01T00:00:00.000Z','tmux_pane_focus','remote.tmux');",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        let events = db.get_events(None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "old-1");
+        assert_eq!(events[0].window_app_id, None);
+        assert_eq!(events[0].window_title, None);
+
+        let version = db
+            .conn
+            .query_row("SELECT version FROM schema_info LIMIT 1", [], |row| {
+                row.get::<_, i32>(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let ts = Utc.with_ymd_and_hms(2026, 6, 14, 10, 0, 0).unwrap();
+        let mut event = make_event("win-2", ts, tt_core::EventType::WindowFocus);
+        event.window_app_id = Some("slack".to_string());
+        event.window_title = Some("Team chat".to_string());
+        assert!(db.insert_event(&event).unwrap());
+
+        let events = db.get_events(None, None).unwrap();
+        let got = events.iter().find(|event| event.id == "win-2").unwrap();
+        assert_eq!(got.window_app_id.as_deref(), Some("slack"));
+        assert_eq!(got.window_title.as_deref(), Some("Team chat"));
+    }
+
+    #[test]
+    fn test_open_fails_on_newer_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("v10.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_info (version INTEGER NOT NULL);
+                 INSERT INTO schema_info (version) VALUES (10);",
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            Database::open(&db_path),
+            Err(DbError::SchemaVersionMismatch { found: 10, .. })
+        ));
+    }
+
     fn make_event_with_source(id: &str, timestamp: DateTime<Utc>, source: &str) -> StoredEvent {
         StoredEvent {
             id: id.to_string(),
@@ -2021,6 +2201,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: None,
             session_id: None,
@@ -2245,6 +2427,101 @@ mod tests {
         // Verify assignments
         let events = db.get_events_by_stream("s1").unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn test_assign_events_by_ids_assigns_requested_ids_only() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+        db.insert_event(&make_event("e1", ts, tt_core::EventType::WindowFocus))
+            .unwrap();
+        db.insert_event(&make_event("e2", ts, tt_core::EventType::WindowFocus))
+            .unwrap();
+        db.insert_event(&make_event("e3", ts, tt_core::EventType::WindowFocus))
+            .unwrap();
+        db.insert_stream(&make_stream("s1", Some("window-work")))
+            .unwrap();
+
+        let ids = vec!["e1".to_string(), "e3".to_string(), "missing".to_string()];
+        let count = db.assign_events_by_ids(&ids, "s1", "inferred").unwrap();
+
+        assert_eq!(count, 2);
+        let assigned = db.get_events_by_stream("s1").unwrap();
+        let assigned_ids: Vec<_> = assigned.iter().map(|event| event.id.as_str()).collect();
+        assert_eq!(assigned_ids, vec!["e1", "e3"]);
+        let unassigned = db.get_events_without_stream().unwrap();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].id, "e2");
+    }
+
+    #[test]
+    fn test_assign_events_by_ids_chunks_large_id_lists() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+        for index in 0..550 {
+            db.insert_event(&make_event(
+                &format!("e{index}"),
+                ts + chrono::Duration::seconds(index),
+                tt_core::EventType::WindowFocus,
+            ))
+            .unwrap();
+        }
+        db.insert_event(&make_event(
+            "left-alone",
+            ts,
+            tt_core::EventType::WindowFocus,
+        ))
+        .unwrap();
+        db.insert_stream(&make_stream("s1", Some("window-work")))
+            .unwrap();
+
+        let ids: Vec<String> = (0..550).map(|index| format!("e{index}")).collect();
+        let count = db.assign_events_by_ids(&ids, "s1", "inferred").unwrap();
+
+        assert_eq!(count, 550);
+        assert_eq!(db.get_events_by_stream("s1").unwrap().len(), 550);
+        let unassigned = db.get_events_without_stream().unwrap();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].id, "left-alone");
+    }
+
+    #[test]
+    fn test_assign_events_by_ids_preserves_user_assignments() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+        db.insert_stream(&make_stream("s_user", Some("manual")))
+            .unwrap();
+        db.insert_stream(&make_stream("s1", Some("window-work")))
+            .unwrap();
+
+        // A user-assigned event must NOT be reassigned.
+        let mut user_event = make_event("e_user", ts, tt_core::EventType::WindowFocus);
+        user_event.stream_id = Some("s_user".to_string());
+        user_event.assignment_source = Some("user".to_string());
+        db.insert_event(&user_event).unwrap();
+
+        // An unassigned event should be reassigned.
+        db.insert_event(&make_event(
+            "e_inferred",
+            ts,
+            tt_core::EventType::WindowFocus,
+        ))
+        .unwrap();
+
+        let ids = vec!["e_user".to_string(), "e_inferred".to_string()];
+        let count = db.assign_events_by_ids(&ids, "s1", "inferred").unwrap();
+
+        // Only the non-user event was updated; the user assignment is preserved.
+        assert_eq!(count, 1);
+        let user_stream = db.get_events_by_stream("s_user").unwrap();
+        assert_eq!(user_stream.len(), 1);
+        assert_eq!(user_stream[0].id, "e_user");
+        let s1 = db.get_events_by_stream("s1").unwrap();
+        let s1_ids: Vec<_> = s1.iter().map(|event| event.id.as_str()).collect();
+        assert_eq!(s1_ids, vec!["e_inferred"]);
     }
 
     #[test]

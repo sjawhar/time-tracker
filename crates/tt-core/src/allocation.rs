@@ -24,7 +24,7 @@ const UNASSIGNED_STREAM_ID: &str = "(unassigned)";
 #[derive(Debug, Clone)]
 pub struct AllocationConfig {
     /// Grace period after last focus event before direct time pauses.
-    /// Default: 60000 (1 minute).
+    /// Default: 300000 (5 minutes).
     pub attention_window_ms: i64,
 
     /// If no `agent_tool_use` for this duration after the most recent tool use,
@@ -302,6 +302,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                     }
 
                     tmux_focus_stream_id = Some(stream_id.to_string());
+                    window_focus_state.app = None;
+                    window_focus_state.stream_id = None;
                     focus_state = FocusState::Focused {
                         stream_id: stream_id.to_string(),
                         focus_start: event_time,
@@ -424,6 +426,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                     }
 
                     tmux_focus_stream_id = Some(stream_id.to_string());
+                    window_focus_state.app = None;
+                    window_focus_state.stream_id = None;
                     focus_state = FocusState::Focused {
                         stream_id: stream_id.to_string(),
                         focus_start: event_time,
@@ -492,8 +496,42 @@ pub fn allocate_time<E: AllocatableEvent>(
                     .get("app")
                     .and_then(|v| v.as_str())
                     .map(str::to_ascii_lowercase);
+
+                if let FocusState::Focused { focus_start, .. } = &focus_state {
+                    let resolved = resolve_focus_stream(
+                        &window_focus_state,
+                        tmux_focus_stream_id.as_deref(),
+                        browser_focus_state.stream_id.as_deref(),
+                    );
+                    if let Some(resolved_stream) = &resolved {
+                        let max_end =
+                            *focus_start + Duration::milliseconds(config.attention_window_ms);
+                        let actual_end = event_time.min(max_end);
+                        add_direct(
+                            resolved_stream,
+                            *focus_start,
+                            actual_end,
+                            &mut activity_intervals,
+                            &mut stream_times,
+                        );
+                    }
+                }
+
                 window_focus_state.app = app;
                 window_focus_state.stream_id = event.stream_id().map(String::from);
+
+                if let Some(stream_id) = resolve_focus_stream(
+                    &window_focus_state,
+                    tmux_focus_stream_id.as_deref(),
+                    browser_focus_state.stream_id.as_deref(),
+                ) {
+                    focus_state = FocusState::Focused {
+                        stream_id,
+                        focus_start: event_time,
+                    };
+                } else {
+                    focus_state = FocusState::Unfocused;
+                }
             }
 
             EventType::BrowserTab => {
@@ -690,7 +728,7 @@ fn is_browser_app(app: &str) -> bool {
 ///
 /// Hierarchy:
 /// - If window is a terminal app -> use tmux focus stream
-/// - If window is a browser app -> use browser tab stream
+/// - If window is a browser app -> use browser tab stream, falling back to window focus stream
 /// - Otherwise -> use window focus stream
 fn resolve_focus_stream(
     window_state: &WindowFocusState,
@@ -699,7 +737,9 @@ fn resolve_focus_stream(
 ) -> Option<String> {
     match &window_state.app {
         Some(app) if is_terminal_app(app) => tmux_stream_id.map(String::from),
-        Some(app) if is_browser_app(app) => browser_stream_id.map(String::from),
+        Some(app) if is_browser_app(app) => browser_stream_id
+            .map(String::from)
+            .or_else(|| window_state.stream_id.clone()),
         Some(_) => window_state.stream_id.clone(),
         None => tmux_stream_id.map(String::from), // Fallback to tmux if no window info
     }
@@ -1357,6 +1397,86 @@ mod tests {
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Window focus + tmux focus on same stream = 1 minute (attention window)
         assert_eq!(stream_a.time_direct_ms, 60 * 1000);
+    }
+
+    #[test]
+    fn test_window_focus_closes_prior_interval_before_updating_window_state() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::window_focus(ts(10), "slack", Some("S")),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(11)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let stream_s = get_stream_time(&result, "S").expect("Stream S should exist");
+
+        assert_eq!(stream_a.time_direct_ms, 60_000);
+        assert_eq!(stream_s.time_direct_ms, 60_000);
+    }
+
+    #[test]
+    fn test_tmux_focus_after_gui_window_does_not_use_stale_window_stream_on_finalize() {
+        let events = vec![
+            TestEvent::window_focus(ts(0), "slack", Some("S")),
+            TestEvent::tmux_focus(ts(5), "A"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let stream_s = get_stream_time(&result, "S").expect("Stream S should exist");
+
+        assert_eq!(stream_a.time_direct_ms, 60_000);
+        assert_eq!(stream_s.time_direct_ms, 60_000);
+    }
+
+    #[test]
+    fn test_window_focus_accrues_direct_time_for_gui_app() {
+        let events = vec![TestEvent::window_focus(ts(0), "slack", Some("S"))];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(1)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_s = get_stream_time(&result, "S").expect("Stream S should exist");
+        assert_eq!(stream_s.time_direct_ms, 60_000);
+    }
+
+    #[test]
+    fn test_window_focus_browser_without_tab_falls_back_to_window_stream() {
+        let events = vec![TestEvent::window_focus(ts(0), "firefox", Some("P"))];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(1)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_p = get_stream_time(&result, "P").expect("Stream P should exist");
+        assert_eq!(stream_p.time_direct_ms, 60_000);
     }
 
     #[test]

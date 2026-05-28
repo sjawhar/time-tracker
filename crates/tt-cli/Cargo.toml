@@ -30,6 +30,9 @@ fs2 = "0.4"
 regex = "1.11"
 uuid.workspace = true
 hostname.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["staging", "client"] }
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "8e84152" }
 
 [dev-dependencies]
 insta.workspace = true

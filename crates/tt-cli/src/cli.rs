@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 /// AI-native time tracker.
 ///
@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand};
 #[command(name = "tt", version, about, long_about = None)]
 pub struct Cli {
     /// Enable verbose output.
-    #[arg(short, long, global = true)]
-    pub verbose: bool,
+    #[arg(short, long, global = true, action = ArgAction::Count)]
+    pub verbose: u8,
 
     /// Path to config file.
     #[arg(short, long, global = true)]
@@ -221,6 +221,25 @@ pub enum Commands {
         /// Minimum gap duration to include (minutes).
         #[arg(long, default_value = "5")]
         gap_threshold: u32,
+    },
+
+    /// Watch the COSMIC desktop for active-window and idle events.
+    Watch {
+        /// Idle timeout in seconds before emitting an idle event.
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+
+        /// Poll interval in milliseconds.
+        #[arg(long)]
+        poll_ms: Option<u64>,
+
+        /// Print events as JSONL instead of writing to `SQLite`.
+        #[arg(long)]
+        no_write: bool,
+
+        /// Poll once, emit/write any resulting events, then exit.
+        #[arg(long)]
+        once: bool,
     },
 }
 

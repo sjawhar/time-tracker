@@ -27,15 +27,15 @@ The file will be created if it doesn't exist. Data is appended (one JSON object 
 
 ## Quick Reference
 
-0. **Classify**: Invoke classify-streams to tag untagged streams
-1. **Trends**: Show 8-week historical patterns with bar charts
-2. **Data**: Ingest sessions + fetch tt report for time breakdown
-3. **Context**: Present time tables, session summary, reflection questions
-4. **Narrate**: User speaks freely, Claude tracks and maps to structure
-5. **Structure**: Present filled form, highlight actual vs perceived gaps
-6. **Challenge**: Red team pushes back on patterns and blind spots
-7. **Save**: Append to JSONL file
-8. **Post-review actions** *(optional)*: Run user-configured follow-up instructions (e.g. 1-on-1 prep, standup draft) defined in `weekly-review.toml` `[post_review_actions]`
+1. **Classify**: Tag untagged streams — the data-integrity gate, NOT optional prep (see Phase 1). Every later number depends on it.
+2. **Trends**: Show 8-week historical patterns with bar charts
+3. **Data**: Ingest sessions + fetch tt report for time breakdown
+4. **Context**: Present time tables, session summary, reflection questions
+5. **Narrate**: User speaks freely, Claude tracks and maps to structure
+6. **Structure**: Present filled form, highlight actual vs perceived gaps
+7. **Challenge**: Red team pushes back on patterns and blind spots
+8. **Save**: Append to JSONL file
+9. **Post-review actions** *(optional)*: Run user-configured follow-up instructions (e.g. 1-on-1 prep, standup draft) defined in `weekly-review.toml` `[post_review_actions]`
 
 ## Critical Constraints
 
@@ -45,7 +45,7 @@ These rules take priority over other instructions:
 
 2. **Preserve full detail for future analysis** — Specific names, events, dates, and context are the value. Future red-teaming depends on being able to reference "Beth" or "Tuesday's planning meeting" — generic summaries lose this.
 
-3. **Confirm before phase transitions** — Always confirm with the user before moving from narration (Phase 4) to structured presentation (Phase 5). Don't assume "done" from ambiguous signals.
+3. **Confirm before phase transitions** — Always confirm with the user before moving from narration (Phase 5) to structured presentation (Phase 6). Don't assume "done" from ambiguous signals.
 
 ## Argument Parsing
 
@@ -67,7 +67,7 @@ The JSONL path is passed as the skill's `args` parameter:
 - `[goals]` — checkbox items
 - `[ratings]` — rating dimensions and scale
 - `[review]` — output path, week start day
-- `[post_review_actions]` — user-defined freeform instructions for Phase 8
+- `[post_review_actions]` — user-defined freeform instructions for Phase 9
 
 **Ontology config**: Read `~/.config/time-tracker/ontology.toml` for:
 - `projects.names[]` — valid project tags
@@ -75,9 +75,17 @@ The JSONL path is passed as the skill's `args` parameter:
 
 **Fallbacks**: If either config is missing, use sensible defaults. The review can proceed without config — it just uses built-in defaults for questions, goals, and ratings.
 
-## Phase 0: Classify Streams (Prep)
+## Phase 1: Classify Streams — DATA-INTEGRITY GATE (do not skip)
 
-**REQUIRED**: Tag untagged streams before collecting report data. This ensures `tt report` has meaningful `by_tag` groupings.
+**This is not prep. It is the gate the entire review depends on.** Tag untagged streams BEFORE collecting any report data, so `tt report`'s `by_tag` and the perceived-vs-actual comparison (Phase 6) reflect reality.
+
+### Why you cannot move on without this
+
+The only reason to pull tt data at all is to give the user an **objective check against self-delusion.** The reflection (Phases 5–6) is where the user grades their week; the tt numbers are the one thing keeping that grade honest. If a large share of the week's time is unattributed, that check is broken — the user is grading on vibes, which is the exact failure this skill exists to prevent. A review built on half-attributed data is *worse* than one with no data, because it looks grounded while being arbitrary.
+
+**Flagging the gap is NOT closing it.** Writing "⚠️ coverage caveat — treat as floors" and proceeding is the single most common failure here. It feels responsible and it ships the broken instrument anyway. Do not do it. Either the time is attributed, or you stop.
+
+### Procedure
 
 Invoke the classify-streams skill:
 
@@ -85,16 +93,20 @@ Invoke the classify-streams skill:
 /classify-streams 1 week ago
 ```
 
-This runs the full classification pipeline: load ontology, ingest sessions, identify untagged streams, classify using path heuristics + LLM, apply tags, and report results.
+Full pipeline: load ontology, ingest sessions, identify untagged streams, classify (path heuristics + LLM), apply tags, report. **Wait for it to finish** before Phase 2.
 
-**Wait for classification to complete** before proceeding to Phase 1.
+### Hard gate — do NOT advance to Phase 2 until BOTH hold
 
-**Fallback**: If classify-streams fails or is unavailable:
-1. Inform the user: "Stream classification unavailable — proceeding with existing tags. Report data may have more entries in the 'untagged' bucket."
-2. Continue to Phase 1. The review still works — just with less structured tag data.
-3. Do NOT block the entire review on classification failure.
+1. You actually ran classification (not just read the unassigned count and noted it).
+2. Unattributed time is a **small fraction** of the total (rule of thumb: < ~15% of direct time). Verify explicitly after classifying.
 
-## Phase 1: Trend Analysis
+If a big unattributed bucket remains, the streams aren't the issue — loose events aren't grouped into streams (assignment conflicts, a new cwd, an ingestion gap). Investigate and re-run; don't proceed. If you're about to present time tables with a large unattributed bucket: **STOP**, fix it, or tell the user plainly that the time data is unusable this week and why.
+
+### Fallback — genuine tool failure ONLY
+
+"It's annoying / the unclassified list is junk / I'm short on time" is **not** a valid reason to skip. The only thing that can interrupt classification is the tooling itself failing (classify-streams crashes, tt unavailable) — and even then you do **NOT** auto-skip. **STOP, tell the user the tool failed and what it means (the review's time data would be unreliable), and ask for express permission to proceed without it.** Continue only if the user explicitly grants it; then run on manual estimates only, note it in the saved entry, and do not present per-project tt numbers as if they're sound. No automatic skipping, ever — a bypass requires the user's express okay.
+
+## Phase 2: Trend Analysis
 
 1. **Load historical data** from the provided JSONL path
    - If file doesn't exist, start fresh (no historical trends to show)
@@ -145,7 +157,7 @@ print(plt.build())
 
 5. **Present trends**: "Here's how your past 8 weeks looked. Keep this in mind as you reflect."
 
-## Phase 2: Data Collection
+## Phase 3: Data Collection
 
 **CRITICAL: Run the FULL ingestion pipeline. Partial data = wrong answer. Do NOT skip steps or present incomplete numbers.**
 
@@ -191,7 +203,7 @@ tt classify --json --start "$WEEK_START" --end "$WEEK_END"
 
 This provides full session data with `summary`, `starting_prompt`, `tool_call_count`, etc.
 
-## Phase 3: Present Context
+## Phase 4: Present Context
 
 1. **Load ontology** from `~/.config/time-tracker/ontology.toml` — use `projects.names[]` and `activities.names[]` to organize the presentation.
 
@@ -235,7 +247,7 @@ Agent Sessions (Mon-Sun):
 
 5. **Prompt**: "tt says you spent X% on Development, Y% on Code Review. You had N agent sessions across M projects. Does that feel right? Start narrating your thoughts — I'll track them."
 
-## Phase 4: Free-Form Narration
+## Phase 5: Free-Form Narration
 
 **Let the user speak/type freely.** Track and map to form sections:
 
@@ -257,9 +269,9 @@ Agent Sessions (Mon-Sun):
 **Exit condition**: When user signals completion ("done", "ready", "that's it", or similar):
 1. Summarize what you've captured: "I have: 3 successes, 2 mistakes, 1 bottleneck, ratings for mental/productivity/engagement..."
 2. Ask for confirmation: "Ready to see the structured form, or want to add more?"
-3. Only proceed to Phase 5 after explicit confirmation
+3. Only proceed to Phase 6 after explicit confirmation
 
-## Phase 5: Structured Presentation
+## Phase 6: Structured Presentation
 
 1. **Present the filled-in form** with all sections organized:
 
@@ -314,12 +326,12 @@ On track (personal): Unsure
 
 5. **Ask for edits**: "Anything to adjust before we continue?"
 
-## Phase 6: Red Team Challenge
+## Phase 7: Red Team Challenge
 
 **Launch the `red-teamer` agent** (using Task tool with `subagent_type: "red-teamer"`).
 
 **Context to pass to the agent** (include all of this in the prompt):
-1. **Current week data**: The complete structured form from Phase 5 (time allocations, reflections, ratings, priorities)
+1. **Current week data**: The complete structured form from Phase 6 (time allocations, reflections, ratings, priorities)
 2. **tt data**: Actual time per tag (direct + delegated), delegation ratio, agent session counts
 3. **Historical trends**: Summary of last 8 weeks — recurring themes in successes/mistakes/bottlenecks, rating patterns, priority follow-through
 4. **Repeated patterns**: Phrases or themes that appear in multiple weeks (e.g., "communicate better" appearing 3 times)
@@ -334,7 +346,7 @@ On track (personal): Unsure
 
 **Present challenges** to the user. Let them respond and revise if needed.
 
-## Phase 7: Save
+## Phase 8: Save
 
 1. **Build the JSON object** with all collected data (see schema below)
    - Include `red_team` with challenges raised and user responses
@@ -351,7 +363,7 @@ On track (personal): Unsure
 
 4. **Show summary**: "Week of Jan 12-18 saved. Review #31."
 
-## Phase 8: Post-Review Actions (optional)
+## Phase 9: Post-Review Actions (optional)
 
 Run any user-configured follow-up actions defined in `~/.config/time-tracker/weekly-review.toml` under `[post_review_actions]`. This is the user's customizable extension point for things they always want to do at the end of a review (1-on-1 prep, drafting standup notes, queuing emails, journaling prompts, etc.).
 
@@ -368,7 +380,7 @@ instructions = """
 """
 ```
 
-If the section is missing, empty, or whitespace-only: **skip Phase 8 entirely.** Do not prompt the user. Do not ask them to configure it. Just end the review.
+If the section is missing, empty, or whitespace-only: **skip Phase 9 entirely.** Do not prompt the user. Do not ask them to configure it. Just end the review.
 
 ### Step 2: Confirm with the user
 
@@ -421,21 +433,21 @@ Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.
 
 ## Fallback Handling
 
-### Classification Failure (Phase 0)
-If classify-streams is unavailable or fails:
-1. Inform the user: "Stream classification unavailable — proceeding with existing tags"
-2. Skip Phase 0, continue to Phase 1
-3. Report data will have more entries in the "untagged" bucket — this is acceptable
+### Classification Failure (Phase 1)
+Classification is the data-integrity gate. If classify-streams is unavailable or fails, do **NOT** auto-skip and proceed — bypassing the gate requires the user's express permission.
+1. **STOP.** Tell the user: "Stream classification FAILED — I won't bypass it without your okay, because the time data for this review would be unreliable. Here's what failed: …"
+2. Ask for explicit permission to proceed without trustworthy time data.
+3. Only if the user expressly grants it: continue on manual estimates, note in the saved entry that the time data is unreliable, and do not present per-project tt numbers as sound. Otherwise, pause the review until classification can run.
 
-### tt Report Failure (Phase 2)
+### tt Report Failure (Phase 3)
 If `tt report` is unavailable or fails:
 1. Inform the user: "tt report unavailable — we'll do manual time entry"
-2. Skip Phase 2 data collection
-3. In Phase 3, present empty time allocation tables
+2. Skip Phase 3 data collection
+3. In Phase 4, present empty time allocation tables
 4. Ask user to estimate percentages directly: "How did you spend your time this week? Estimate percentages for your main activities."
-5. In Phase 7, the `tt` field will be empty/null
+5. In Phase 8, the `tt` field will be empty/null
 
-### Chart Failure (Phase 1)
+### Chart Failure (Phase 2)
 If `plotext` fails or produces garbled output:
 1. Fall back to text-based visualization:
 ```
@@ -453,11 +465,11 @@ If `~/.config/time-tracker/weekly-review.toml` is missing:
 - Use built-in defaults for reflection questions, goals, ratings
 - Log a note: "No config found — using defaults"
 If `~/.config/time-tracker/ontology.toml` is missing:
-- Skip ontology-based organization in Phase 3
+- Skip ontology-based organization in Phase 4
 - Present raw tt report data without project/activity grouping
 
-### Post-Review Actions Missing or Skipped (Phase 8)
-If `[post_review_actions]` is absent or `instructions` is empty: skip Phase 8 silently — no prompt, no warning. Phase 8 is optional by design.
+### Post-Review Actions Missing or Skipped (Phase 9)
+If `[post_review_actions]` is absent or `instructions` is empty: skip Phase 9 silently — no prompt, no warning. Phase 9 is optional by design.
 If user declines to run them at the confirmation prompt: end the review without running. Do not save the skip.
 
 ## Edge Cases
@@ -474,7 +486,7 @@ If user declines to run them at the confirmation prompt: end the review without 
 
 | Mistake | Fix |
 |---------|-----|
-| Skipping Phase 0 (classify-streams) | **Always** run classify-streams first. Tagged data makes the entire review more meaningful. |
+| Skipping Phase 1 (classify-streams) | **Always** run classify-streams first. Tagged data makes the entire review more meaningful. |
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt report`. Without it you miss most data. |
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
 | Presenting partial results | Run the FULL pipeline (ingest → sync → infer streams → recompute → report). Don't stop partway and show incomplete numbers — it's worse than no answer. |
@@ -482,17 +494,17 @@ If user declines to run them at the confirmation prompt: end the review without 
 | Calling Toggl MCP tools | Use `tt report` exclusively. tt replaces Toggl for this workflow. |
 | Hardcoding project/activity lists | Read from `~/.config/time-tracker/ontology.toml`. Never hardcode taxonomy. |
 | Condensing user prose | Preserve full text. "Not prioritizing well" loses the detail that enables red-teaming. |
-| Skipping phase confirmations | Always confirm before transitioning from narration (Phase 4) to structured (Phase 5). |
+| Skipping phase confirmations | Always confirm before transitioning from narration (Phase 5) to structured (Phase 6). |
 | Using `cargo run --` instead of `tt` | Use the `tt` binary directly. Build once if needed, then use the binary. |
 | Missing `week.start`/`week.end` | Always populate these in the JSONL output (YYYY-MM-DD format). |
 | Using `toggl` field in JSONL | Use the `tt` field. Schema uses time-tracker data, not Toggl. |
 | Rushing through narration | Let the user talk. Brief acknowledgments only. Don't lead or suggest what they should say. |
 | Including reflect-style analysis | Session pattern analysis is a separate skill. Weekly review focuses on time, goals, and reflection. |
 | Using `tt classify --json` for time data | `classify` shows sessions and clusters, not period-scoped time. Use `tt report` for time within a specific period. |
-| Running Phase 8 instructions without user confirmation | **Always** ask "Run them now? (y / skip)" before executing the freeform instructions. The instructions are opt-in per-review. |
-| Saving Phase 8 action output to JSONL | Phase 8 outputs are **ephemeral**. The just-saved review entry must remain untouched. If the user wants persistence, they update their instructions to write to a different file. |
+| Running Phase 9 instructions without user confirmation | **Always** ask "Run them now? (y / skip)" before executing the freeform instructions. The instructions are opt-in per-review. |
+| Saving Phase 9 action output to JSONL | Phase 9 outputs are **ephemeral**. The just-saved review entry must remain untouched. If the user wants persistence, they update their instructions to write to a different file. |
 | Treating absent `[post_review_actions]` as an error | It's optional. Skip silently. Don't prompt the user to configure it. |
-| Inventing follow-ups beyond user instructions | Phase 8 only does what the freeform `instructions` say. Don't add suggestions, summaries, or actions not requested. |
+| Inventing follow-ups beyond user instructions | Phase 9 only does what the freeform `instructions` say. Don't add suggestions, summaries, or actions not requested. |
 
 ## Goal Tracking Checkboxes
 
@@ -546,4 +558,4 @@ These determine how tt interprets event patterns into focus time. Adjust if you 
 
 ### After Calibration
 
-Once satisfied with accuracy, remove Toggl from Phase 2 data collection and rely solely on tt.
+Once satisfied with accuracy, remove Toggl from Phase 3 data collection and rely solely on tt.

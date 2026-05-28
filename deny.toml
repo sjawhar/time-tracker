@@ -20,7 +20,16 @@ allow = [
     "Unicode-DFS-2016",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
 ]
+
+# cosmic-client-toolkit (cctk) does not declare a license field in its Cargo.toml,
+# but the COSMIC project is published under GPL-3.0-only. See:
+# https://github.com/pop-os/cosmic-client-toolkit
+[[licenses.clarify]]
+crate = "cosmic-client-toolkit"
+expression = "GPL-3.0-only"
+license-files = []
 
 [bans]
 multiple-versions = "warn"
@@ -31,3 +40,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/pop-os/cosmic-protocols"]

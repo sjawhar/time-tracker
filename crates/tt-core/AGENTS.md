@@ -6,7 +6,7 @@ Core algorithms and types for time tracking. Pure computation + session parsing 
 
 | Module | Lines | Role |
 |--------|-------|------|
-| `allocation.rs` | 1366 | Time allocation algorithm (direct + delegated) |
+| `allocation.rs` | ~1854 | Time allocation algorithm (direct + delegated) |
 | `session.rs` | 980 | Claude Code session scanning/parsing |
 | `opencode.rs` | ~880 | OpenCode session scanning. Reads `session` from monolithic `opencode.db`; reads `message`/`part` from per-session shard at `sessions/<id>.db` when present, else from monolithic. |
 | `project.rs` | ~50 | Git remote → project name extraction |
@@ -24,7 +24,7 @@ Computes direct (human focus) and delegated (agent) time per stream.
 ### Key Types
 
 - `AllocatableEvent` — trait that `StoredEvent` (tt-db) implements. Methods: `timestamp()`, `event_type()`, `stream_id()`, `session_id()`, `action()`, `data()`
-- `AllocationConfig` — `attention_window_ms` (default 60s), `agent_timeout_ms` (default 30min)
+- `AllocationConfig` — `attention_window_ms` (default 300s / 5min; tests use 60s), `agent_timeout_ms` (default 30min)
 - `StreamTime` — result per stream: `time_direct_ms` + `time_delegated_ms`
 - `FocusState` — enum: `Focused { stream_id, focus_start }` | `Unfocused`
 - `AgentSession` — tracks per-session: `first_tool_use_at`, `last_tool_use_at`, `ended`
@@ -36,7 +36,8 @@ Computes direct (human focus) and delegated (agent) time per stream.
 - Agent sessions without tool_use events get zero delegated time
 - Agent timeout: no tool_use for `agent_timeout_ms` → session ends at last tool_use
 - `user_message` events establish focus on their stream (like `tmux_pane_focus`) — sending a message to an agent counts as direct work
-- Focus hierarchy: terminal uses tmux stream, browser uses browser stream
+- Focus hierarchy (`resolve_focus_stream`): terminal app → tmux stream; browser app → browser-tab stream, falling back to the window's own stream when there's no `browser_tab` info; other GUI app → the window's stream
+- `window_focus` establishes focus for non-terminal/non-browser GUI apps (Slack, doc/PDF readers): it closes the prior interval against the *old* window state first, then opens the new focus. Unclassified window events (no stream) accrue no time until classify assigns them
 
 ### Testing
 

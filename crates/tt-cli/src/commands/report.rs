@@ -1157,6 +1157,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: action.map(ToString::to_string),
             cwd: Some("/home/sami/time-tracker/default".to_string()),
             session_id: Some(session_id.to_string()),
