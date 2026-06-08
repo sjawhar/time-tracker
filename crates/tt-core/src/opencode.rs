@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags, params};
 
 use crate::session::{
@@ -87,120 +88,103 @@ struct MessageStats {
     last_message_time: Option<i64>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "two near-identical match arms for since/no-since are kept inline; refactoring would obscure the SQL"
-)]
+/// Open a read-only connection to the monolithic `OpenCode` database.
+///
+/// Each rayon worker opens its own connection: `NO_MUTEX` is safe because a
+/// connection is only ever used by the single thread that created it.
+fn open_monolith_ro(db_path: &Path) -> Option<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match Connection::open_with_flags(db_path, flags) {
+        Ok(conn) => {
+            if let Err(err) = conn.busy_timeout(Duration::from_secs(5)) {
+                tracing::warn!(path = ?db_path, error = %err, "failed to set OpenCode db timeout");
+                return None;
+            }
+            Some(conn)
+        }
+        Err(err) => {
+            tracing::warn!(path = ?db_path, error = %err, "failed to open OpenCode database");
+            None
+        }
+    }
+}
+
+/// Read all session metadata rows, optionally filtered to those updated after `since`.
+fn collect_session_rows(
+    conn: &Connection,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<SessionRow>, rusqlite::Error> {
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok(SessionRow {
+            id: row.get::<_, String>(0)?,
+            directory: row.get::<_, String>(1)?,
+            title: row.get::<_, String>(2)?,
+            parent_id: row.get::<_, Option<String>>(3)?,
+            time_created: row.get::<_, i64>(4)?,
+            time_updated: row.get::<_, i64>(5)?,
+        })
+    };
+
+    if let Some(ts) = since {
+        let mut stmt = conn.prepare(
+            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session \
+             WHERE time_updated > ?",
+        )?;
+        let rows = stmt.query_map(params![ts.timestamp_millis()], map_row)?;
+        rows.collect()
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session",
+        )?;
+        let rows = stmt.query_map([], map_row)?;
+        rows.collect()
+    }
+}
+
+/// Scan `OpenCode` sessions from the monolithic database.
+///
+/// Session rows are read once, then `build_agent_session` runs across a rayon
+/// thread pool — sessions are independent and read-only, so a many-core host
+/// processes them in parallel rather than serially. Each worker reuses one
+/// read-only monolith connection (for sessions without a per-session shard)
+/// via `map_init`.
 pub fn scan_opencode_sessions(
     db_path: &Path,
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<AgentSession>, SessionError> {
-    // NO_MUTEX is safe: single connection used from a single thread (no rayon).
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = match Connection::open_with_flags(db_path, flags) {
-        Ok(conn) => conn,
+    let Some(conn) = open_monolith_ro(db_path) else {
+        return Ok(Vec::new());
+    };
+
+    let sessions_dir_buf = db_path.parent().map(|p| p.join("sessions"));
+    let sessions_dir = sessions_dir_buf.as_deref();
+
+    let rows = match collect_session_rows(&conn, since) {
+        Ok(rows) => rows,
         Err(err) => {
-            tracing::warn!(path = ?db_path, error = %err, "failed to open OpenCode database");
+            tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
             return Ok(Vec::new());
         }
     };
+    drop(conn);
 
-    if let Err(err) = conn.busy_timeout(Duration::from_secs(5)) {
-        tracing::warn!(path = ?db_path, error = %err, "failed to set OpenCode db timeout");
-        return Ok(Vec::new());
-    }
-
-    let sessions_dir = db_path.parent().map(|p| p.join("sessions"));
-    let mut sessions = Vec::new();
-
-    if let Some(ts) = since {
-        let mut stmt = match conn.prepare(
-            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session \
-             WHERE time_updated > ?",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
-                return Ok(Vec::new());
-            }
-        };
-
-        match stmt.query_map(params![ts.timestamp_millis()], |row| {
-            Ok(SessionRow {
-                id: row.get::<_, String>(0)?,
-                directory: row.get::<_, String>(1)?,
-                title: row.get::<_, String>(2)?,
-                parent_id: row.get::<_, Option<String>>(3)?,
-                time_created: row.get::<_, i64>(4)?,
-                time_updated: row.get::<_, i64>(5)?,
-            })
-        }) {
-            Ok(rows) => {
-                for session_row in rows {
-                    match session_row {
-                        Ok(row) => {
-                            if let Err(err) =
-                                build_agent_session(&conn, sessions_dir.as_deref(), row)
-                                    .map(|s| sessions.push(s))
-                            {
-                                tracing::warn!(error = %err, "skipping invalid OpenCode session");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "skipping invalid OpenCode session row");
-                        }
+    let mut sessions: Vec<AgentSession> = rows
+        .into_par_iter()
+        .map_init(
+            || open_monolith_ro(db_path),
+            |thread_conn, row| {
+                let conn = thread_conn.as_ref()?;
+                match build_agent_session(conn, sessions_dir, row) {
+                    Ok(session) => Some(session),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "skipping invalid OpenCode session");
+                        None
                     }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
-                return Ok(Vec::new());
-            }
-        }
-    } else {
-        let mut stmt = match conn.prepare(
-            "SELECT id, directory, title, parent_id, time_created, time_updated FROM session",
-        ) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
-                return Ok(Vec::new());
-            }
-        };
-
-        match stmt.query_map([], |row| {
-            Ok(SessionRow {
-                id: row.get::<_, String>(0)?,
-                directory: row.get::<_, String>(1)?,
-                title: row.get::<_, String>(2)?,
-                parent_id: row.get::<_, Option<String>>(3)?,
-                time_created: row.get::<_, i64>(4)?,
-                time_updated: row.get::<_, i64>(5)?,
-            })
-        }) {
-            Ok(rows) => {
-                for session_row in rows {
-                    match session_row {
-                        Ok(row) => {
-                            if let Err(err) =
-                                build_agent_session(&conn, sessions_dir.as_deref(), row)
-                                    .map(|s| sessions.push(s))
-                            {
-                                tracing::warn!(error = %err, "skipping invalid OpenCode session");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "skipping invalid OpenCode session row");
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(path = ?db_path, error = %err, "failed to iterate OpenCode sessions");
-                return Ok(Vec::new());
-            }
-        }
-    }
+            },
+        )
+        .flatten()
+        .collect();
 
     sessions.sort_by_key(|e| e.start_time);
     Ok(sessions)
@@ -218,8 +202,15 @@ fn build_agent_session(
     let shard_conn = open_session_shard(sessions_dir, &session_row.id);
     let stats_conn = shard_conn.as_ref().unwrap_or(main_conn);
     let message_stats = collect_message_stats(stats_conn, &session_row.id)?;
-    let tool_call_count = count_tool_calls(stats_conn, &session_row.id)?;
     let tool_call_timestamps = collect_tool_call_timestamps(stats_conn, &session_row.id)?;
+    // Derive the tool-call count from the timestamps we already fetched. Only
+    // when the timestamp list hit its cap do we run the separate COUNT(*), so
+    // the common case avoids a second scan of the session's `part` rows.
+    let tool_call_count = if tool_call_timestamps.len() < MAX_TOOL_CALL_TIMESTAMPS {
+        i32::try_from(tool_call_timestamps.len()).unwrap_or(i32::MAX)
+    } else {
+        count_tool_calls(stats_conn, &session_row.id)?
+    };
     let message_count = message_stats
         .user_message_count
         .saturating_add(message_stats.assistant_message_count);
@@ -353,16 +344,20 @@ fn collect_message_stats(
     conn: &Connection,
     session_id: &str,
 ) -> Result<MessageStats, SessionError> {
-    let mut message_stmt = conn.prepare_cached(
-        "SELECT id, time_created, \
-                CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END as role \
-         FROM message WHERE session_id = ?1 ORDER BY time_created",
-    )?;
-    let mut part_stmt = conn.prepare_cached(
-        "SELECT CASE WHEN json_valid(data) THEN json_extract(data, '$.text') END as text \
-         FROM part WHERE message_id = ?1 AND json_valid(data) \
-         AND json_extract(data, '$.type') = 'text' \
-         ORDER BY id",
+    // One pass: join each message to its text parts (if any). The LEFT JOIN
+    // keeps messages with no text part (assistant/tool-only messages) so the
+    // message counts and `last_message_time` stay correct, collapsing what was
+    // previously one `part` query per user message into a single query.
+    let mut stmt = conn.prepare_cached(
+        "SELECT m.id, m.time_created, \
+                CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END as role, \
+                CASE WHEN json_valid(p.data) AND json_extract(p.data, '$.type') = 'text' \
+                     THEN json_extract(p.data, '$.text') END as text \
+         FROM message m \
+         LEFT JOIN part p ON p.message_id = m.id \
+             AND json_valid(p.data) AND json_extract(p.data, '$.type') = 'text' \
+         WHERE m.session_id = ?1 \
+         ORDER BY m.time_created, m.id, p.id",
     )?;
 
     let mut stats = MessageStats {
@@ -374,61 +369,74 @@ fn collect_message_stats(
         last_message_time: None,
     };
 
-    let messages = message_stmt.query_map([session_id], |row| {
+    let rows = stmt.query_map([session_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?;
 
-    for message in messages {
-        let (message_id, created_ms, role) = message?;
-        let Some(role) = role else {
-            continue;
-        };
-        stats.last_message_time = Some(created_ms);
-        match role.as_str() {
-            "user" => {
-                stats.user_message_count = stats.user_message_count.saturating_add(1);
+    // Rows for the same message are contiguous (ordered by time, id). Buffer
+    // each message's text parts, flushing when the message id changes.
+    let mut cur_id: Option<String> = None;
+    let mut cur_created: i64 = 0;
+    let mut cur_role: Option<String> = None;
+    let mut cur_texts: Vec<String> = Vec::new();
 
-                let text = collect_text_parts(&mut part_stmt, &message_id)?;
-                if !text.is_empty() {
-                    if stats.starting_prompt.is_none() {
-                        stats.starting_prompt = Some(truncate_prompt(&text));
-                    }
-                    if stats.user_prompts.len() < MAX_USER_PROMPTS {
-                        stats.user_prompts.push(truncate_prompt(&text));
-                    }
-                    if stats.user_message_timestamps.len() < MAX_USER_MESSAGE_TIMESTAMPS {
-                        if let Some(ts) = unix_ms_to_datetime(created_ms) {
-                            stats.user_message_timestamps.push(ts);
-                        }
-                    }
-                }
+    for row in rows {
+        let (id, created_ms, role, text) = row?;
+        if cur_id.as_deref() != Some(id.as_str()) {
+            if cur_id.is_some() {
+                flush_message(&mut stats, cur_role.as_deref(), cur_created, &cur_texts);
             }
-            "assistant" => {
-                stats.assistant_message_count = stats.assistant_message_count.saturating_add(1);
-            }
-            _ => {}
+            cur_id = Some(id);
+            cur_created = created_ms;
+            cur_role = role;
+            cur_texts.clear();
         }
+        if let Some(text) = text {
+            cur_texts.push(text);
+        }
+    }
+    if cur_id.is_some() {
+        flush_message(&mut stats, cur_role.as_deref(), cur_created, &cur_texts);
     }
 
     Ok(stats)
 }
 
-fn collect_text_parts(
-    part_stmt: &mut rusqlite::Statement<'_>,
-    message_id: &str,
-) -> Result<String, SessionError> {
-    let text_parts = part_stmt.query_map([message_id], |row| row.get::<_, Option<String>>(0))?;
-    let mut text_values = Vec::new();
-    for part in text_parts {
-        if let Some(text) = part? {
-            text_values.push(text);
+/// Fold a single grouped message into the running stats, mirroring the original
+/// per-message logic: messages without a valid role are ignored entirely.
+fn flush_message(stats: &mut MessageStats, role: Option<&str>, created_ms: i64, texts: &[String]) {
+    let Some(role) = role else {
+        return;
+    };
+    stats.last_message_time = Some(created_ms);
+    match role {
+        "user" => {
+            stats.user_message_count = stats.user_message_count.saturating_add(1);
+            let text = texts.join("\n");
+            if !text.is_empty() {
+                if stats.starting_prompt.is_none() {
+                    stats.starting_prompt = Some(truncate_prompt(&text));
+                }
+                if stats.user_prompts.len() < MAX_USER_PROMPTS {
+                    stats.user_prompts.push(truncate_prompt(&text));
+                }
+                if stats.user_message_timestamps.len() < MAX_USER_MESSAGE_TIMESTAMPS {
+                    if let Some(ts) = unix_ms_to_datetime(created_ms) {
+                        stats.user_message_timestamps.push(ts);
+                    }
+                }
+            }
         }
+        "assistant" => {
+            stats.assistant_message_count = stats.assistant_message_count.saturating_add(1);
+        }
+        _ => {}
     }
-    Ok(text_values.join("\n"))
 }
 
 #[cfg(test)]
