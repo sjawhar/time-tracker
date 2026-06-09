@@ -26,6 +26,7 @@ The config covers (in prose):
 - **Remotes** — which machines to sync, which to skip
 - **Stream conventions** — commonly reused stream names worth pre-loading
 - **Tone/format preferences** — user-specific style notes that apply every day
+- **Weekly priorities** — where this week's goals live (data, not config): `~/.local/share/time-tracker/daily-standups/w<WEEK>/priorities.md`, seeded from the review machine over SSH. Drives the Weekly Priority Check (Phase 7).
 
 **If the config is missing**, ask the user to create one before proceeding. See the Setup section at the bottom for a template.
 
@@ -63,15 +64,18 @@ digraph standup {
   ingest [label="2. Ingest + sync remotes\n(skip per config)"];
   gather [label="3. Gather context\ntt classify --json"];
   analyze [label="4. Create streams\n(infer-streams)"];
-  compute [label="5. Get computed time\ntt report --last-day --json"];
-  prs [label="6. Look up PRs\n(private repos via local clone)"];
-  filter [label="7. Filter to audience\n(include/exclude from config)"];
-  ask [label="8. Ask user\n(plans? blockers?)"];
-  draft [label="9. Draft + show user"];
-  iterate [label="10. Iterate with user"];
-  post [label="11. Post via blocks\n(slack-bot MCP)"];
+  coverage [label="5. Coverage gate\n(all activity assigned)"];
+  compute [label="6. Get computed time\ntt report --last-day + --week --json"];
+  prio [label="7. Weekly priority check\n(curious debugging beat)"];
+  prs [label="8. Look up PRs\n(private repos via local clone)"];
+  filter [label="9. Filter to audience\n(include/exclude from config)"];
+  ask [label="10. Ask user\n(plans? blockers?)"];
+  draft [label="11. Draft + show user"];
+  iterate [label="12. Iterate with user"];
+  post [label="13. Post via blocks\n(slack-bot MCP)"];
+  archive [label="14. Archive\nw<WEEK>/<DATE>.md"];
 
-  cfg -> start -> ingest -> gather -> analyze -> compute -> prs -> filter -> ask -> draft -> iterate -> post;
+  cfg -> start -> ingest -> gather -> analyze -> coverage -> compute -> prio -> prs -> filter -> ask -> draft -> iterate -> post -> archive;
 }
 ```
 
@@ -80,14 +84,13 @@ digraph standup {
 Use the timezone from your config (Timezone section). Compute the standup day boundary at midnight in that zone.
 
 ```bash
-# Read the user's local timezone offset from the config (or just check the markdown).
-# Yesterday in user's local timezone, converted to UTC:
-OFFSET=8  # for Asia/Singapore (UTC+8); read from config
-START=$(date -u -d "yesterday 00:00 UTC+$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
-END=$(date -u -d "today 00:00 UTC+$OFFSET" +%Y-%m-%dT%H:%M:%SZ)
+# Parse the standup day boundary at midnight in your config's timezone.
+ZONE=<your-timezone>   # from config (Timezone section), e.g. America/New_York
+START=$(TZ=$ZONE date -d "yesterday 00:00" -u +%Y-%m-%dT%H:%M:%SZ)
+END=$(TZ=$ZONE date -d "today 00:00" -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
-If your zone is UTC+8: yesterday 00:00 local = previous day 16:00 UTC.
+For a UTC-5 zone: yesterday 00:00 local = yesterday 05:00 UTC.
 
 ## Phase 2: Ingest + Sync Remotes
 
@@ -150,17 +153,49 @@ Look up existing streams matching your common patterns:
 sqlite3 ~/.local/share/time-tracker/tt.db "SELECT id, name FROM streams ORDER BY name;"
 ```
 
-## Phase 5: Get Computed Time
+## Phase 5: Coverage Gate (MANDATORY — do not skip)
+
+`tt report` only attributes time to events that belong to a stream. Events with no
+stream are surfaced in an **`(unassigned)`** bucket (and `totals.unassigned_*_ms`), but
+are NOT broken down by project. Auto-assign-by-cwd (run during `tt sync`) only matches
+cwds already linked to a stream, so any NEW cwd stays unassigned. If most of the day is
+unassigned, the per-project numbers are meaningless — this is the failure mode that once
+made a 12h "all one stream" report hide ~128h of real activity.
+
+Before trusting ANY time number, verify coverage against the raw events:
+
+```bash
+# START/END = your local window (same as Phase 3)
+DB=~/.local/share/time-tracker/tt.db
+sqlite3 "$DB" "SELECT COALESCE(stream_id,'NULL') AS sid, cwd, COUNT(*) AS n
+  FROM events WHERE timestamp >= '$START' AND timestamp < '$END'
+  GROUP BY sid, cwd ORDER BY n DESC LIMIT 40;"
+```
+
+If any cwd with meaningful activity has `stream_id = NULL`, **GO BACK to Phase 4** and
+classify those sessions before computing time. After `tt report`, also check that
+`totals.unassigned_direct_ms + totals.unassigned_delegated_ms` is a small fraction of the
+total. If the `(unassigned)` bucket is large, the report is INCOMPLETE — classify,
+recompute, and re-pull. Never report per-project time off an uncovered day.
+
+**The coverage gate applies to the WEEK, not just the day.** The Weekly Priority Check (Phase 7) reads `tt report --week`, so run this same coverage check across the whole week window (Mon→now), not just yesterday. A brand-new working directory (e.g. a freshly-cloned sub-project or new worktree) starts out unassigned to any stream and silently vanishes from the totals — close that gap before trusting the priority proportions.
+
+## Phase 6: Get Computed Time
 
 **MANDATORY GATE: no time numbers without this step.**
 
 ```bash
-tt report --last-day --json > /tmp/report-yesterday.json
+# NOTE: tt report defaults to Etc/UTC. Force your config's timezone ($ZONE from Phase 1)
+# so the day/week boundaries are correct.
+TZ=$ZONE tt report --last-day --json > /tmp/report-yesterday.json
+# ALSO pull the current week so far (Mon→now) for the Weekly Priority Check (Phase 7):
+TZ=$ZONE tt report --week --json > /tmp/report-thisweek.json
 ```
 
 Sources of time data in the JSON (all in milliseconds):
 
 - `totals.time_direct_ms` / `totals.time_delegated_ms` — full-day totals
+- `totals.unassigned_direct_ms` / `totals.unassigned_delegated_ms` — activity not assigned to any stream. If non-trivial, STOP and return to the Coverage Gate (Phase 5).
 - `by_tag[]` — direct/delegated per tag. Unique tags (e.g. a per-PR tag) give per-stream split. Multi-stream tags need stream-level slicing.
 - For per-stream split when multiple streams share a tag: use the human report `tt report --last-day` (shows stream totals).
 
@@ -171,7 +206,52 @@ Convert ms → hours:
 jq '.by_tag[] | {tag, h_direct: (.time_direct_ms / 3600000 * 10 | floor / 10), h_delegated: (.time_delegated_ms / 3600000 * 10 | floor / 10)}' /tmp/report-yesterday.json
 ```
 
-## Phase 6: Look Up PRs
+## Phase 7: Weekly Priority Check (the opening beat)
+
+**This is the first thing you present to the user each morning** — but it needs the week's computed time, so operationally it runs after the silent data pipeline (Phases 1–5). Everything before this is prep the user doesn't see.
+
+Its job: keep this week's priorities front-of-mind and catch drift **early, while there's still a week to steer**. It is NOT a status report and NOT a gotcha.
+
+### Step 1 — Load this week's priorities
+
+This week's working file lives at `~/.local/share/time-tracker/daily-standups/w<WEEK>/priorities.md` — `<WEEK>` is the ISO week number (`TZ=<your-zone> date +%V`; e.g. Mon 2026-06-08 → `w24`). The day's standup is archived beside it as `<DATE>.md` (Phase 14). Two sources, merged:
+
+1. **Local working file** `…/daily-standups/w<WEEK>/priorities.md` — priorities + `[ ]`/`[x]` checkboxes. Read it first; create the `w<WEEK>/` dir if this is the first standup of a new week.
+2. **Latest weekly review** (the baseline) — the review runs on another machine with no cloud sync, so pull it over SSH (host/path from the config's *Weekly priorities* section):
+   ```bash
+   ssh <review-host> tail -1 ~/.local/share/time-tracker/weekly-reviews.jsonl \
+     | jq '{week: .week, priorities: .next_week.priorities}'
+   ```
+   - If the review's `week.start` is **newer** than the local file's week → a new week began: reseed the local file from `next_week.priorities`, carry forward any unchecked items the user still wants, note the new week.
+   - If **same week** → the local file is authoritative (it holds the user's live edits + checkboxes); use the review only to fill gaps.
+3. **Live adds** — the user may paste new/changed priorities at any standup (priorities drift mid-week). Write them straight into the local file.
+
+### Step 2 — Show priorities + where the week's time actually went
+
+Render the priority list with checkboxes (checked items stay listed but are **not** nagged). Alongside, show where the week's tracked time went, from `/tmp/report-thisweek.json` (pulled in Phase 6):
+
+- Per-tag hours (`by_tag[]`), plus the top streams (from the human `tt report --week` — per-stream time is not in the JSON).
+- **Honesty rule:** most of these priorities (1:1s, people/strategy/research questions) will have **no tt signal at all** — they're off-keyboard. Do NOT fabricate a per-priority percentage. Show where time *did* go, lay it next to the priorities, and reason about alignment. Attach hours to a priority only when it cleanly maps to a stream/tag.
+
+### Step 3 — The reconciliation (curious debugging, NOT a verdict)
+
+This is the experimental heart of the beat. **You will frequently be factually wrong** — you can't see off-keyboard work, you don't know whether a big time-sink is secretly *in service of* a priority, and your stream→priority mapping is a guess. So run it as **collaborative debugging**, never judgment:
+
+- State what you see **as a hypothesis you expect to be wrong**, then ask. ("Your biggest time sink this week isn't on your priority list — is it in service of one of them, or pulling you off?")
+- For every priority with no tracked time, ask: **off-keyboard (I'll tick it), or not started?** Never assume "not done."
+- For every big time-sink not on the list, ask what it's *for* — don't label it drift.
+- Name your own likely mapping errors ("I mapped this stream to that priority, but they may not be the same thing — did I get that wrong?").
+- Treat every mismatch as one of three things and figure out which **with the user**: (a) my data/mapping is wrong, (b) it's real off-keyboard work, (c) genuine drift. Only (c) is a problem — and even then, early in the week it's a steer, not a scolding.
+- **No shame, no moralizing.** The frame is "let's catch drift early," not "you failed."
+- When the user answers, **update the local file**: tick `[x]`, add off-keyboard notes, promote/drop carried-from-review items, record new priorities.
+
+### Step 4 — Carry into the day
+
+The priority check informs the **Today** section (Phase 10): today's plan should connect to the live priorities (or consciously not — the user's call).
+
+**This whole phase is private — it is never posted to Slack.** The Slack standup (Yesterday / Today / Blockers) is unchanged.
+
+## Phase 8: Look Up PRs
 
 For private repos listed in the "Repos to look up PRs in" section of your config, use the local clone (since `gh search prs --author=@me` can't see them):
 
@@ -196,7 +276,7 @@ gh search prs --author=@me --updated=">=$(date -u -d "yesterday" +%Y-%m-%d)" --j
 - ❌ `<https://example.com/repo/pull/123|#123>` — link text is uninformative
 - ❌ Bare `https://example.com/repo/pull/123` — giant URL clutter
 
-## Phase 7: Filter to Audience
+## Phase 9: Filter to Audience
 
 Use the include/exclude guidance from your config. After classification:
 
@@ -208,7 +288,7 @@ If filtering drops significant time (e.g. several hours of excluded work): **do 
 
 If you're unsure whether a stream belongs: **leave it out**. The user can ask to add it back during iteration.
 
-## Phase 8: Ask the User Two Things
+## Phase 10: Ask the User Two Things
 
 Before drafting, ask:
 
@@ -217,9 +297,9 @@ Before drafting, ask:
 
 If user gave plans in their initial invocation, skip the question.
 
-## Phase 9: Draft
+## Phase 11: Draft
 
-Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 11).
+Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 13).
 
 **Template:**
 
@@ -243,14 +323,14 @@ Draft using Slack mrkdwn so the user can read it easily. The structure must map 
 
 **Writing rules:**
 
-- Top-level bullets: `-` flush left. Sub-bullets: two-space indent then `-`. This maps to `rich_text_list` with `indent: 0` and `indent: 1` (see Phase 11).
+- Top-level bullets: `-` flush left. Sub-bullets: two-space indent then `-`. This maps to `rich_text_list` with `indent: 0` and `indent: 1` (see Phase 13).
 - Exactly one blank line after the header line (`*Standup - ...*`). **No blank lines elsewhere** — sections (`*Yesterday*`, `*Today*`, `*Blockers*`) and projects flow directly without spacing.
 - Bold: `*…*` (single asterisks). `**…**` renders as literal asterisks in Slack mrkdwn.
 - Hyperlinks: `<url|friendly outcome description>`. Never bare URLs, never `<url|#NNNN>`.
 - Time: copy ms→h from `tt report` exactly. Use 1 decimal (`9h`, `2.5h`, `~30m`). Drop the time annotation entirely when the user says times are wrong or unreliable.
 - Apply any user-specific layers from the personal config's *Format / tone preferences* section (e.g., theme song line, post-content additions). The skill template above is the generic baseline.
 
-## Phase 10: Iterate with User
+## Phase 12: Iterate with User
 
 Show the draft and ask for edits. **Expect 1–3 rounds** — common revisions:
 
@@ -261,8 +341,8 @@ Show the draft and ask for edits. **Expect 1–3 rounds** — common revisions:
 
 Each iteration, re-show the full draft (not a diff). Don't post until the user has explicitly approved the content.
 
-After content approval, apply any post-approval steps your personal config defines under *Format / tone preferences* before moving to Phase 11. The skill stops at content; the config owns the personal layers.
-## Phase 11: Post to Slack
+After content approval, apply any post-approval steps your personal config defines under *Format / tone preferences* before moving to Phase 13. The skill stops at content; the config owns the personal layers.
+## Phase 13: Post to Slack
 
 **Use the slack-bot MCP `conversations_add_message` tool with the `blocks` parameter.** This bypasses the markdown converter and posts native Block Kit `rich_text`. Requires slack-mcp-server v1.3.0+. See the `slack-bot` skill for the full Block Kit reference — the short version follows.
 
@@ -311,6 +391,21 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
   -d "{\"channel\": \"<channel_id>\", \"ts\": \"<message_ts>\"}"'
 ```
 
+## Phase 14: Archive the Day
+
+Save the day's standup so the week builds a readable history (and tomorrow's standup can reference it).
+
+```bash
+ZONE=<your-timezone>                 # from config (Timezone section)
+WEEK=$(TZ=$ZONE date +%V)            # ISO week (posting day)
+DATE=$(TZ=$ZONE date +%Y-%m-%d)      # posting day
+DIR=~/.local/share/time-tracker/daily-standups/w$WEEK
+mkdir -p "$DIR"
+# Write the approved standup + a short priority-check summary to: $DIR/$DATE.md
+```
+
+`<DATE>.md` holds: the posted standup (Yesterday / Today / Blockers) plus a brief Weekly Priority Check summary (what was ticked off, what's off-keyboard, any drift noted). It's the private daily record; `priorities.md` in the same dir is the live week tracker. Never post this archive to Slack.
+
 ## Common Mistakes (DO NOT REPEAT)
 
 | Mistake | Fix |
@@ -336,6 +431,11 @@ secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/ch
 | Literal `•` / `◦` characters in posted text | Use Block Kit `rich_text_list` with `indent: 0` / `indent: 1`. Slack renders the bullet glyphs from the list structure. Literal characters break copy/paste, accessibility, and search. |
 | Blank lines between sections (`*Yesterday*` → `*Today*`) | Only ONE blank line in the entire message: after the header line. Section transitions are `rich_text_section` elements with `\n` + bold label + `\n`. |
 | Sending the draft markdown text directly via `text` or `content_type: "text/plain"` | Convert the approved draft to Block Kit `rich_text` JSON and send via `blocks`. The draft's `-` / `  -` indentation maps to `rich_text_list` indent 0 / 1. |
+| Weekly Priority Check delivered as a verdict ("you're off-track") | It's collaborative debugging. State observations as hypotheses you expect to be wrong; ask what's really going on. No shame, no moralizing. |
+| Assuming a priority with no `tt` time wasn't done | Ask: off-keyboard (tick it) or not started? You can't see 1:1s, calls, thinking. |
+| Inventing a per-priority % | Most priorities have no `tt` signal. Show where time *did* go and reason about alignment; attach hours only when a priority cleanly maps to a stream/tag. |
+| Coverage-gating only yesterday | The priority beat reads `tt report --week`; run the same coverage check (Phase 5) across the whole week (Mon→now), not just yesterday, or new working directories stay unattributed and skew the proportions. |
+| Editing `priorities.md` beyond what the user said | Only tick/add/drop based on what the user actually confirmed this standup. Carried-from-review items stay in their "confirm" section until confirmed. |
 
 ## Example Output
 
