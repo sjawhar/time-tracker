@@ -57,6 +57,10 @@ pub struct ReportData {
     pub tags_by_stream: HashMap<String, Vec<String>>,
     /// Agent sessions overlapping the report period.
     pub agent_sessions: Vec<AgentSession>,
+    /// Direct (human attention) time on activity not assigned to any stream.
+    pub unassigned_direct_ms: i64,
+    /// Delegated (agent) time on activity not assigned to any stream.
+    pub unassigned_delegated_ms: i64,
 }
 
 const DEFAULT_WEEK_START_DAY: &str = "monday";
@@ -332,13 +336,24 @@ pub fn generate_report_data_for_date(
         .map(|session| (session.session_id.clone(), session.session_type))
         .collect();
 
+    // Known session end times so delegated time uses the real end instead of the timeout
+    // heuristic (mirrors recompute). Without this, report delegated time can be inaccurate.
+    let session_end_times: HashMap<String, DateTime<Utc>> = agent_sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .end_time
+                .map(|end| (session.session_id.clone(), end))
+        })
+        .collect();
+
     // Calculate time from events using the allocation algorithm
     let config = AllocationConfig::default();
     let result = allocate_time(
         &events,
         &config,
         Some(period_end),
-        &HashMap::new(),
+        &session_end_times,
         &session_types,
     );
 
@@ -375,6 +390,8 @@ pub fn generate_report_data_for_date(
         streams,
         tags_by_stream,
         agent_sessions,
+        unassigned_direct_ms: result.unassigned_direct_ms,
+        unassigned_delegated_ms: result.unassigned_delegated_ms,
     })
 }
 
@@ -463,7 +480,10 @@ pub fn format_report(data: &ReportData) -> String {
     let agent_session_summary =
         build_agent_session_summary(&data.agent_sessions, data.period_start, data.period_end);
 
-    if data.streams.is_empty() {
+    if data.streams.is_empty()
+        && data.unassigned_direct_ms == 0
+        && data.unassigned_delegated_ms == 0
+    {
         // Empty period
         let period_word = match data.period_type {
             PeriodType::Week => "week",
@@ -478,8 +498,14 @@ pub fn format_report(data: &ReportData) -> String {
     }
 
     // Calculate totals
-    let total_direct: i64 = data.streams.iter().map(|s| s.time_direct_ms).sum();
-    let total_delegated: i64 = data.streams.iter().map(|s| s.time_delegated_ms).sum();
+    let total_direct: i64 =
+        data.streams.iter().map(|s| s.time_direct_ms).sum::<i64>() + data.unassigned_direct_ms;
+    let total_delegated: i64 = data
+        .streams
+        .iter()
+        .map(|s| s.time_delegated_ms)
+        .sum::<i64>()
+        + data.unassigned_delegated_ms;
     let total_time = total_direct + total_delegated;
 
     let tag_entries = build_tag_entries(&data.streams, &data.tags_by_stream);
@@ -495,6 +521,7 @@ pub fn format_report(data: &ReportData) -> String {
         }
     }
     let untagged_total_ms = untagged_direct_ms + untagged_delegated_ms;
+    let unassigned_total_ms = data.unassigned_direct_ms + data.unassigned_delegated_ms;
 
     let max_total = if tag_entries.is_empty() {
         total_time
@@ -504,7 +531,7 @@ pub fn format_report(data: &ReportData) -> String {
             .map(|entry| entry.time_direct_ms + entry.time_delegated_ms)
             .max()
             .unwrap_or(0);
-        std::cmp::max(max_tag_total, untagged_total_ms)
+        std::cmp::max(max_tag_total, untagged_total_ms).max(unassigned_total_ms)
     };
 
     // BY TAG section
@@ -551,6 +578,37 @@ pub fn format_report(data: &ReportData) -> String {
         format_duration(untagged_delegated_ms)
     )
     .unwrap();
+
+    // Unassigned section: activity not attributed to any stream. Surfaced loudly so a report
+    // built mostly from unclassified events can never look complete-but-empty.
+    if unassigned_total_ms > 0 {
+        writeln!(output).unwrap();
+        let unassigned_total = format_duration(unassigned_total_ms);
+        let unassigned_bar = progress_bar(unassigned_total_ms, max_total);
+        writeln!(
+            output,
+            "{:<42}{:>7}  {}",
+            "(unassigned)", unassigned_total, unassigned_bar
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  Direct:    {}",
+            format_duration(data.unassigned_direct_ms)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  Delegated: {}",
+            format_duration(data.unassigned_delegated_ms)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "  Not assigned to any stream. Run 'tt classify' to attribute this time."
+        )
+        .unwrap();
+    }
 
     // Sessions list
     writeln!(output, "  Sessions:").unwrap();
@@ -674,6 +732,10 @@ pub struct JsonTotals {
     pub time_direct_ms: i64,
     pub time_delegated_ms: i64,
     pub stream_count: usize,
+    /// Direct time on activity not assigned to any stream (subset of `time_direct_ms`).
+    pub unassigned_direct_ms: i64,
+    /// Delegated time on activity not assigned to any stream (subset of `time_delegated_ms`).
+    pub unassigned_delegated_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -752,8 +814,14 @@ fn build_json_report(data: &ReportData) -> JsonReport {
         .format("%Y-%m-%d")
         .to_string();
 
-    let total_direct: i64 = data.streams.iter().map(|s| s.time_direct_ms).sum();
-    let total_delegated: i64 = data.streams.iter().map(|s| s.time_delegated_ms).sum();
+    let total_direct: i64 =
+        data.streams.iter().map(|s| s.time_direct_ms).sum::<i64>() + data.unassigned_direct_ms;
+    let total_delegated: i64 = data
+        .streams
+        .iter()
+        .map(|s| s.time_delegated_ms)
+        .sum::<i64>()
+        + data.unassigned_delegated_ms;
     let agent_sessions =
         build_agent_session_summary(&data.agent_sessions, data.period_start, data.period_end);
 
@@ -792,6 +860,8 @@ fn build_json_report(data: &ReportData) -> JsonReport {
             time_direct_ms: total_direct,
             time_delegated_ms: total_delegated,
             stream_count: data.streams.len(),
+            unassigned_direct_ms: data.unassigned_direct_ms,
+            unassigned_delegated_ms: data.unassigned_delegated_ms,
         },
     }
 }
@@ -1137,66 +1207,70 @@ mod tests {
         let second_start = weeks[1]["period"]["start"].as_str().unwrap();
         assert!(first_start > second_start);
 
-        assert_snapshot!(output, @r###"
-{
-  "weeks": [
-    {
-      "generated_at": "2025-02-05T12:00:00+00:00",
-      "timezone": "Etc/UTC",
-      "week_start_day": "monday",
-      "period": {
-        "start": "2025-02-03",
-        "end": "2025-02-09",
-        "type": "week"
-      },
-      "by_tag": [],
-      "untagged": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "streams": []
-      },
-      "agent_sessions": {
-        "total": 0,
-        "by_source": {},
-        "by_type": {},
-        "top_sessions": []
-      },
-      "totals": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "stream_count": 0
-      }
-    },
-    {
-      "generated_at": "2025-02-05T12:00:00+00:00",
-      "timezone": "Etc/UTC",
-      "week_start_day": "monday",
-      "period": {
-        "start": "2025-01-27",
-        "end": "2025-02-02",
-        "type": "week"
-      },
-      "by_tag": [],
-      "untagged": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "streams": []
-      },
-      "agent_sessions": {
-        "total": 0,
-        "by_source": {},
-        "by_type": {},
-        "top_sessions": []
-      },
-      "totals": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "stream_count": 0
-      }
-    }
-  ]
-}
-"###);
+        assert_snapshot!(output, @r#"
+        {
+          "weeks": [
+            {
+              "generated_at": "2025-02-05T12:00:00+00:00",
+              "timezone": "Etc/UTC",
+              "week_start_day": "monday",
+              "period": {
+                "start": "2025-02-03",
+                "end": "2025-02-09",
+                "type": "week"
+              },
+              "by_tag": [],
+              "untagged": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "streams": []
+              },
+              "agent_sessions": {
+                "total": 0,
+                "by_source": {},
+                "by_type": {},
+                "top_sessions": []
+              },
+              "totals": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "stream_count": 0,
+                "unassigned_direct_ms": 0,
+                "unassigned_delegated_ms": 0
+              }
+            },
+            {
+              "generated_at": "2025-02-05T12:00:00+00:00",
+              "timezone": "Etc/UTC",
+              "week_start_day": "monday",
+              "period": {
+                "start": "2025-01-27",
+                "end": "2025-02-02",
+                "type": "week"
+              },
+              "by_tag": [],
+              "untagged": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "streams": []
+              },
+              "agent_sessions": {
+                "total": 0,
+                "by_source": {},
+                "by_type": {},
+                "top_sessions": []
+              },
+              "totals": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "stream_count": 0,
+                "unassigned_direct_ms": 0,
+                "unassigned_delegated_ms": 0
+              }
+            }
+          ]
+        }
+        "#);
     }
 
     #[test]
@@ -1221,93 +1295,99 @@ mod tests {
         assert!(first_start > second_start);
         assert!(second_start > third_start);
 
-        assert_snapshot!(output, @r###"
-{
-  "weeks": [
-    {
-      "generated_at": "2025-02-05T12:00:00+00:00",
-      "timezone": "Etc/UTC",
-      "week_start_day": "monday",
-      "period": {
-        "start": "2025-02-03",
-        "end": "2025-02-09",
-        "type": "week"
-      },
-      "by_tag": [],
-      "untagged": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "streams": []
-      },
-      "agent_sessions": {
-        "total": 0,
-        "by_source": {},
-        "by_type": {},
-        "top_sessions": []
-      },
-      "totals": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "stream_count": 0
-      }
-    },
-    {
-      "generated_at": "2025-02-05T12:00:00+00:00",
-      "timezone": "Etc/UTC",
-      "week_start_day": "monday",
-      "period": {
-        "start": "2025-01-27",
-        "end": "2025-02-02",
-        "type": "week"
-      },
-      "by_tag": [],
-      "untagged": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "streams": []
-      },
-      "agent_sessions": {
-        "total": 0,
-        "by_source": {},
-        "by_type": {},
-        "top_sessions": []
-      },
-      "totals": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "stream_count": 0
-      }
-    },
-    {
-      "generated_at": "2025-02-05T12:00:00+00:00",
-      "timezone": "Etc/UTC",
-      "week_start_day": "monday",
-      "period": {
-        "start": "2025-01-20",
-        "end": "2025-01-26",
-        "type": "week"
-      },
-      "by_tag": [],
-      "untagged": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "streams": []
-      },
-      "agent_sessions": {
-        "total": 0,
-        "by_source": {},
-        "by_type": {},
-        "top_sessions": []
-      },
-      "totals": {
-        "time_direct_ms": 0,
-        "time_delegated_ms": 0,
-        "stream_count": 0
-      }
-    }
-  ]
-}
-"###);
+        assert_snapshot!(output, @r#"
+        {
+          "weeks": [
+            {
+              "generated_at": "2025-02-05T12:00:00+00:00",
+              "timezone": "Etc/UTC",
+              "week_start_day": "monday",
+              "period": {
+                "start": "2025-02-03",
+                "end": "2025-02-09",
+                "type": "week"
+              },
+              "by_tag": [],
+              "untagged": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "streams": []
+              },
+              "agent_sessions": {
+                "total": 0,
+                "by_source": {},
+                "by_type": {},
+                "top_sessions": []
+              },
+              "totals": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "stream_count": 0,
+                "unassigned_direct_ms": 0,
+                "unassigned_delegated_ms": 0
+              }
+            },
+            {
+              "generated_at": "2025-02-05T12:00:00+00:00",
+              "timezone": "Etc/UTC",
+              "week_start_day": "monday",
+              "period": {
+                "start": "2025-01-27",
+                "end": "2025-02-02",
+                "type": "week"
+              },
+              "by_tag": [],
+              "untagged": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "streams": []
+              },
+              "agent_sessions": {
+                "total": 0,
+                "by_source": {},
+                "by_type": {},
+                "top_sessions": []
+              },
+              "totals": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "stream_count": 0,
+                "unassigned_direct_ms": 0,
+                "unassigned_delegated_ms": 0
+              }
+            },
+            {
+              "generated_at": "2025-02-05T12:00:00+00:00",
+              "timezone": "Etc/UTC",
+              "week_start_day": "monday",
+              "period": {
+                "start": "2025-01-20",
+                "end": "2025-01-26",
+                "type": "week"
+              },
+              "by_tag": [],
+              "untagged": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "streams": []
+              },
+              "agent_sessions": {
+                "total": 0,
+                "by_source": {},
+                "by_type": {},
+                "top_sessions": []
+              },
+              "totals": {
+                "time_direct_ms": 0,
+                "time_delegated_ms": 0,
+                "stream_count": 0,
+                "unassigned_direct_ms": 0,
+                "unassigned_delegated_ms": 0
+              }
+            }
+          ]
+        }
+        "#);
     }
 
     #[test]
@@ -1321,6 +1401,8 @@ mod tests {
             streams: vec![],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);
@@ -1341,6 +1423,8 @@ mod tests {
             ],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);
@@ -1363,6 +1447,8 @@ mod tests {
             )],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1387,6 +1473,8 @@ mod tests {
             ],
             tags_by_stream,
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1415,6 +1503,8 @@ mod tests {
             )],
             tags_by_stream,
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1438,6 +1528,8 @@ mod tests {
             ],
             tags_by_stream,
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1479,6 +1571,8 @@ mod tests {
                     Some("Short prompt"),
                 ),
             ],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1552,6 +1646,8 @@ mod tests {
                     Some("cutoff"),
                 ),
             ],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1600,6 +1696,8 @@ mod tests {
                     Some("Three"),
                 ),
             ],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report_json(&data).unwrap();
@@ -1638,6 +1736,8 @@ mod tests {
             )],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);
@@ -1667,6 +1767,8 @@ mod tests {
             streams,
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);
@@ -1719,6 +1821,8 @@ Delegated time: 3h 13m (36%)
             )],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);
@@ -1742,6 +1846,8 @@ Delegated time: 3h 13m (36%)
             )],
             tags_by_stream: HashMap::new(),
             agent_sessions: vec![],
+            unassigned_direct_ms: 0,
+            unassigned_delegated_ms: 0,
         };
 
         let output = format_report(&data);

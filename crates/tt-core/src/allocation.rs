@@ -15,6 +15,11 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::{EventType, SessionType};
 
+/// Synthetic stream id for activity not assigned to any real stream. It is removed
+/// from `stream_times` before returning (surfaced via `AllocationResult::unassigned_*_ms`),
+/// so it never leaks into a real stream id (and thus never reaches the DB on recompute).
+const UNASSIGNED_STREAM_ID: &str = "(unassigned)";
+
 /// Configuration for time allocation.
 #[derive(Debug, Clone)]
 pub struct AllocationConfig {
@@ -58,6 +63,12 @@ pub struct AllocationResult {
 
     /// Total wall-clock time with any activity (union of intervals, not sum).
     pub total_tracked_ms: i64,
+
+    /// Human attention time on events not assigned to any stream.
+    pub unassigned_direct_ms: i64,
+
+    /// Agent execution time on events not assigned to any stream.
+    pub unassigned_delegated_ms: i64,
 }
 
 /// An event suitable for time allocation.
@@ -145,8 +156,9 @@ impl Interval {
 /// Calculate time allocation for a time range.
 ///
 /// Events must be sorted by timestamp ascending.
-/// Events with `stream_id = None` are excluded from direct time attribution
-/// (but may still contribute to agent tracking if they have `session_id`).
+/// Events with `stream_id = None` are attributed to a synthetic unassigned bucket
+/// (surfaced via `unassigned_direct_ms` / `unassigned_delegated_ms`) instead of being
+/// silently dropped. The sentinel is removed from `stream_times` before returning.
 ///
 /// # Arguments
 ///
@@ -266,7 +278,8 @@ pub fn allocate_time<E: AllocatableEvent>(
 
         match event_type {
             EventType::TmuxPaneFocus => {
-                if let Some(stream_id) = event.stream_id() {
+                let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
+                {
                     // Close previous focus interval using resolved stream
                     if let FocusState::Focused { focus_start, .. } = &focus_state {
                         let resolved = resolve_focus_stream(
@@ -349,7 +362,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                         browser_focus_state.stream_id.as_deref(),
                     );
                     // Only reset attention window if this event is for the resolved stream
-                    let event_stream = event.stream_id();
+                    let event_stream = Some(event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID));
                     if let Some(resolved_stream) = &resolved {
                         if event_stream == Some(resolved_stream.as_str()) {
                             if event_time > *focus_start {
@@ -387,7 +400,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                 if is_subagent_message {
                     continue;
                 }
-                if let Some(stream_id) = event.stream_id() {
+                let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
+                {
                     // Close previous focus interval
                     if let FocusState::Focused { focus_start, .. } = &focus_state {
                         let resolved = resolve_focus_stream(
@@ -423,7 +437,8 @@ pub fn allocate_time<E: AllocatableEvent>(
 
                 match action {
                     "started" => {
-                        if let Some(stream_id) = event.stream_id() {
+                        let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
+                        {
                             agent_sessions.insert(
                                 session_id.to_string(),
                                 AgentSession {
@@ -488,7 +503,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                     .as_ref()
                     .is_some_and(|app| is_browser_app(app))
                 {
-                    if let Some(stream_id) = event.stream_id() {
+                    let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
+                    {
                         // Close previous focus interval
                         if let FocusState::Focused { focus_start, .. } = &focus_state {
                             let resolved = resolve_focus_stream(
@@ -517,7 +533,12 @@ pub fn allocate_time<E: AllocatableEvent>(
                     }
                 }
 
-                browser_focus_state.stream_id = event.stream_id().map(String::from);
+                browser_focus_state.stream_id = Some(
+                    event
+                        .stream_id()
+                        .unwrap_or(UNASSIGNED_STREAM_ID)
+                        .to_string(),
+                );
             }
         }
 
@@ -588,6 +609,9 @@ pub fn allocate_time<E: AllocatableEvent>(
     // Calculate total tracked time from interval union
     let total_tracked_ms = calculate_total_tracked(&activity_intervals);
 
+    let (unassigned_direct_ms, unassigned_delegated_ms) =
+        stream_times.remove(UNASSIGNED_STREAM_ID).unwrap_or((0, 0));
+
     let stream_times_vec = stream_times
         .into_iter()
         .map(|(stream_id, (direct, delegated))| StreamTime {
@@ -600,6 +624,8 @@ pub fn allocate_time<E: AllocatableEvent>(
     AllocationResult {
         stream_times: stream_times_vec,
         total_tracked_ms,
+        unassigned_direct_ms,
+        unassigned_delegated_ms,
     }
 }
 
@@ -1161,35 +1187,37 @@ mod tests {
         assert!(stream_b.is_none() || stream_b.unwrap().time_direct_ms == 0);
     }
 
-    // Test 13: Events with stream_id = null excluded
+    // Test 13: Switching focus to an unassigned pane must stop crediting the previously
+    // focused real stream; the remaining time goes to the unassigned bucket instead of
+    // being silently dropped (regression guard for the silent-drop bug).
     #[test]
-    fn test_events_without_stream_excluded() {
-        let events = vec![TestEvent {
-            timestamp: ts(0),
-            event_type: EventType::TmuxPaneFocus,
-            stream_id: None, // Not assigned to any stream
-            session_id: None,
-            action: None,
-            data: json!({"pane_id": "%1"}),
-        }];
+    fn test_focus_switch_to_unassigned_stops_crediting_real_stream() {
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent {
+                timestamp: ts(0) + Duration::seconds(30),
+                event_type: EventType::TmuxPaneFocus,
+                stream_id: None,
+                session_id: None,
+                action: None,
+                data: json!({"pane_id": "%2", "cwd": "/test"}),
+            },
+        ];
 
         let config = test_config();
         let result = allocate_time(
             &events,
             &config,
-            Some(ts(10)),
+            Some(ts(5)),
             &HashMap::new(),
             &HashMap::new(),
         );
 
-        // No streams should have time
-        assert!(
-            result.stream_times.is_empty()
-                || result
-                    .stream_times
-                    .iter()
-                    .all(|s| s.time_direct_ms == 0 && s.time_delegated_ms == 0)
-        );
+        // A focused at 0; the unassigned focus at 0:30 closes A's interval at 0:30 = 30s.
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        assert_eq!(stream_a.time_direct_ms, 30_000);
+        // Unassigned focus from 0:30, capped at the 60s attention window = 60s.
+        assert_eq!(result.unassigned_direct_ms, 60_000);
     }
 
     // Test 14: Combined focus + agent + AFK
@@ -1768,5 +1796,59 @@ mod tests {
         // msg@1 establishes focus; msg@2 closes [1, min(2, 1+1min)]=[1,2]=1min, reopens at 2;
         // finalize closes [2, min(5, 2+1min)]=[2,3]=1min. Total: 2min.
         assert_eq!(stream_a.time_direct_ms, 2 * 60_000);
+    }
+
+    // Regression guard for the silent-drop bug: events with NO stream assignment used to
+    // vanish from time attribution entirely. They must now accrue to a synthetic
+    // "unassigned" bucket, surfaced via AllocationResult.unassigned_{direct,delegated}_ms,
+    // WITHOUT leaking a fake stream id into stream_times.
+    #[test]
+    fn test_unassigned_agent_session_accrues_delegated_time() {
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_tool_use(ts(1), "sess1", "ignored"),
+            TestEvent::agent_tool_use(ts(2), "sess1", "ignored"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", None),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Delegated time from first tool use (1) to end (3) = 2 min, credited to unassigned.
+        assert_eq!(result.unassigned_delegated_ms, 2 * 60_000);
+        // The synthetic bucket must NOT leak into stream_times as a real stream.
+        assert!(result.stream_times.is_empty());
+    }
+
+    #[test]
+    fn test_unassigned_focus_accrues_direct_time() {
+        let events = vec![TestEvent {
+            timestamp: ts(0),
+            event_type: EventType::TmuxPaneFocus,
+            stream_id: None,
+            session_id: None,
+            action: None,
+            data: json!({"pane_id": "%1", "cwd": "/test"}),
+        }];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Focus with no stream accrues direct time to the unassigned bucket (1min window),
+        // and must not appear as a real stream.
+        assert_eq!(result.unassigned_direct_ms, 60_000);
+        assert!(result.stream_times.is_empty());
     }
 }

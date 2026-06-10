@@ -68,6 +68,20 @@ For full detail including gaps, use:
 tt classify --json --unclassified --gaps --start "{time_range}"
 ```
 
+**Coverage check — enumerate EVERY active cwd, not just the obvious ones.** `tt sync`
+auto-assigns events by cwd only for cwds already linked to a stream; brand-new cwds stay
+`stream_id = NULL` and silently vanish from `tt report`. List them all so none are missed:
+
+```bash
+DB=~/.local/share/time-tracker/tt.db
+sqlite3 "$DB" "SELECT COALESCE(stream_id,'NULL') AS sid, cwd, COUNT(*) AS n
+  FROM events WHERE timestamp >= '{start}' AND timestamp < '{end}'
+  GROUP BY sid, cwd ORDER BY n DESC;"
+```
+
+Every cwd with `sid = NULL` and non-trivial `n` MUST be assigned a stream in Phase 4
+(via `cwd_like` rules or per-session assignment). Do not finish with NULL cwds remaining.
+
 ## Phase 3: Identify Streams
 
 For each project, group agent sessions into streams using:
@@ -163,4 +177,4 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 1. All events assigned to streams (check `tt classify --unclassified`)
 2. `tt streams list` shows direct/delegated time per stream
 3. Report presented to user
-4. Report presented to user
+4. `(unassigned)` bucket in `tt report` is near-zero (no meaningful NULL-stream cwds remain)
