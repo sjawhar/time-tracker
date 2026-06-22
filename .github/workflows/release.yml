@@ -169,7 +169,7 @@ jobs:
 
       - name: Generate checksums
         run: |
-          for dir in */; do
+          for dir in tt-*/; do
             (cd "$dir" && sha256sum *.tar.gz >> ../SHA256SUMS)
           done
 
