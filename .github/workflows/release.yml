@@ -94,8 +94,8 @@ jobs:
       fail-fast: true
       matrix:
         target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
@@ -156,10 +156,10 @@ jobs:
 
       - name: Generate checksums
         run: |
-          cd tt-x86_64-unknown-linux-musl
-          sha256sum tt-x86_64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
-          cd ../tt-aarch64-unknown-linux-musl
-          sha256sum tt-aarch64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
+          cd tt-x86_64-unknown-linux-gnu
+          sha256sum tt-x86_64-unknown-linux-gnu.tar.gz >> ../SHA256SUMS
+          cd ../tt-aarch64-unknown-linux-gnu
+          sha256sum tt-aarch64-unknown-linux-gnu.tar.gz >> ../SHA256SUMS
 
       - name: Create GitHub Release
         env:

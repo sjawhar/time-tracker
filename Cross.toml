@@ -1,0 +1,19 @@
+# cross-rs configuration
+#
+# Installs libxkbcommon-dev inside the cross build container, required by
+# smithay-client-toolkit (transitively pulled in by cosmic-client-toolkit
+# for the `tt watch` subcommand on COSMIC).
+#
+# For aarch64 we add the arm64 multiarch repo and install the :arm64 variant
+# of the dev package so headers + .pc files resolve for cross-compilation.
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes libxkbcommon-dev",
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install --assume-yes libxkbcommon-dev:arm64",
+]
