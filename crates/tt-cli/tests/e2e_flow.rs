@@ -687,6 +687,8 @@ fn test_delegated_time_from_agent_session_events() {
                 git_workspace: None,
                 status: None,
                 idle_duration_ms: None,
+                window_app_id: None,
+                window_title: None,
                 action: None,
                 cwd: Some("/project".to_string()),
                 session_id: Some(session_id.clone()),

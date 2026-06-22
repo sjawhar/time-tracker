@@ -590,6 +590,8 @@ fn create_session_events(session: &AgentSession, machine_id: Option<&str>) -> Ve
         git_workspace: None,
         status: None,
         idle_duration_ms: None,
+        window_app_id: None,
+        window_title: None,
         action: None,
         cwd: Some(session.project_path.clone()),
         session_id: Some(session.session_id.clone()),

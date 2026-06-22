@@ -1,10 +1,10 @@
 # tt-db — SQLite Storage Layer
 
-Single-file monolith (`src/lib.rs`, 2363 lines). All database types and methods in one file.
+Single-file monolith (`src/lib.rs`, ~2580 lines). All database types and methods in one file.
 
-## Schema (v7)
+## Schema (v9)
 
-No migrations. Version mismatch = `DbError::SchemaVersionMismatch` (hard error). Bump `SCHEMA_VERSION` constant + recreate DB.
+Additive forward migrations for supported older versions (e.g. v8→v9: `ALTER TABLE events ADD COLUMN …` in a transaction inside `init()`). Any other version mismatch (newer-than-expected, or an unsupported older version) = `DbError::SchemaVersionMismatch` (hard error). To evolve: bump the `SCHEMA_VERSION` constant, add the columns to the `CREATE TABLE`, and add a migration arm in `init()`.
 
 ### Tables
 
@@ -12,7 +12,8 @@ No migrations. Version mismatch = `DbError::SchemaVersionMismatch` (hard error).
 events (id TEXT PK, timestamp TEXT, type TEXT, source TEXT, schema_version INT,
         cwd TEXT, git_project TEXT, git_workspace TEXT, pane_id TEXT,
         tmux_session TEXT, window_index INT, status TEXT, idle_duration_ms INT,
-        action TEXT, session_id TEXT, stream_id TEXT FK, assignment_source TEXT)
+        action TEXT, session_id TEXT, stream_id TEXT FK, assignment_source TEXT,
+        window_app_id TEXT, window_title TEXT)
 
 streams (id TEXT PK, created_at TEXT, updated_at TEXT, name TEXT,
          time_direct_ms INT, time_delegated_ms INT,

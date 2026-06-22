@@ -30,7 +30,7 @@ Example: `/infer-streams 3 days ago`
 **CRITICAL: Run the FULL ingestion pipeline. Partial data = wrong answer.**
 
 ```bash
-cargo build 2>/dev/null && cargo run -- ingest sessions
+tt ingest sessions
 ```
 
 Then sync ALL remote machines. Check `tt machines` — if any remotes exist, sync them:

@@ -97,7 +97,7 @@ For a UTC-5 zone: yesterday 00:00 local = yesterday 05:00 UTC.
 **CRITICAL: Always run the full pipeline. Partial data = wrong answer.**
 
 ```bash
-cargo build 2>/dev/null && cargo run -- ingest sessions
+tt ingest sessions
 ```
 
 Sync remotes, skipping any in the config's "Remotes to sync" section's skip list:
@@ -142,7 +142,7 @@ Skill("infer-streams")
 Use the "Streams I recognize across days" section of your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions, then:
 
 ```bash
-cargo run -- classify --apply /tmp/standup-assignments.json
+tt classify --apply /tmp/standup-assignments.json
 ```
 
 This persists streams AND runs `tt recompute --force`. On a large DB the recompute may take 2–5 minutes — use a 600s timeout.

@@ -65,6 +65,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: None,
             session_id: None,

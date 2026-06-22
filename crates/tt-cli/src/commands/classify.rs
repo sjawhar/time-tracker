@@ -47,12 +47,25 @@ struct EventCluster {
     stream_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct WindowRun {
+    start: String,
+    end: String,
+    duration_minutes: i64,
+    app_id: String,
+    event_ids: Vec<String>,
+    titles: Vec<String>,
+    machine_id: Option<String>,
+    stream_id: Option<String>,
+}
+
 /// Full classification output.
 #[derive(Debug, Serialize)]
 struct ClassifyOutput {
     time_range: TimeRange,
     sessions: Vec<SessionSummary>,
     event_clusters: Vec<EventCluster>,
+    window_runs: Vec<WindowRun>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gaps: Option<Vec<GapInfo>>,
     stats: ClassifyStats,
@@ -165,15 +178,16 @@ pub fn run_show(
         session_summaries.retain(|s| s.stream_id.is_none());
     }
 
-    // Build non-session event clusters
     let non_session_events: Vec<_> = classified_events
         .iter()
         .filter(|e| e.session_id.is_none())
         .collect();
 
     let mut clusters = cluster_events(&non_session_events);
+    let mut window_runs = synthesize_window_runs(&non_session_events);
     if unclassified {
         clusters.retain(|c| c.stream_id.is_none());
+        window_runs.retain(|run| run.stream_id.is_none());
     }
 
     let stats = ClassifyStats {
@@ -225,6 +239,7 @@ pub fn run_show(
         },
         sessions: session_summaries,
         event_clusters: clusters,
+        window_runs,
         gaps: gap_list,
         stats,
     };
@@ -293,6 +308,22 @@ fn print_summary(output: &ClassifyOutput) {
             );
         }
     }
+
+    if !output.window_runs.is_empty() {
+        println!("\nWINDOW RUNS");
+        println!("{}", "─".repeat(100));
+        for run in &output.window_runs {
+            let status = if run.stream_id.is_some() { "✓" } else { "?" };
+            let title = run.titles.first().map_or("(no title)", String::as_str);
+            println!(
+                "  {status} {:<30} {:>5}m {:>4} events  {}",
+                run.app_id,
+                run.duration_minutes,
+                run.event_ids.len(),
+                truncate(title, 50),
+            );
+        }
+    }
 }
 
 fn print_table(output: &ClassifyOutput) {
@@ -332,11 +363,17 @@ fn print_table(output: &ClassifyOutput) {
 
 /// Cluster non-session events by CWD + temporal proximity.
 fn cluster_events(events: &[&tt_db::StoredEvent]) -> Vec<EventCluster> {
-    if events.is_empty() {
+    let filtered: Vec<_> = events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type != tt_core::EventType::WindowFocus)
+        .collect();
+
+    if filtered.is_empty() {
         return Vec::new();
     }
 
-    let mut sorted: Vec<_> = events.to_vec();
+    let mut sorted = filtered;
     sorted.sort_by(|a, b| {
         let cwd_cmp = a.cwd.cmp(&b.cwd);
         if cwd_cmp == std::cmp::Ordering::Equal {
@@ -404,6 +441,105 @@ fn cluster_events(events: &[&tt_db::StoredEvent]) -> Vec<EventCluster> {
     clusters
 }
 
+fn synthesize_window_runs(events: &[&tt_db::StoredEvent]) -> Vec<WindowRun> {
+    let mut sorted: Vec<_> = events
+        .iter()
+        .copied()
+        .filter(|event| event.event_type == tt_core::EventType::WindowFocus)
+        .collect();
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+
+    sorted.sort_by(|a, b| {
+        let machine_cmp = a.machine_id.cmp(&b.machine_id);
+        if machine_cmp == std::cmp::Ordering::Equal {
+            a.timestamp.cmp(&b.timestamp)
+        } else {
+            machine_cmp
+        }
+    });
+
+    let gap_threshold = Duration::minutes(30);
+    let mut runs = Vec::new();
+    let first = sorted[0];
+    let mut current = WindowRunBuilder::new(first);
+
+    for event in &sorted[1..] {
+        let same_machine = event.machine_id == current.machine_id;
+        let same_app = event.window_app_id.as_deref().unwrap_or("(unknown)") == current.app_id;
+        let within_gap = event.timestamp - current.end < gap_threshold;
+
+        if same_machine && same_app && within_gap {
+            current.push(event);
+        } else {
+            runs.push(current.finish());
+            current = WindowRunBuilder::new(event);
+        }
+    }
+
+    runs.push(current.finish());
+    runs
+}
+
+struct WindowRunBuilder {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    app_id: String,
+    event_ids: Vec<String>,
+    titles: Vec<String>,
+    machine_id: Option<String>,
+    stream_id: Option<String>,
+}
+
+impl WindowRunBuilder {
+    fn new(event: &tt_db::StoredEvent) -> Self {
+        let mut builder = Self {
+            start: event.timestamp,
+            end: event.timestamp,
+            app_id: event
+                .window_app_id
+                .clone()
+                .unwrap_or_else(|| "(unknown)".to_string()),
+            event_ids: Vec::new(),
+            titles: Vec::new(),
+            machine_id: event.machine_id.clone(),
+            stream_id: event.stream_id.clone(),
+        };
+        builder.push(event);
+        builder
+    }
+
+    fn push(&mut self, event: &tt_db::StoredEvent) {
+        const MAX_TITLES: usize = 5;
+
+        self.end = event.timestamp;
+        self.event_ids.push(event.id.clone());
+        if self.stream_id.is_none() {
+            self.stream_id.clone_from(&event.stream_id);
+        }
+        if let Some(title) = &event.window_title {
+            let is_consecutive_duplicate = self.titles.last() == Some(title);
+            if !is_consecutive_duplicate && self.titles.len() < MAX_TITLES {
+                self.titles.push(title.clone());
+            }
+        }
+    }
+
+    fn finish(self) -> WindowRun {
+        WindowRun {
+            start: self.start.to_rfc3339(),
+            end: self.end.to_rfc3339(),
+            duration_minutes: (self.end - self.start).num_minutes(),
+            app_id: self.app_id,
+            event_ids: self.event_ids,
+            titles: self.titles,
+            machine_id: self.machine_id,
+            stream_id: self.stream_id,
+        }
+    }
+}
+
 // ── Apply mode ─────────────────────────────────────────────────────────────
 
 /// Input format for `tt classify --apply`.
@@ -415,6 +551,8 @@ pub struct ClassifyApplyInput {
     pub assign_by_session: Vec<SessionAssignment>,
     #[serde(default)]
     pub assign_by_pattern: Vec<PatternAssignment>,
+    #[serde(default)]
+    pub assign_by_event_ids: Vec<EventIdsAssignment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +575,12 @@ pub struct PatternAssignment {
     pub start: Option<String>,
     #[serde(default)]
     pub end: Option<String>,
+    pub stream: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventIdsAssignment {
+    pub event_ids: Vec<String>,
     pub stream: String,
 }
 
@@ -477,6 +621,7 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
         .map(|s| s.name.clone())
         .chain(input.assign_by_session.iter().map(|a| a.stream.clone()))
         .chain(input.assign_by_pattern.iter().map(|a| a.stream.clone()))
+        .chain(input.assign_by_event_ids.iter().map(|a| a.stream.clone()))
         .collect();
 
     for name in &all_stream_names {
@@ -576,7 +721,33 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
         }
     }
 
-    // Phase 4: Recompute affected streams
+    // Phase 4: Explicit event ID assignments
+    for assignment in &input.assign_by_event_ids {
+        let stream_id = stream_name_to_id
+            .get(&assignment.stream)
+            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+
+        let count = db
+            .assign_events_by_ids(&assignment.event_ids, stream_id, "inferred")
+            .with_context(|| {
+                format!(
+                    "failed to assign {} explicit events to stream {}",
+                    assignment.event_ids.len(),
+                    assignment.stream
+                )
+            })?;
+
+        if count > 0 {
+            tracing::info!(
+                stream = %assignment.stream,
+                count,
+                "assigned explicit events"
+            );
+            total_assigned += count;
+        }
+    }
+
+    // Phase 5: Recompute affected streams
     if total_assigned > 0 {
         println!("Assigned {total_assigned} events. Recomputing...");
         super::recompute::run(db, true)?;
@@ -645,6 +816,8 @@ mod tests {
             git_workspace: None,
             status: None,
             idle_duration_ms: None,
+            window_app_id: None,
+            window_title: None,
             action: None,
             cwd: Some(cwd.to_string()),
             session_id: session_id.map(String::from),
@@ -652,6 +825,104 @@ mod tests {
             assignment_source: None,
             data: json!({}),
         }
+    }
+
+    fn make_window_event(
+        id: &str,
+        timestamp: DateTime<Utc>,
+        app_id: &str,
+        title: &str,
+        machine_id: &str,
+    ) -> tt_db::StoredEvent {
+        let mut event = make_event(id, timestamp, tt_core::EventType::WindowFocus, None, "");
+        event.source = "local.cosmic".to_string();
+        event.cwd = None;
+        event.machine_id = Some(machine_id.to_string());
+        event.window_app_id = Some(app_id.to_string());
+        event.window_title = Some(title.to_string());
+        event
+    }
+
+    #[test]
+    fn test_synthesize_window_runs_groups_by_app_gap_and_machine() {
+        let events = [
+            make_window_event("w1", ts(0), "firefox", "Docs", "local"),
+            make_window_event("w2", ts(5), "firefox", "Docs", "local"),
+            make_window_event("w3", ts(10), "firefox", "Issue", "local"),
+            make_window_event("w4", ts(45), "firefox", "Issue", "local"),
+            make_window_event("w5", ts(46), "slack", "Team", "local"),
+            make_window_event("w6", ts(47), "firefox", "Remote", "remote"),
+        ];
+        let refs: Vec<_> = events.iter().collect();
+
+        let runs = synthesize_window_runs(&refs);
+
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[0].app_id, "firefox");
+        assert_eq!(runs[0].event_ids, vec!["w1", "w2", "w3"]);
+        assert_eq!(runs[0].titles, vec!["Docs", "Issue"]);
+        assert_eq!(runs[0].duration_minutes, 10);
+        assert_eq!(runs[0].machine_id.as_deref(), Some("local"));
+        assert_eq!(runs[1].event_ids, vec!["w4"]);
+        assert_eq!(runs[2].app_id, "slack");
+        assert_eq!(runs[2].event_ids, vec!["w5"]);
+        assert_eq!(runs[3].machine_id.as_deref(), Some("remote"));
+        assert_eq!(runs[3].event_ids, vec!["w6"]);
+    }
+
+    #[test]
+    fn test_cluster_events_excludes_window_focus_empty_cwd_cluster() {
+        let window = make_window_event("w1", ts(0), "firefox", "Docs", "local");
+        let tmux = make_event(
+            "t1",
+            ts(1),
+            tt_core::EventType::TmuxPaneFocus,
+            None,
+            "/project-x",
+        );
+        let events = [window, tmux];
+        let refs: Vec<_> = events.iter().collect();
+
+        let clusters = cluster_events(&refs);
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].cwd, "/project-x");
+    }
+
+    #[test]
+    fn test_classify_apply_assigns_window_events_by_event_ids() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        for event in [
+            make_window_event("w1", ts(0), "firefox", "Docs", "local"),
+            make_window_event("w2", ts(1), "firefox", "Docs", "local"),
+            make_window_event("w3", ts(2), "slack", "Team", "local"),
+        ] {
+            db.insert_event(&event).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("classify.json");
+        std::fs::write(
+            &input_path,
+            serde_json::to_string(&json!({
+                "assign_by_event_ids": [{
+                    "event_ids": ["w1", "w2"],
+                    "stream": "proposal"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run_apply(&db, input_path.to_str().unwrap()).unwrap();
+
+        let stream = db.resolve_stream("proposal").unwrap().unwrap();
+        let assigned = db.get_events_by_stream(&stream.id).unwrap();
+        let assigned_ids: Vec<_> = assigned.iter().map(|event| event.id.as_str()).collect();
+        assert_eq!(assigned_ids, vec!["w1", "w2"]);
+        let unassigned = db.get_events_without_stream().unwrap();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].id, "w3");
     }
 
     #[test]
@@ -735,6 +1006,7 @@ mod tests {
                 end: None,
                 stream: "stream-x".to_string(),
             }],
+            assign_by_event_ids: vec![],
         };
 
         // Manually run the assignment logic (without recompute)

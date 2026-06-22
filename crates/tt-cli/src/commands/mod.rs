@@ -13,5 +13,6 @@ pub mod status;
 pub mod streams;
 pub mod sync;
 pub mod tag;
+pub mod watch;
 
 pub mod util;
