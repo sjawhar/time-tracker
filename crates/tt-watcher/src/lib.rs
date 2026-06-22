@@ -197,14 +197,14 @@ pub fn run(
     no_write: bool,
     once: bool,
 ) -> Result<()> {
-    let config = crate::Config::load_from(config_path).context("failed to load configuration")?;
+    let config = tt_cli::Config::load_from(config_path).context("failed to load configuration")?;
     if let Some(parent) = config.database_path.parent() {
         std::fs::create_dir_all(parent).context("failed to create database directory")?;
     }
     let db = tt_db::Database::open(&config.database_path).context("failed to open database")?;
-    let identity = crate::machine::require_machine_identity()?;
+    let identity = tt_cli::machine::require_machine_identity()?;
     let mut backend = CosmicBackend::new(idle_timeout).context(
-        "failed to initialize COSMIC watcher backend; tt watch currently requires a COSMIC Wayland session",
+        "failed to initialize COSMIC watcher backend; tt-watcher requires a COSMIC Wayland session",
     )?;
     let mut state = EmitState::new(identity.machine_id);
     let poll_interval = StdDuration::from_millis(poll_ms.unwrap_or(DEFAULT_POLL_MS));

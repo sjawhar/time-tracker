@@ -15,7 +15,8 @@ crates/
 │   │   └── commands/       # One file per subcommand + snapshots/
 │   └── tests/e2e_flow.rs   # Integration tests (spawns actual binary)
 ├── tt-core/       # Domain logic. See crates/tt-core/AGENTS.md
-└── tt-db/         # SQLite storage. See crates/tt-db/AGENTS.md
+├── tt-db/         # SQLite storage. See crates/tt-db/AGENTS.md
+└── tt-watcher/    # COSMIC window/idle daemon binary ("tt-watcher"). Wayland/cctk; writes window_focus + afk_change events directly to SQLite.
 config/            # tmux-hook.conf (event capture setup)
 scripts/           # deploy-remote.sh (binary → remote ~/.local/bin/tt)
 specs/             # Architecture docs, design specs, research notes
@@ -24,8 +25,9 @@ specs/             # Architecture docs, design specs, research notes
 ### Crate Dependencies
 
 ```
-tt-cli ─┬─> tt-core
-        └─> tt-db ───> tt-core
+tt-cli ─────> tt-core
+        └───> tt-db ───> tt-core
+tt-watcher ─> tt-cli ──> (transitively pulls in tt-core, tt-db)
 ```
 
 `tt-llm` is referenced in specs but does not exist yet.
@@ -44,6 +46,7 @@ tt-cli ─┬─> tt-core
 | Add machine support | `tt-cli/src/machine.rs` | UUID-based identity per machine |
 | Multi-machine sync | `tt-cli/src/commands/sync.rs` | SSH-based event pull |
 | Deploy binary | `scripts/deploy-remote.sh` | Builds release, copies via SSH, optionally configures tmux hook |
+| Touch the watcher | `tt-watcher/src/{lib,backend,cosmic,main}.rs` | Separate binary so main `tt` stays musl-static; `tt-watcher` is glibc (cctk → libxkbcommon). systemd unit at `config/tt-watcher.service`. |
 
 ## Commands
 
