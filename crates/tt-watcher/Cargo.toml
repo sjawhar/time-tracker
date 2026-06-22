@@ -1,39 +1,33 @@
 [package]
-name = "tt-cli"
+name = "tt-watcher"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "AI-native time tracker CLI"
+description = "COSMIC window/idle watcher daemon for the tt time tracker"
 
 [[bin]]
-name = "tt"
+name = "tt-watcher"
 path = "src/main.rs"
 
 [dependencies]
+tt-cli = { path = "../tt-cli" }
 tt-core.workspace = true
 tt-db.workspace = true
 
 clap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
-figment.workspace = true
-iana-time-zone = "0.1"
-dirs.workspace = true
-flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
-fs2 = "0.4"
-regex = "1.11"
-uuid.workspace = true
-hostname.workspace = true
+
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["staging", "client"] }
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "8e84152" }
 
 [dev-dependencies]
-insta.workspace = true
-tempfile.workspace = true
 rusqlite.workspace = true
 
 [lints]

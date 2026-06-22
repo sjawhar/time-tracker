@@ -14,7 +14,7 @@ use wayland_protocols::ext::{
     idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1},
 };
 
-use super::backend::{ActiveWindow, IdleState, Snapshot, WindowBackend};
+use crate::backend::{ActiveWindow, IdleState, Snapshot, WindowBackend};
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 180;
 

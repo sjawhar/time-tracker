@@ -6,7 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 use tt_cli::commands::{
     classify, context, export, import, ingest, init, machines, recompute, report, status, streams,
-    sync, tag, watch,
+    sync, tag,
 };
 use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
 
@@ -188,20 +188,6 @@ fn main() -> Result<()> {
                     *gap_threshold,
                 )?;
             }
-        }
-        Some(Commands::Watch {
-            idle_timeout,
-            poll_ms,
-            no_write,
-            once,
-        }) => {
-            watch::run(
-                cli.config.as_deref(),
-                *idle_timeout,
-                *poll_ms,
-                *no_write,
-                *once,
-            )?;
         }
         None => {
             // No subcommand, show help

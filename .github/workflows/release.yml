@@ -86,16 +86,29 @@ jobs:
           echo "Bumping $CURRENT → $VERSION"
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.binary }} for ${{ matrix.target }})
     needs: version
     if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          # Main `tt` binary stays musl-static (no system-library deps).
+          - target: x86_64-unknown-linux-musl
+            package: tt-cli
+            binary: tt
+          - target: aarch64-unknown-linux-musl
+            package: tt-cli
+            binary: tt
+          # `tt-watcher` requires libxkbcommon (via cctk) so it ships as
+          # glibc-dynamic; Cross.toml installs the system lib in the build container.
+          - target: x86_64-unknown-linux-gnu
+            package: tt-watcher
+            binary: tt-watcher
+          - target: aarch64-unknown-linux-gnu
+            package: tt-watcher
+            binary: tt-watcher
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +118,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-${{ matrix.binary }}
 
       - uses: taiki-e/install-action@cross
 
@@ -113,16 +126,16 @@ jobs:
         run: sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
 
       - name: Build
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} -p ${{ matrix.package }}
 
       - name: Package
-        run: tar czf tt-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release tt
+        run: tar czf ${{ matrix.binary }}-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release ${{ matrix.binary }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tt-${{ matrix.target }}
-          path: tt-${{ matrix.target }}.tar.gz
+          name: ${{ matrix.binary }}-${{ matrix.target }}
+          path: ${{ matrix.binary }}-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release
@@ -156,10 +169,9 @@ jobs:
 
       - name: Generate checksums
         run: |
-          cd tt-x86_64-unknown-linux-musl
-          sha256sum tt-x86_64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
-          cd ../tt-aarch64-unknown-linux-musl
-          sha256sum tt-aarch64-unknown-linux-musl.tar.gz >> ../SHA256SUMS
+          for dir in */; do
+            (cd "$dir" && sha256sum *.tar.gz >> ../SHA256SUMS)
+          done
 
       - name: Create GitHub Release
         env:

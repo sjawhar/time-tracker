@@ -1237,7 +1237,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "cosmic-client-toolkit",
  "dirs",
  "figment",
  "flate2",
@@ -1255,8 +1254,6 @@ dependencies = [
  "tt-core",
  "tt-db",
  "uuid",
- "wayland-client",
- "wayland-protocols",
 ]
 
 [[package]]
@@ -1286,6 +1283,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tt-core",
+]
+
+[[package]]
+name = "tt-watcher"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "cosmic-client-toolkit",
+ "rusqlite",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "tt-cli",
+ "tt-core",
+ "tt-db",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

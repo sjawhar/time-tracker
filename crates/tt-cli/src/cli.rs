@@ -222,25 +222,6 @@ pub enum Commands {
         #[arg(long, default_value = "5")]
         gap_threshold: u32,
     },
-
-    /// Watch the COSMIC desktop for active-window and idle events.
-    Watch {
-        /// Idle timeout in seconds before emitting an idle event.
-        #[arg(long)]
-        idle_timeout: Option<u64>,
-
-        /// Poll interval in milliseconds.
-        #[arg(long)]
-        poll_ms: Option<u64>,
-
-        /// Print events as JSONL instead of writing to `SQLite`.
-        #[arg(long)]
-        no_write: bool,
-
-        /// Poll once, emit/write any resulting events, then exit.
-        #[arg(long)]
-        once: bool,
-    },
 }
 
 /// Streams subcommand actions.
