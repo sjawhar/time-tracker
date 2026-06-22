@@ -1,0 +1,43 @@
+---
+source: crates/tt-cli/src/commands/todo/json.rs
+expression: render_next(&view).unwrap()
+---
+{
+  "today": "2026-06-23",
+  "sections": {
+    "due": [
+      {
+        "id": "td_due000001",
+        "text": "Due item",
+        "priority": [
+          "ipi"
+        ],
+        "stream": null,
+        "rank": 9,
+        "when": null,
+        "due": "2026-06-23",
+        "due_marker": "due_today",
+        "pin": false,
+        "quick": true
+      }
+    ],
+    "main": [],
+    "later": [
+      {
+        "id": "td_later0001",
+        "text": "Later item",
+        "priority": [
+          "ipi"
+        ],
+        "stream": null,
+        "rank": 9,
+        "when": "2026-06-25",
+        "due": null,
+        "due_marker": null,
+        "pin": false,
+        "quick": false
+      }
+    ]
+  },
+  "diagnostics": []
+}

@@ -1,0 +1,13 @@
+---
+source: crates/tt-cli/src/commands/todo/render.rs
+assertion_line: 187
+expression: "next_output(&due_loaded, options())"
+---
+TODO NEXT (2026-06-23)
+
+Due
+- Already late [id:td_late00001 rank:9 priority:ipi(9) stream:- overdue:2026-06-22]
+- Due today [id:td_today0001 rank:2 priority:admin(2) stream:- due:today]
+
+Main
+- Future due [id:td_future001 rank:9 priority:ipi(9) stream:- due:2026-06-24]

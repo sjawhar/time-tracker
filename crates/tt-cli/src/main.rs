@@ -4,11 +4,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+mod todo_dispatch;
+
+use todo_dispatch::{run_priority_action, run_todo_action};
 use tt_cli::commands::{
     classify, context, export, import, ingest, init, machines, recompute, report, status, streams,
     sync, tag,
 };
-use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction};
+use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction, TodoAction};
 
 /// Load config and open database, ensuring the parent directory exists.
 fn open_database(config_path: Option<&Path>) -> Result<(tt_db::Database, Config)> {
@@ -21,6 +24,12 @@ fn open_database(config_path: Option<&Path>) -> Result<(tt_db::Database, Config)
 
     let db = tt_db::Database::open(&config.database_path).context("failed to open database")?;
     Ok((db, config))
+}
+
+fn load_config(config_path: Option<&Path>) -> Result<Config> {
+    let config = Config::load_from(config_path).context("failed to load configuration")?;
+    tracing::debug!(?config, "loaded configuration");
+    Ok(config)
 }
 
 #[expect(
@@ -121,11 +130,34 @@ fn main() -> Result<()> {
             tag::run(&db, stream, tag_name)?;
         }
         Some(Commands::Streams(action)) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
+            let (db, config) = open_database(cli.config.as_deref())?;
             match action {
                 StreamsAction::List { json } => streams::run(&db, *json)?,
                 StreamsAction::Create { name } => streams::create(&db, name.clone())?,
+                StreamsAction::Link { stream, priority } => {
+                    streams::link(
+                        &db,
+                        &config,
+                        &streams::LinkOptions {
+                            stream: stream.clone(),
+                            priority: priority.clone(),
+                        },
+                    )?;
+                }
             }
+        }
+        Some(Commands::Todo(action)) => {
+            if matches!(action, TodoAction::Drift { .. }) {
+                let (db, config) = open_database(cli.config.as_deref())?;
+                run_todo_action(Some(&db), &config, action)?;
+            } else {
+                let config = load_config(cli.config.as_deref())?;
+                run_todo_action(None, &config, action)?;
+            }
+        }
+        Some(Commands::Priority(action)) => {
+            let config = load_config(cli.config.as_deref())?;
+            run_priority_action(&config, action)?;
         }
         Some(Commands::Init { label }) => {
             init::run(label.as_deref())?;

@@ -14,7 +14,7 @@ use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZ
 use serde::Serialize;
 use tt_core::session::AgentSession;
 use tt_core::{AllocationConfig, EventType, SessionType, allocate_time};
-use tt_db::Database;
+use tt_db::{Database, StoredEvent};
 
 /// Report period type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,10 +295,7 @@ pub fn generate_report_data_for_date(
         Period::Day | Period::LastDay | Period::Custom(_, _) => PeriodType::Day,
     };
 
-    // Get events within the period
-    let mut events = db
-        .get_events_in_range(period_start, period_end)
-        .context("failed to get events in period")?;
+    let mut events = get_report_period_events(db, period_start, period_end)?;
 
     let session_ids_with_starts: BTreeSet<&str> = events
         .iter()
@@ -393,6 +390,19 @@ pub fn generate_report_data_for_date(
         unassigned_direct_ms: result.unassigned_direct_ms,
         unassigned_delegated_ms: result.unassigned_delegated_ms,
     })
+}
+
+fn get_report_period_events(
+    db: &Database,
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> Result<Vec<StoredEvent>> {
+    let exclusive_end = period_end - chrono::Duration::milliseconds(1);
+    if exclusive_end < period_start {
+        return Ok(Vec::new());
+    }
+    db.get_events_in_range(period_start, exclusive_end)
+        .context("failed to get events in period")
 }
 
 /// Formats the period description for the report header.
@@ -1166,6 +1176,71 @@ mod tests {
             assignment_source: None,
             data: json!({}),
         }
+    }
+
+    #[test]
+    fn report_period_event_fetch_is_half_open_at_end_boundary() {
+        // Given: one event inside a report period and one exactly at the period end.
+        let db = tt_db::Database::open_in_memory().unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 29, 0, 0, 0).unwrap();
+        db.insert_stream(&tt_db::Stream {
+            id: "stream-a".to_string(),
+            name: Some("Stream A".to_string()),
+            created_at: start,
+            updated_at: start,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: false,
+        })
+        .unwrap();
+        db.insert_stream(&tt_db::Stream {
+            id: "stream-b".to_string(),
+            name: Some("Stream B".to_string()),
+            created_at: start,
+            updated_at: start,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: false,
+        })
+        .unwrap();
+        let inside = make_agent_event(
+            "inside",
+            end - chrono::Duration::milliseconds(1),
+            tt_core::EventType::TmuxPaneFocus,
+            "session",
+            "stream-a",
+            None,
+        );
+        let boundary = make_agent_event(
+            "boundary",
+            end,
+            tt_core::EventType::TmuxPaneFocus,
+            "session",
+            "stream-b",
+            None,
+        );
+        db.insert_events(&[inside, boundary]).unwrap();
+
+        // When: report code fetches events for the half-open period [start, end).
+        let events = get_report_period_events(&db, start, end).unwrap();
+
+        // Then: the end-boundary event is excluded from the earlier period.
+        let ids = events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["inside"]);
+        let next_period_ids = get_report_period_events(&db, end, end + chrono::Duration::days(7))
+            .unwrap()
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(next_period_ids, vec!["boundary"]);
     }
 
     fn build_weeks_json(reference_dates: &[NaiveDate]) -> String {

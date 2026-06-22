@@ -1,0 +1,7 @@
+---
+source: crates/tt-cli/src/commands/priority.rs
+expression: render_ls(&loaded).unwrap()
+---
+PRIORITIES
+- IPI launch [ipi] value=9 status=active
+- Admin [admin] value=1 status=done

@@ -1,0 +1,10 @@
+---
+source: crates/tt-cli/src/commands/todo/render.rs
+expression: render_ls(&view).unwrap()
+---
+TODOS
+- [ ] Missing id [id:missing rank:9 priority:ipi(9) stream:- quick]
+
+DIAGNOSTICS
+- todos.md line 1: JSON metadata parse error: missing field `id` at line 1 column 82 | - [ ] Missing id <!-- tt-todo:{"priority":["ipi"],"stream":null,"when":null,"due":null,"pin":false,"quick":true} -->
+- todos.md line 2: JSON metadata parse error: key must be a string at line 1 column 2 | - [ ] Broken <!-- tt-todo:{bad json} -->
