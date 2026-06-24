@@ -12,12 +12,15 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Path to the database file.
     pub database_path: PathBuf,
+    /// Path to the markdown-backed todo store directory.
+    pub todo_store_path: PathBuf,
 }
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("database_path", &self.database_path)
+            .field("todo_store_path", &self.todo_store_path)
             .finish()
     }
 }
@@ -27,6 +30,7 @@ impl Default for Config {
         let data_dir = dirs_data_path().unwrap_or_else(|| PathBuf::from("."));
         Self {
             database_path: data_dir.join("tt.db"),
+            todo_store_path: data_dir.join("daily-standups"),
         }
     }
 }
@@ -116,5 +120,43 @@ mod tests {
         let config = Config::default();
         let data_dir = dirs_data_path().unwrap();
         assert_eq!(config.database_path, data_dir.join("tt.db"));
+    }
+
+    #[test]
+    fn default_config_uses_data_dir_for_todo_store_when_available() {
+        let config = Config::default();
+        let data_dir = dirs_data_path().unwrap();
+
+        assert_eq!(config.todo_store_path, data_dir.join("daily-standups"));
+    }
+
+    #[test]
+    fn load_from_uses_tt_todo_store_path_env_override() {
+        const CHILD_MARKER: &str = "TT_TEST_TODO_STORE_PATH_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config = Config::load_from(None).unwrap();
+            assert_eq!(
+                config.todo_store_path,
+                PathBuf::from("/tmp/tt-todo-store-env")
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::load_from_uses_tt_todo_store_path_env_override")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("TT_TODO_STORE_PATH", "/tmp/tt-todo-store-env")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

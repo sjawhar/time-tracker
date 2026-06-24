@@ -10,6 +10,7 @@ pub mod event_type;
 pub mod opencode;
 pub mod project;
 pub mod session;
+pub mod todos;
 
 pub use allocation::{
     AllocatableEvent, AllocationConfig, AllocationResult, StreamTime, allocate_time,

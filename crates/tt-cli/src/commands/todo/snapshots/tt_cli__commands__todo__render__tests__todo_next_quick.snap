@@ -1,0 +1,11 @@
+---
+source: crates/tt-cli/src/commands/todo/render.rs
+expression: "next_output(&loaded, NextOptions { quick: true, later: true, ..options() })"
+---
+TODO NEXT (2026-06-23)
+
+Main
+- Quick admin reply [id:td_quick0001 rank:2 priority:admin(2) stream:- quick]
+
+Later
+- Deferred task [id:td_later0001 rank:9 priority:ipi(9) stream:- quick]

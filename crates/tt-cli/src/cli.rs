@@ -119,6 +119,14 @@ pub enum Commands {
     #[command(subcommand)]
     Streams(StreamsAction),
 
+    /// Show and inspect markdown-backed todos.
+    #[command(subcommand)]
+    Todo(TodoAction),
+
+    /// Show and inspect markdown-backed priorities.
+    #[command(subcommand)]
+    Priority(PriorityAction),
+
     /// Initialize machine identity for multi-machine sync.
     ///
     /// Generates a persistent UUID for this machine, stored in
@@ -242,6 +250,153 @@ pub enum StreamsAction {
         /// Name for the stream.
         name: String,
     },
+
+    /// Link a stream name to a priority slug.
+    Link {
+        /// Exact stream display name.
+        stream: String,
+
+        /// Priority slug from priorities.md.
+        priority: String,
+    },
+}
+
+/// Todo subcommand actions.
+#[derive(Debug, Subcommand)]
+pub enum TodoAction {
+    /// Show the current actionable todo list.
+    Next {
+        /// Limit the main list to the first N items.
+        #[arg(long, value_name = "N")]
+        top: Option<usize>,
+
+        /// Show only quick todos.
+        #[arg(long)]
+        quick: bool,
+
+        /// Output stable JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Group the main list by priority.
+        #[arg(long)]
+        by_priority: bool,
+
+        /// Include deferred later items.
+        #[arg(long)]
+        later: bool,
+    },
+
+    /// List all todos and parse diagnostics.
+    Ls,
+
+    /// Add a todo.
+    Add {
+        text: String,
+
+        /// Priority slug served by this todo. Repeat for multiple priorities.
+        #[arg(long = "priority", value_name = "SLUG")]
+        priority: Vec<String>,
+
+        /// Stream name served by this todo.
+        #[arg(long, value_name = "NAME")]
+        stream: Option<String>,
+
+        /// Due date (YYYY-MM-DD).
+        #[arg(long, value_name = "DATE")]
+        due: Option<String>,
+
+        /// Defer until date (YYYY-MM-DD).
+        #[arg(long, value_name = "DATE")]
+        when: Option<String>,
+
+        #[arg(long)]
+        quick: bool,
+
+        #[arg(long)]
+        pin: bool,
+    },
+
+    /// Mark a todo done by id.
+    Done { id: String },
+
+    /// Defer a todo until a date (YYYY-MM-DD).
+    Defer { id: String, date: String },
+
+    /// Move a todo relative to other todo lines.
+    Rank {
+        id: String,
+
+        #[arg(long, group = "rank_position")]
+        top: bool,
+
+        /// Move above another todo id.
+        #[arg(long, value_name = "ID", group = "rank_position")]
+        above: Option<String>,
+
+        /// Move below another todo id.
+        #[arg(long, value_name = "ID", group = "rank_position")]
+        below: Option<String>,
+    },
+
+    /// Add ids to todos that are missing them.
+    NormalizeIds,
+
+    /// Check todo ordering and priority alignment.
+    Check {
+        /// Output stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Compare priority importance against tracked stream time.
+    Drift {
+        /// Current week (Monday to Sunday). This is the default.
+        #[arg(long, group = "todo_drift_period")]
+        week: bool,
+
+        /// Previous week.
+        #[arg(long, group = "todo_drift_period")]
+        last_week: bool,
+
+        /// Today.
+        #[arg(long, group = "todo_drift_period")]
+        day: bool,
+
+        /// Yesterday.
+        #[arg(long, group = "todo_drift_period")]
+        last_day: bool,
+
+        /// Output stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Priority subcommand actions.
+#[derive(Debug, Subcommand)]
+pub enum PriorityAction {
+    /// List priorities and parse diagnostics.
+    Ls,
+
+    /// Add a priority.
+    Add {
+        title: String,
+
+        /// Priority slug. Defaults to a slug derived from the title.
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Priority value.
+        #[arg(long)]
+        value: i32,
+    },
+
+    /// Set a priority value.
+    Value { slug: String, n: i32 },
+
+    /// Mark a priority done.
+    Done { slug: String },
 }
 
 /// Event types that can be ingested.
