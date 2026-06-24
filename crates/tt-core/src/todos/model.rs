@@ -44,10 +44,11 @@ pub enum PriorityStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Priority {
-    pub title: String,
     pub slug: String,
     pub value: i32,
     pub status: PriorityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,8 @@ pub struct Todo {
     pub pin: bool,
     pub quick: bool,
     pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +136,8 @@ pub(super) struct PriorityMetadata {
     pub(super) slug: String,
     pub(super) value: i32,
     pub(super) status: PriorityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -145,6 +150,8 @@ pub(super) struct TodoMetadata {
     pub(super) due: Option<NaiveDate>,
     pub(super) pin: bool,
     pub(super) quick: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) block: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -23,7 +23,6 @@ pub struct DriftReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PriorityDrift {
     pub priority_slug: String,
-    pub priority_title: String,
     pub priority_value: i32,
     pub importance_share: f64,
     pub direct_ms: i64,
@@ -208,7 +207,6 @@ fn priority_drift(
         .unwrap_or_default();
     PriorityDrift {
         priority_slug: priority.slug.clone(),
-        priority_title: priority.title.clone(),
         priority_value: priority.value,
         importance_share: share_i32(priority.value, importance_total),
         direct_ms: time.direct_ms,

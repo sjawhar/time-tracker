@@ -102,7 +102,7 @@ fn mutations_do_not_fuse_newline_less_store_lines() {
     // When: priority add appends after a newline-less priority.
     assert_success(&run_tt(
         &store,
-        &["priority", "add", "Admin", "--value", "1"],
+        &["priority", "add", "admin", "--value", "1"],
     ));
 
     // Then: both priority records remain separate and parseable.
@@ -172,31 +172,78 @@ fn ambiguous_todo_id_failure_leaves_file_byte_identical() {
 }
 
 #[test]
-fn priority_add_accepts_explicit_slug() {
+fn priority_add_writes_slug_and_optional_description() {
     // Given: an empty store.
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("todos");
 
-    // When: a priority is added with an explicit slug.
+    // When: a priority is added with a slug and a description.
     assert_success(&run_tt(
         &store,
         &[
             "priority",
             "add",
-            "IPI launch",
-            "--slug",
             "ipi",
             "--value",
             "9",
+            "--description",
+            "IPI launch",
         ],
     ));
 
-    // Then: the explicit slug is written instead of the derived title slug.
+    // Then: the slug is the visible text and the description is stored in metadata.
     let priorities = std::fs::read_to_string(store.join("priorities.md")).unwrap();
     assert_eq!(
         priorities,
-        "- [ ] IPI launch <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n"
+        "- [ ] ipi <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\",\"description\":\"IPI launch\"} -->\n"
     );
+}
+
+#[test]
+fn priority_add_empty_description_omits_metadata_key() {
+    // Given: an empty store.
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("todos");
+
+    // When: a priority is added with an empty description.
+    assert_success(&run_tt(
+        &store,
+        &[
+            "priority",
+            "add",
+            "ipi",
+            "--value",
+            "9",
+            "--description",
+            "",
+        ],
+    ));
+
+    // Then: no `description` key is written.
+    let priorities = std::fs::read_to_string(store.join("priorities.md")).unwrap();
+    assert_eq!(
+        priorities,
+        "- [ ] ipi <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n"
+    );
+}
+
+#[test]
+fn priority_add_rejects_invalid_slug_without_creating_store() {
+    // Given: a missing store directory.
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("todos");
+
+    // When: priority add receives an invalid positional slug (uppercase).
+    let output = run_tt(&store, &["priority", "add", "Admin", "--value", "1"]);
+
+    // Then: it fails before creating the store directory.
+    assert!(!output.status.success(), "invalid slug should fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("slug"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!store.exists(), "invalid input must not create store dir");
 }
 
 #[test]

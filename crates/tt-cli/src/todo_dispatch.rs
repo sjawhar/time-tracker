@@ -45,6 +45,8 @@ pub fn run_todo_action(db: Option<&Database>, config: &Config, action: &TodoActi
         ),
         TodoAction::Done { id } => todo::run_done(config, id),
         TodoAction::Defer { id, date } => todo::run_defer(config, id, date),
+        TodoAction::Block { id, reason } => todo::run_block(config, id, reason),
+        TodoAction::Unblock { id } => todo::run_unblock(config, id),
         TodoAction::Rank {
             id,
             top,
@@ -90,15 +92,23 @@ const fn todo_drift_period(last_week: bool, day: bool, last_day: bool) -> report
 pub fn run_priority_action(config: &Config, action: &PriorityAction) -> Result<()> {
     match action {
         PriorityAction::Ls => priority::run_ls(config),
-        PriorityAction::Add { title, slug, value } => priority::run_add(
+        PriorityAction::Add {
+            slug,
+            value,
+            description,
+        } => priority::run_add(
             config,
             priority::AddOptions {
-                title: title.clone(),
                 slug: slug.clone(),
                 value: *value,
+                description: description.clone(),
             },
         ),
+        PriorityAction::Describe { slug, text } => priority::run_describe(config, slug, text),
         PriorityAction::Value { slug, n } => priority::run_value(config, slug, *n),
+        PriorityAction::Rename { old_slug, new_slug } => {
+            priority::run_rename(config, old_slug, new_slug)
+        }
         PriorityAction::Done { slug } => priority::run_done(config, slug),
     }
 }

@@ -28,6 +28,7 @@ pub fn run_add(config: &Config, options: AddOptions) -> Result<()> {
         pin: options.pin,
         quick: options.quick,
         done: false,
+        block: None,
     };
     insert_todo_by_rank(&mut loaded, todo);
     write_todos(config, &loaded.store.todos)
@@ -51,6 +52,33 @@ pub fn run_defer(config: &Config, id: &str, date: &str) -> Result<()> {
         bail!("todo '{id}' not found");
     };
     todo.when = Some(when);
+    write_todos(config, &loaded.store.todos)
+}
+
+pub fn run_block(config: &Config, id: &str, reason: &str) -> Result<()> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("block reason must not be empty");
+    }
+    let mut loaded = load_mutating(config)?;
+    let index = unique_todo_line_index(&loaded, id)?;
+    let TodoFileItem::Todo(todo) = &mut loaded.store.todos.items[index].item else {
+        bail!("todo '{id}' not found");
+    };
+    if todo.done {
+        bail!("cannot block a done todo '{id}'");
+    }
+    todo.block = Some(reason.to_string());
+    write_todos(config, &loaded.store.todos)
+}
+
+pub fn run_unblock(config: &Config, id: &str) -> Result<()> {
+    let mut loaded = load_mutating(config)?;
+    let index = unique_todo_line_index(&loaded, id)?;
+    let TodoFileItem::Todo(todo) = &mut loaded.store.todos.items[index].item else {
+        bail!("todo '{id}' not found");
+    };
+    todo.block = None;
     write_todos(config, &loaded.store.todos)
 }
 

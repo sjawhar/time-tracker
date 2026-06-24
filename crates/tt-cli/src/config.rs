@@ -30,7 +30,7 @@ impl Default for Config {
         let data_dir = dirs_data_path().unwrap_or_else(|| PathBuf::from("."));
         Self {
             database_path: data_dir.join("tt.db"),
-            todo_store_path: data_dir.join("daily-standups"),
+            todo_store_path: data_dir,
         }
     }
 }
@@ -127,7 +127,7 @@ mod tests {
         let config = Config::default();
         let data_dir = dirs_data_path().unwrap();
 
-        assert_eq!(config.todo_store_path, data_dir.join("daily-standups"));
+        assert_eq!(config.todo_store_path, data_dir);
     }
 
     #[test]

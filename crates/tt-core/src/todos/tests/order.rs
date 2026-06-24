@@ -209,6 +209,58 @@ fn due_overrides_when_into_due_section() -> Result<(), chrono::ParseError> {
 }
 
 #[test]
+fn blocked_todo_is_separated_from_due_and_main() {
+    // Given: an overdue todo that is also blocked, plus a plain actionable todo.
+    let today = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+    let mut blocked = todo(
+        "td_blocked001",
+        &["ipi"],
+        None,
+        None,
+        NaiveDate::from_ymd_opt(2026, 6, 20),
+        false,
+        false,
+    );
+    blocked.block = Some("waiting on Peter".to_string());
+    let actionable = todo("td_open000001", &["ipi"], None, None, None, false, false);
+    let todos = [blocked, actionable];
+
+    // When: the todos are classified into sections.
+    let sections = classify_next_sections(&todos, today);
+
+    // Then: the blocked todo is only under Blocked, never Due/Main/Later.
+    assert_eq!(section_ids(&sections.blocked), ["td_blocked001"]);
+    assert_eq!(section_ids(&sections.due), Vec::<&str>::new());
+    assert_eq!(section_ids(&sections.main), ["td_open000001"]);
+    assert_eq!(section_ids(&sections.later), Vec::<&str>::new());
+}
+
+#[test]
+fn find_alignment_does_not_exempt_blocked_todos() {
+    // Given: a low-rank todo followed by a higher-rank BLOCKED todo (out of order).
+    let priorities = vec![
+        priority("high", 9, PriorityStatus::Active),
+        priority("low", 1, PriorityStatus::Active),
+    ];
+    let low = todo("td_low000001", &["low"], None, None, None, false, false);
+    let mut blocked = todo("td_blocked001", &["high"], None, None, None, false, false);
+    blocked.block = Some("waiting".to_string());
+    let todos = [low, blocked];
+
+    // When: alignment is checked.
+    let findings = find_alignment(&todos, &priorities, &[]);
+
+    // Then: the blocked todo is still flagged misordered (block grants no exemption).
+    assert!(
+        findings.iter().any(|finding| matches!(
+            finding,
+            AlignmentFinding::Misordered { todo_id, .. } if todo_id == "td_blocked001"
+        )),
+        "blocked todo should still be ordering-checked: {findings:?}"
+    );
+}
+
+#[test]
 fn next_sections_include_overdue_and_preserve_section_order() -> Result<(), chrono::ParseError> {
     // Given: multiple due, main, later, and done todos are interleaved in canonical order.
     let today = NaiveDate::parse_from_str("2026-06-23", "%Y-%m-%d")?;

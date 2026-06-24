@@ -79,6 +79,14 @@ pub fn run_defer(config: &Config, id: &str, date: &str) -> Result<()> {
     mutate::run_defer(config, id, date)
 }
 
+pub fn run_block(config: &Config, id: &str, reason: &str) -> Result<()> {
+    mutate::run_block(config, id, reason)
+}
+
+pub fn run_unblock(config: &Config, id: &str) -> Result<()> {
+    mutate::run_unblock(config, id)
+}
+
 pub fn run_rank(config: &Config, options: &RankOptions) -> Result<()> {
     mutate::run_rank(config, options)
 }

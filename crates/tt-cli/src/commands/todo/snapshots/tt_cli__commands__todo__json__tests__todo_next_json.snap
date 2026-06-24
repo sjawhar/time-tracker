@@ -18,10 +18,12 @@ expression: render_next(&view).unwrap()
         "due": "2026-06-23",
         "due_marker": "due_today",
         "pin": false,
-        "quick": true
+        "quick": true,
+        "block": null
       }
     ],
     "main": [],
+    "blocked": [],
     "later": [
       {
         "id": "td_later0001",
@@ -35,7 +37,8 @@ expression: render_next(&view).unwrap()
         "due": null,
         "due_marker": null,
         "pin": false,
-        "quick": false
+        "quick": false,
+        "block": null
       }
     ]
   },

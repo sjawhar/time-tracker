@@ -17,6 +17,7 @@ struct JsonNext<'a> {
 struct JsonSections<'a> {
     due: Vec<JsonTodo<'a>>,
     main: Vec<JsonTodo<'a>>,
+    blocked: Vec<JsonTodo<'a>>,
     later: Vec<JsonTodo<'a>>,
 }
 
@@ -32,6 +33,7 @@ struct JsonTodo<'a> {
     due_marker: Option<String>,
     pin: bool,
     quick: bool,
+    block: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -48,6 +50,12 @@ pub fn render_next(view: &TodoView<'_>) -> Result<String> {
         sections: JsonSections {
             due: json_todos(&view.due, &view.priorities, &view.stream_links, view.today),
             main: json_todos(&view.main, &view.priorities, &view.stream_links, view.today),
+            blocked: json_todos(
+                &view.blocked,
+                &view.priorities,
+                &view.stream_links,
+                view.today,
+            ),
             later: json_todos(
                 &view.later,
                 &view.priorities,
@@ -96,6 +104,7 @@ fn json_todos<'a>(
             due_marker: json_due_marker(todo, today),
             pin: todo.pin,
             quick: todo.quick,
+            block: todo.block.as_deref(),
         })
         .collect()
 }

@@ -5,11 +5,11 @@ expression: "next_output(&loaded, NextOptions { later: true, ..options() })"
 TODO NEXT (2026-06-23)
 
 Due
-- Ship overdue fix [id:td_due000001 rank:9 priority:ipi(9) stream:- overdue:2026-06-22]
+- Ship overdue fix [id:td_due000001 rank:9 priority:ipi(9) stream:- overdue:2026-06-22 when:2026-06-30]
 
 Main
 - Quick admin reply [id:td_quick0001 rank:2 priority:admin(2) stream:- quick]
 - Stream-linked work [id:td_stream001 rank:9 priority:ipi(9) stream:Fable 5 DPI]
 
 Later
-- Deferred task [id:td_later0001 rank:9 priority:ipi(9) stream:- quick]
+- Deferred task [id:td_later0001 rank:9 priority:ipi(9) stream:- when:2026-06-25 quick]

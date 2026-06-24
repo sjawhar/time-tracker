@@ -5,7 +5,7 @@ expression: "next_output(&loaded, NextOptions { by_priority: true, ..options() }
 TODO NEXT (2026-06-23)
 
 Due
-- Ship overdue fix [id:td_due000001 rank:9 priority:ipi(9) stream:- overdue:2026-06-22]
+- Ship overdue fix [id:td_due000001 rank:9 priority:ipi(9) stream:- overdue:2026-06-22 when:2026-06-30]
 
 Main by priority
   priority:ipi(9)

@@ -50,12 +50,13 @@ impl RenderLine for PriorityFileItem {
                     slug: priority.slug.clone(),
                     value: priority.value,
                     status: priority.status,
+                    description: priority.description.clone(),
                 };
                 let json = serde_json::to_string(&metadata).map_err(|_| fmt::Error)?;
                 write!(
                     f,
                     "{PRIORITY_PREFIX}{}{PRIORITY_MARKER}{json}{COMMENT_SUFFIX}",
-                    priority.title
+                    priority.slug
                 )
             }
             Self::Raw(line) => f.write_str(line),
@@ -75,6 +76,7 @@ impl RenderLine for TodoFileItem {
                     due: todo.due,
                     pin: todo.pin,
                     quick: todo.quick,
+                    block: todo.block.clone(),
                 };
                 let prefix = if todo.done {
                     TODO_DONE_PREFIX

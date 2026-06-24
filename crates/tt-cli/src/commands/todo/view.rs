@@ -15,6 +15,7 @@ pub struct TodoView<'a> {
     pub stream_links: Vec<StreamPriorityLink>,
     pub due: Vec<Todo>,
     pub main: Vec<Todo>,
+    pub blocked: Vec<Todo>,
     pub later: Vec<Todo>,
     pub by_priority: bool,
     pub show_later: bool,
@@ -45,6 +46,7 @@ impl<'a> TodoView<'a> {
             stream_links,
             due: filtered(sections.due, options.quick, None),
             main: filtered(sections.main, options.quick, options.top),
+            blocked: filtered(sections.blocked, options.quick, None),
             later: filtered(sections.later, options.quick, None),
             by_priority: options.by_priority,
             show_later: options.later,
@@ -78,13 +80,15 @@ pub fn todo_metadata(
         .map_or_else(|| "rank:-".to_string(), |value| format!("rank:{value}"));
     let relation = relation_label(todo, priorities, stream_links);
     let due = due_label(todo, today);
+    let when = when_label(todo);
     let stream = todo
         .stream
         .as_ref()
         .map_or_else(|| "stream:-".to_string(), |name| format!("stream:{name}"));
     let quick = if todo.quick { " quick" } else { "" };
     let pin = if todo.pin { " pin" } else { "" };
-    format!("[{id} {rank} {relation} {stream}{due}{quick}{pin}]")
+    let block = block_label(todo);
+    format!("[{id} {rank} {relation} {stream}{due}{when}{quick}{pin}{block}]")
 }
 
 pub struct PriorityGroup<'a> {
@@ -199,6 +203,17 @@ fn due_label(todo: &Todo, today: Option<NaiveDate>) -> String {
         Some(today) if due == today => " due:today".to_string(),
         Some(_) | None => format!(" due:{due}"),
     }
+}
+
+fn when_label(todo: &Todo) -> String {
+    todo.when
+        .map_or_else(String::new, |when| format!(" when:{when}"))
+}
+
+fn block_label(todo: &Todo) -> String {
+    todo.block
+        .as_ref()
+        .map_or_else(String::new, |reason| format!(" blocked:{reason:?}"))
 }
 
 fn best_priority<'a>(

@@ -7,7 +7,7 @@ use super::{
     parse_priorities, parse_streams, parse_todo_lenient, parse_todos,
 };
 
-const FULL_PRIORITIES: &str = "# Priorities\n\n- [ ] IPI launch <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n- [ ] Archive docs <!-- tt-priority:{\"slug\":\"docs\",\"value\":3,\"status\":\"done\"} -->\n- [ ] Old idea <!-- tt-priority:{\"slug\":\"old\",\"value\":1,\"status\":\"dropped\"} -->\n";
+const FULL_PRIORITIES: &str = "# Priorities\n\n- [ ] ipi <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n- [ ] docs <!-- tt-priority:{\"slug\":\"docs\",\"value\":3,\"status\":\"done\"} -->\n- [ ] old <!-- tt-priority:{\"slug\":\"old\",\"value\":1,\"status\":\"dropped\"} -->\n";
 const FULL_TODOS: &str = "## Due\n- [ ] Draft pricing reply <!-- tt-todo:{\"id\":\"td_0123456789\",\"priority\":[\"ipi\",\"docs\"],\"stream\":\"Fable 5 DPI\",\"when\":\"2026-06-18\",\"due\":\"2026-06-19\",\"pin\":true,\"quick\":true} -->\n\n## Later\n- [x] Close old loop <!-- tt-todo:{\"id\":\"td_abcdefghij\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false} -->\n";
 const FULL_STREAMS: &str = "# Streams\n- Fable 5 DPI <!-- tt-stream:{\"priority\":\"ipi\"} -->\n";
 
@@ -39,6 +39,28 @@ fn round_trips_full_fixture() {
     assert!(priority_diagnostics_again.is_empty());
     assert!(todo_diagnostics_again.is_empty());
     assert!(stream_diagnostics_again.is_empty());
+}
+
+#[test]
+fn round_trips_block_field_and_omits_when_absent() {
+    // Given: a blocked todo and an unblocked todo.
+    let blocked = "- [ ] Blocked work <!-- tt-todo:{\"id\":\"td_blocked001\",\"priority\":[\"ipi\"],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"block\":\"waiting on Peter\"} -->\n";
+    let unblocked = "- [ ] Open work <!-- tt-todo:{\"id\":\"td_open000001\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false} -->\n";
+
+    // When: each is parsed and serialized again.
+    let (blocked_file, blocked_diagnostics) = parse_todos(blocked);
+    let (unblocked_file, unblocked_diagnostics) = parse_todos(unblocked);
+
+    // Then: the block reason round-trips, and an unblocked todo emits no `block` key.
+    assert!(blocked_diagnostics.is_empty());
+    assert!(unblocked_diagnostics.is_empty());
+    let TodoFileItem::Todo(todo) = &blocked_file.items[0].item else {
+        panic!("expected parsed todo");
+    };
+    assert_eq!(todo.block.as_deref(), Some("waiting on Peter"));
+    assert_eq!(blocked_file.to_string(), blocked);
+    assert_eq!(unblocked_file.to_string(), unblocked);
+    assert!(!unblocked_file.to_string().contains("block"));
 }
 
 #[test]
@@ -112,7 +134,7 @@ fn parses_exact_hidden_json_grammar() {
     let (todo_file, todo_diagnostics) = parse_todos(todos);
     let (stream_file, stream_diagnostics) = parse_streams(streams);
 
-    // Then: visible text and hidden JSON fields are parsed exactly.
+    // Then: hidden JSON fields are parsed exactly.
     assert!(priority_diagnostics.is_empty());
     assert!(todo_diagnostics.is_empty());
     assert!(stream_diagnostics.is_empty());
@@ -120,7 +142,8 @@ fn parses_exact_hidden_json_grammar() {
     let PriorityFileItem::Priority(priority) = &priority_file.items[0].item else {
         panic!("expected parsed priority");
     };
-    assert_eq!(priority.title, "IPI launch");
+    // visible text is no longer part of the priority model; only the slug names it.
+    assert_eq!(priority.description, None);
     assert_eq!(priority.slug, "ipi");
     assert_eq!(priority.value, 9);
     assert_eq!(priority.status, PriorityStatus::Active);
@@ -146,6 +169,57 @@ fn parses_exact_hidden_json_grammar() {
 }
 
 #[test]
+fn round_trips_description_field_and_omits_when_absent() {
+    // Given: a described priority and a description-less priority.
+    let described = "- [ ] scenario-gen <!-- tt-priority:{\"slug\":\"scenario-gen\",\"value\":9,\"status\":\"active\",\"description\":\"IPI: scenario-gen quality\"} -->\n";
+    let plain =
+        "- [ ] ops <!-- tt-priority:{\"slug\":\"ops\",\"value\":6,\"status\":\"active\"} -->\n";
+
+    // When: each is parsed and serialized again.
+    let (described_file, described_diagnostics) = parse_priorities(described);
+    let (plain_file, plain_diagnostics) = parse_priorities(plain);
+
+    // Then: the description round-trips, and a description-less priority emits no `description` key.
+    assert!(described_diagnostics.is_empty());
+    assert!(plain_diagnostics.is_empty());
+    let PriorityFileItem::Priority(priority) = &described_file.items[0].item else {
+        panic!("expected parsed priority");
+    };
+    assert_eq!(
+        priority.description.as_deref(),
+        Some("IPI: scenario-gen quality")
+    );
+    assert_eq!(described_file.to_string(), described);
+    assert_eq!(plain_file.to_string(), plain);
+    assert!(!plain_file.to_string().contains("description"));
+}
+
+#[test]
+fn old_priority_line_parses_without_description_and_rerenders_visible_text_as_slug() {
+    // Given: a PRE-MIGRATION line whose visible text is a human title and whose metadata
+    // carries no `description`.
+    let old = "- [ ] IPI launch <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n";
+
+    // When: it is parsed and serialized again.
+    let (file, diagnostics) = parse_priorities(old);
+    let rendered = file.to_string();
+
+    // Then: it parses cleanly with no description, and re-rendering DROPS the old title —
+    // the visible text becomes the slug. This is the loss-point the live migration must run
+    // before; it is asserted here as a contract.
+    assert!(diagnostics.is_empty());
+    let PriorityFileItem::Priority(priority) = &file.items[0].item else {
+        panic!("expected parsed priority");
+    };
+    assert_eq!(priority.description, None);
+    assert_eq!(
+        rendered,
+        "- [ ] ipi <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n"
+    );
+    assert!(!rendered.contains("IPI launch"));
+}
+
+#[test]
 fn serializes_none_line_ending_as_separator_when_line_becomes_non_final() {
     // Given: a parsed file whose original final line had no trailing newline.
     let input = "## Later";
@@ -161,6 +235,7 @@ fn serializes_none_line_ending_as_separator_when_line_becomes_non_final() {
             pin: false,
             quick: false,
             done: false,
+            block: None,
         }),
         line_ending: LineEnding::None,
     });

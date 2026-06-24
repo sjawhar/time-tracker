@@ -4,10 +4,10 @@ use super::super::{Priority, PriorityStatus, StreamPriorityLink, StreamTimeInput
 
 pub fn priority(slug: &str, value: i32, status: PriorityStatus) -> Priority {
     Priority {
-        title: slug.to_string(),
         slug: slug.to_string(),
         value,
         status,
+        description: None,
     }
 }
 
@@ -48,6 +48,7 @@ pub fn todo(
         pin,
         quick: false,
         done,
+        block: None,
     }
 }
 
