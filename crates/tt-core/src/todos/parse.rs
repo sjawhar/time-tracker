@@ -131,13 +131,13 @@ fn parse_priority_line(line: &str) -> Result<Option<PriorityFileItem>, TodoParse
     if !line.contains(PRIORITY_MARKER) {
         return Ok(None);
     }
-    let (title, json) = hidden_json(line, PRIORITY_GRAMMAR)?;
+    let (_visible, json) = hidden_json(line, PRIORITY_GRAMMAR)?;
     let metadata = parse_json::<PriorityMetadata>(json)?;
     Ok(Some(PriorityFileItem::Priority(Priority {
-        title: title.to_string(),
         slug: metadata.slug,
         value: metadata.value,
         status: metadata.status,
+        description: metadata.description,
     })))
 }
 
@@ -188,6 +188,7 @@ fn todo_from_metadata(text: &str, metadata: TodoMetadata, done: bool) -> Todo {
         pin: metadata.pin,
         quick: metadata.quick,
         done,
+        block: metadata.block,
     }
 }
 

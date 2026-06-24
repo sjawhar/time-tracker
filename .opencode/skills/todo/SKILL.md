@@ -5,7 +5,7 @@ description: Use when the user asks what should I do, what's next, todos, priori
 
 # Todo
 
-Use `tt todo` and `tt priority` as the shared source of truth for priorities, todos, and priority/time alignment. The files live in the daily-standups store; `tt` owns deterministic reads, writes, ordering checks, and drift math.
+Use `tt todo` and `tt priority` as the shared source of truth for priorities, todos, and priority/time alignment. The markdown files live in the tt data dir (`~/.local/share/time-tracker/`); `tt` owns deterministic reads, writes, ordering checks, and drift math.
 
 ## Operating Rules
 
@@ -14,7 +14,7 @@ Use `tt todo` and `tt priority` as the shared source of truth for priorities, to
 3. **The list stays clean.** Store only concrete priorities, todos, stream links, dates, pins, and quick flags. Put context, caveats, rationale, and analysis in the conversation.
 4. **Partner mode is read-only.** When asked to think, choose, prioritize, or diagnose drift, read `tt todo check` and `tt todo drift`, then reason in chat. Mutate the store only after an explicit edit request.
 5. **Order is shared; value is the user’s.** You may reposition todos with `tt todo rank`. Never add, finish, or change priority values unless the user explicitly asks for that priority operation.
-6. **Standup integration.** During standup work, resurface `when:` items whose local day has arrived and archive plan-vs-actual notes under `w<NN>/<DATE>.md` in the daily-standups store.
+6. **Standup integration.** During standup work, resurface `when:` items whose local day has arrived and archive plan-vs-actual notes under `w<NN>/<DATE>.md` in `daily-standups/` (the standup archive, separate from the tt store).
 
 ## Command Vocabulary
 
@@ -29,7 +29,8 @@ tt todo normalize-ids
 tt todo check [--json]
 tt todo drift [--week|--last-week|--day|--last-day] [--json]
 
-tt priority add "<title>" --value N [--slug <slug>]
+tt priority add <slug> --value N [--description "..."]
+tt priority describe <slug> "<text>"
 tt priority value <slug> N
 tt priority ls
 tt priority done <slug>

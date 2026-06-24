@@ -323,6 +323,16 @@ pub enum TodoAction {
     /// Defer a todo until a date (YYYY-MM-DD).
     Defer { id: String, date: String },
 
+    /// Mark a todo blocked with a reason.
+    Block {
+        id: String,
+        /// Why the todo is blocked.
+        reason: String,
+    },
+
+    /// Clear a todo's blocked state.
+    Unblock { id: String },
+
     /// Move a todo relative to other todo lines.
     Rank {
         id: String,
@@ -381,22 +391,42 @@ pub enum PriorityAction {
 
     /// Add a priority.
     Add {
-        title: String,
-
-        /// Priority slug. Defaults to a slug derived from the title.
-        #[arg(long)]
-        slug: Option<String>,
+        /// Priority slug — the priority's name. Lowercase ASCII letters, digits, or '-'.
+        slug: String,
 
         /// Priority value.
         #[arg(long)]
         value: i32,
+
+        /// Optional freeform description.
+        #[arg(long)]
+        description: Option<String>,
+    },
+
+    /// Set or clear a priority's description (an empty/whitespace string clears it).
+    Describe {
+        /// Priority slug.
+        slug: String,
+
+        /// Description text; pass "" to clear.
+        text: String,
     },
 
     /// Set a priority value.
-    Value { slug: String, n: i32 },
+    Value {
+        slug: String,
+        n: i32,
+    },
+
+    Rename {
+        old_slug: String,
+        new_slug: String,
+    },
 
     /// Mark a priority done.
-    Done { slug: String },
+    Done {
+        slug: String,
+    },
 }
 
 /// Event types that can be ingested.

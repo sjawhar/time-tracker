@@ -31,6 +31,7 @@ pub enum AlignmentFinding {
 pub enum NextSection {
     Due,
     Main,
+    Blocked,
     Later,
     Done,
 }
@@ -39,6 +40,7 @@ pub enum NextSection {
 pub struct NextSections<'a> {
     pub due: Vec<&'a Todo>,
     pub main: Vec<&'a Todo>,
+    pub blocked: Vec<&'a Todo>,
     pub later: Vec<&'a Todo>,
     pub done: Vec<&'a Todo>,
 }
@@ -131,6 +133,7 @@ pub fn classify_next_sections(todos: &[Todo], today: NaiveDate) -> NextSections<
     let mut sections = NextSections {
         due: Vec::new(),
         main: Vec::new(),
+        blocked: Vec::new(),
         later: Vec::new(),
         done: Vec::new(),
     };
@@ -138,6 +141,7 @@ pub fn classify_next_sections(todos: &[Todo], today: NaiveDate) -> NextSections<
         match next_section(todo, today) {
             NextSection::Due => sections.due.push(todo),
             NextSection::Main => sections.main.push(todo),
+            NextSection::Blocked => sections.blocked.push(todo),
             NextSection::Later => sections.later.push(todo),
             NextSection::Done => sections.done.push(todo),
         }
@@ -151,6 +155,7 @@ impl<'a> NextSections<'a> {
         match section {
             NextSection::Due => &self.due,
             NextSection::Main => &self.main,
+            NextSection::Blocked => &self.blocked,
             NextSection::Later => &self.later,
             NextSection::Done => &self.done,
         }
@@ -193,6 +198,9 @@ fn has_link_references(todo: &Todo) -> bool {
 fn next_section(todo: &Todo, today: NaiveDate) -> NextSection {
     if todo.done {
         return NextSection::Done;
+    }
+    if todo.block.is_some() {
+        return NextSection::Blocked;
     }
     if todo.due.is_some_and(|due| due <= today) {
         return NextSection::Due;

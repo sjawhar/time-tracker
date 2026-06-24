@@ -8,11 +8,14 @@ use crate::todo_store::{
     LoadedTodoStore, StoreFile, load_mutating, load_read_only, write_priorities,
 };
 
+mod rename;
+pub use rename::run_rename;
+
 #[derive(Debug, Clone)]
 pub struct AddOptions {
-    pub title: String,
-    pub slug: Option<String>,
     pub value: i32,
+    pub slug: String,
+    pub description: Option<String>,
 }
 
 pub fn run_ls(config: &Config) -> Result<()> {
@@ -22,17 +25,22 @@ pub fn run_ls(config: &Config) -> Result<()> {
 }
 
 pub fn run_add(config: &Config, options: AddOptions) -> Result<()> {
-    let slug = resolve_slug(&options.title, options.slug.as_deref())?;
+    let AddOptions {
+        value,
+        slug,
+        description,
+    } = options;
+    let slug = validate_explicit_slug(&slug)?;
     let mut loaded = load_mutating(config)?;
     if priority_index(&loaded, &slug).is_some() {
         bail!("priority '{slug}' already exists");
     }
     loaded.store.priorities.items.push(FileLine {
         item: PriorityFileItem::Priority(Priority {
-            title: options.title,
             slug: slug.clone(),
-            value: options.value,
+            value,
             status: PriorityStatus::Active,
+            description: description.as_deref().and_then(normalize_description),
         }),
         line_ending: LineEnding::Lf,
     });
@@ -65,6 +73,28 @@ pub fn run_done(config: &Config, slug: &str) -> Result<()> {
     write_priorities(config, &loaded.store.priorities)
 }
 
+pub fn run_describe(config: &Config, slug: &str, text: &str) -> Result<()> {
+    let mut loaded = load_mutating(config)?;
+    let index =
+        priority_index(&loaded, slug).with_context(|| format!("priority '{slug}' not found"))?;
+    let PriorityFileItem::Priority(priority) = &mut loaded.store.priorities.items[index].item
+    else {
+        bail!("priority '{slug}' not found");
+    };
+    priority.description = normalize_description(text);
+    write_priorities(config, &loaded.store.priorities)
+}
+
+/// Trim a description; treat empty-after-trim as "no description".
+fn normalize_description(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn render_ls(loaded: &LoadedTodoStore) -> Result<String> {
     let mut output = String::new();
     writeln!(output, "PRIORITIES").context("failed to format priority header")?;
@@ -73,15 +103,24 @@ fn render_ls(loaded: &LoadedTodoStore) -> Result<String> {
     for line in &loaded.store.priorities.items {
         if let PriorityFileItem::Priority(priority) = &line.item {
             count += 1;
-            writeln!(
-                output,
-                "- {} [{}] value={} status={}",
-                priority.title,
-                priority.slug,
-                priority.value,
-                status_label(priority.status)
-            )
-            .context("failed to format priority row")?;
+            let row = match &priority.description {
+                Some(description) => writeln!(
+                    output,
+                    "- {} — {} value={} status={}",
+                    priority.slug,
+                    description,
+                    priority.value,
+                    status_label(priority.status)
+                ),
+                None => writeln!(
+                    output,
+                    "- {} value={} status={}",
+                    priority.slug,
+                    priority.value,
+                    status_label(priority.status)
+                ),
+            };
+            row.context("failed to format priority row")?;
         }
     }
 
@@ -126,10 +165,6 @@ fn priority_index(loaded: &LoadedTodoStore, slug: &str) -> Option<usize> {
     )
 }
 
-fn resolve_slug(title: &str, explicit_slug: Option<&str>) -> Result<String> {
-    explicit_slug.map_or_else(|| slug_from_title(title), validate_explicit_slug)
-}
-
 fn validate_explicit_slug(slug: &str) -> Result<String> {
     if slug.is_empty() {
         bail!("priority slug must not be empty");
@@ -140,28 +175,13 @@ fn validate_explicit_slug(slug: &str) -> Result<String> {
     {
         bail!("priority slug must contain only lowercase ASCII letters, digits, or '-'");
     }
+    if !slug
+        .chars()
+        .any(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        bail!("priority slug must contain at least one lowercase ASCII letter or digit");
+    }
     Ok(slug.to_string())
-}
-
-fn slug_from_title(title: &str) -> Result<String> {
-    let mut slug = String::new();
-    let mut previous_was_separator = false;
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            previous_was_separator = false;
-        } else if !slug.is_empty() && !previous_was_separator {
-            slug.push('-');
-            previous_was_separator = true;
-        }
-    }
-    if slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty() {
-        bail!("priority title must contain at least one ASCII letter or digit");
-    }
-    Ok(slug)
 }
 
 #[cfg(test)]
@@ -172,11 +192,21 @@ mod tests {
     #[test]
     fn priority_ls_snapshots() {
         let loaded = parse_store_contents(
-            "- [ ] IPI launch <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\"} -->\n- [ ] Admin <!-- tt-priority:{\"slug\":\"admin\",\"value\":1,\"status\":\"done\"} -->\n",
+            "- [ ] ipi <!-- tt-priority:{\"slug\":\"ipi\",\"value\":9,\"status\":\"active\",\"description\":\"IPI launch\"} -->\n- [ ] admin <!-- tt-priority:{\"slug\":\"admin\",\"value\":1,\"status\":\"done\"} -->\n",
             "",
             "",
         );
 
         insta::assert_snapshot!(render_ls(&loaded).unwrap());
+    }
+
+    #[test]
+    fn validate_explicit_slug_accepts_valid_and_rejects_empty_or_non_alphanumeric() {
+        assert!(super::validate_explicit_slug("ipi").is_ok());
+        assert!(super::validate_explicit_slug("a-b").is_ok());
+        assert!(super::validate_explicit_slug("dpi-report").is_ok());
+        assert!(super::validate_explicit_slug("").is_err());
+        assert!(super::validate_explicit_slug("-").is_err());
+        assert!(super::validate_explicit_slug("Admin").is_err());
     }
 }

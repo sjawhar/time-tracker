@@ -178,10 +178,10 @@ mod tests {
         let warnings = duplicate_named_stream_warnings(&db).unwrap();
         let drift = compute_drift(
             &[Priority {
-                title: "IPI launch".to_string(),
                 slug: "ipi".to_string(),
                 value: 9,
                 status: PriorityStatus::Active,
+                description: None,
             }],
             &[StreamPriorityLink {
                 stream: "Shared stream".to_string(),
