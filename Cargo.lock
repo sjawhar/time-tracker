@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "tt-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "tt-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "insta",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "tt-db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "tt-watcher"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
