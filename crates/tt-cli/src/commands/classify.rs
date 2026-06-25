@@ -553,6 +553,8 @@ pub struct ClassifyApplyInput {
     pub assign_by_pattern: Vec<PatternAssignment>,
     #[serde(default)]
     pub assign_by_event_ids: Vec<EventIdsAssignment>,
+    #[serde(default)]
+    pub assign_by_time: Vec<TimeAssignment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +583,13 @@ pub struct PatternAssignment {
 #[derive(Debug, Deserialize)]
 pub struct EventIdsAssignment {
     pub event_ids: Vec<String>,
+    pub stream: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimeAssignment {
+    pub start: String,
+    pub end: String,
     pub stream: String,
 }
 
@@ -622,6 +631,7 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
         .chain(input.assign_by_session.iter().map(|a| a.stream.clone()))
         .chain(input.assign_by_pattern.iter().map(|a| a.stream.clone()))
         .chain(input.assign_by_event_ids.iter().map(|a| a.stream.clone()))
+        .chain(input.assign_by_time.iter().map(|a| a.stream.clone()))
         .collect();
 
     for name in &all_stream_names {
@@ -742,6 +752,39 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
                 stream = %assignment.stream,
                 count,
                 "assigned explicit events"
+            );
+            total_assigned += count;
+        }
+    }
+
+    // Phase 4.5: Time-range assignments — attribute unassigned GUI/window_focus time
+    // (no cwd/session) to a stream by semantic temporal judgment.
+    for assignment in &input.assign_by_time {
+        let stream_id = stream_name_to_id
+            .get(&assignment.stream)
+            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+
+        let start = parse_datetime(&assignment.start)
+            .context("invalid start time in time-range assignment")?;
+        let end =
+            parse_datetime(&assignment.end).context("invalid end time in time-range assignment")?;
+
+        let count = db
+            .assign_events_by_time_range(start, end, stream_id)
+            .with_context(|| {
+                format!(
+                    "failed to assign time range to stream {}",
+                    assignment.stream
+                )
+            })?;
+
+        if count > 0 {
+            tracing::info!(
+                start = %assignment.start,
+                end = %assignment.end,
+                stream = %assignment.stream,
+                count,
+                "assigned time-range events"
             );
             total_assigned += count;
         }
@@ -1007,6 +1050,7 @@ mod tests {
                 stream: "stream-x".to_string(),
             }],
             assign_by_event_ids: vec![],
+            assign_by_time: vec![],
         };
 
         // Manually run the assignment logic (without recompute)

@@ -132,6 +132,34 @@ impl IngestEvent {
             git_workspace: git_identity.and_then(|i| i.workspace_name),
         }
     }
+
+    /// Creates a new tmux scroll event with a deterministic ID.
+    pub fn scroll(
+        machine_id: &str,
+        pane_id: String,
+        tmux_session: String,
+        window_index: Option<u32>,
+        cwd: String,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let id = format!("{machine_id}:remote.tmux:tmux_scroll:{timestamp_str}:{pane_id}");
+
+        let git_identity = get_git_identity(Path::new(&cwd));
+
+        Self {
+            id,
+            timestamp: timestamp_str,
+            source: "remote.tmux".to_string(),
+            event_type: "tmux_scroll".to_string(),
+            cwd: Some(cwd),
+            pane_id,
+            tmux_session,
+            window_index,
+            git_project: git_identity.as_ref().map(|i| i.project_name.clone()),
+            git_workspace: git_identity.and_then(|i| i.workspace_name),
+        }
+    }
 }
 
 /// Debounce window for pane focus events (500ms).
@@ -278,7 +306,6 @@ fn ingest_pane_focus_impl(
     window_index: Option<u32>,
     cwd: &str,
 ) -> Result<bool> {
-    // Validate required fields are not empty
     if pane_id.is_empty() {
         anyhow::bail!("pane_id cannot be empty");
     }
@@ -286,28 +313,7 @@ fn ingest_pane_focus_impl(
         anyhow::bail!("session_name cannot be empty");
     }
 
-    fs::create_dir_all(data_dir).context("failed to create data directory")?;
-
-    // Acquire lock
-    let lock_file = File::create(lock_path(data_dir)).context("failed to create lock file")?;
-    lock_file
-        .lock_exclusive()
-        .context("failed to acquire lock")?;
-
     let now = Utc::now();
-    #[expect(clippy::cast_sign_loss, reason = "timestamps are always positive")]
-    let now_ms = now.timestamp_millis() as u64;
-
-    // Check debounce and update state in one pass
-    if check_and_update_debounce(data_dir, pane_id, now_ms)? {
-        tracing::debug!(pane_id, "debounced pane focus event");
-        return Ok(false);
-    }
-
-    // Rotate events file if too large (before appending)
-    maybe_rotate_events(data_dir)?;
-
-    // Create and write event
     let event = IngestEvent::pane_focus(
         machine_id,
         pane_id.to_string(),
@@ -316,9 +322,66 @@ fn ingest_pane_focus_impl(
         cwd.to_string(),
         now,
     );
-    append_event(data_dir, &event)?;
+    write_pane_event(data_dir, pane_id, now, &event)
+}
 
-    tracing::info!(event_id = %event.id, "ingested pane focus event");
+/// Ingests a tmux scroll event (copy-mode entry) to the specified data directory.
+fn ingest_scroll_impl(
+    data_dir: &Path,
+    machine_id: &str,
+    pane_id: &str,
+    session_name: &str,
+    window_index: Option<u32>,
+    cwd: &str,
+) -> Result<bool> {
+    if pane_id.is_empty() {
+        anyhow::bail!("pane_id cannot be empty");
+    }
+    if session_name.is_empty() {
+        anyhow::bail!("session_name cannot be empty");
+    }
+
+    let now = Utc::now();
+    let event = IngestEvent::scroll(
+        machine_id,
+        pane_id.to_string(),
+        session_name.to_string(),
+        window_index,
+        cwd.to_string(),
+        now,
+    );
+    // Shares the pane debounce key with pane-focus: one tmux activity event per
+    // pane per debounce window is enough to keep the attention window alive.
+    write_pane_event(data_dir, pane_id, now, &event)
+}
+
+/// Locks the data dir, debounces by `debounce_key`, rotates if needed, and appends
+/// `event`. Returns `false` when the event was debounced (skipped).
+fn write_pane_event(
+    data_dir: &Path,
+    debounce_key: &str,
+    now: DateTime<Utc>,
+    event: &IngestEvent,
+) -> Result<bool> {
+    fs::create_dir_all(data_dir).context("failed to create data directory")?;
+
+    let lock_file = File::create(lock_path(data_dir)).context("failed to create lock file")?;
+    lock_file
+        .lock_exclusive()
+        .context("failed to acquire lock")?;
+
+    #[expect(clippy::cast_sign_loss, reason = "timestamps are always positive")]
+    let now_ms = now.timestamp_millis() as u64;
+
+    if check_and_update_debounce(data_dir, debounce_key, now_ms)? {
+        tracing::debug!(debounce_key, "debounced tmux event");
+        return Ok(false);
+    }
+
+    maybe_rotate_events(data_dir)?;
+    append_event(data_dir, event)?;
+
+    tracing::info!(event_id = %event.id, "ingested tmux event");
 
     Ok(true)
 }
@@ -334,6 +397,26 @@ pub fn ingest_pane_focus(
 ) -> Result<bool> {
     let identity = crate::machine::require_machine_identity()?;
     ingest_pane_focus_impl(
+        &default_data_dir(),
+        &identity.machine_id,
+        pane_id,
+        session_name,
+        window_index,
+        cwd,
+    )
+}
+
+/// Ingests a tmux scroll event to the default data directory.
+///
+/// This is the public API used by the CLI.
+pub fn ingest_scroll(
+    pane_id: &str,
+    session_name: &str,
+    window_index: Option<u32>,
+    cwd: &str,
+) -> Result<bool> {
+    let identity = crate::machine::require_machine_identity()?;
+    ingest_scroll_impl(
         &default_data_dir(),
         &identity.machine_id,
         pane_id,
@@ -839,6 +922,30 @@ mod tests {
         assert_eq!(events[0].pane_id, "%1");
         assert_eq!(events[0].tmux_session, "main");
         assert_eq!(events[0].cwd, Some("/home/test".to_string()));
+    }
+
+    #[test]
+    fn ingest_scroll_writes_tmux_scroll_event() {
+        // Given: a temp data dir.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        // When: a scroll event is ingested.
+        let result = ingest_scroll_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            Some(0),
+            "/home/test",
+        );
+
+        // Then: a single tmux_scroll event is written for the pane.
+        assert!(result.unwrap());
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "tmux_scroll");
+        assert_eq!(events[0].pane_id, "%1");
     }
 
     #[test]

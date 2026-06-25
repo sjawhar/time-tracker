@@ -21,6 +21,8 @@ Computes direct (human focus) and delegated (agent) time per stream.
 2. Build **agent activity timeline** from `agent_session` + `agent_tool_use` events
 3. Walk intervals: attribute time based on focus state and agent state
 
+> **Capture status (important):** `tmux_scroll` and `browser_tab` are *consumed* by the algorithm but have **no emission path** — there is no tmux hook and no `tt ingest` subcommand that produces them, so there are **0 such events ever** in the DB. The CLI help text claiming "scroll" capture (`cli.rs`) and `config/tmux-hook.conf` are both missing it (the hook only emits `tmux_pane_focus` on focus changes). Treat `tmux_scroll`/`browser_tab` as **unimplemented inputs**, not live signals, until a capture path is wired. Their absence means in-pane reading/scrolling produces no events, so heads-down terminal work leans entirely on the `attention_window` cap.
+
 ### Key Types
 
 - `AllocatableEvent` — trait that `StoredEvent` (tt-db) implements. Methods: `timestamp()`, `event_type()`, `stream_id()`, `session_id()`, `action()`, `data()`
@@ -37,7 +39,21 @@ Computes direct (human focus) and delegated (agent) time per stream.
 - Agent timeout: no tool_use for `agent_timeout_ms` → session ends at last tool_use
 - `user_message` events establish focus on their stream (like `tmux_pane_focus`) — sending a message to an agent counts as direct work
 - Focus hierarchy (`resolve_focus_stream`): terminal app → tmux stream; browser app → browser-tab stream, falling back to the window's own stream when there's no `browser_tab` info; other GUI app → the window's stream
-- `window_focus` establishes focus for non-terminal/non-browser GUI apps (Slack, doc/PDF readers): it closes the prior interval against the *old* window state first, then opens the new focus. Unclassified window events (no stream) accrue no time until classify assigns them
+- `window_focus` establishes focus for non-terminal/non-browser GUI apps (Slack, doc/PDF readers): it closes the prior interval against the *old* window state first, then opens the new focus. A GUI/browser window with **no resolvable stream still accrues direct time to the UNASSIGNED bucket** (same as unassigned tmux focus) — active GUI time is never dropped to zero; it waits in UNASSIGNED until classify attributes it.
+
+### Streams are semantic — there is NO deterministic surface→stream mapping
+
+A **stream** is a coherent unit of *work*, identified by human/LLM judgment. It is **not** derivable from any surface signal. Each of these is NOT a stream:
+
+- a **working directory** is not a stream (one repo/dir hosts many streams; one stream spans many dirs)
+- a **window title** is not a stream
+- a **browser tab / URL** is not a stream
+- an **app name** is not a stream
+- **"unfocused"** is not a stream
+
+**Do NOT add deterministic rules that map cwd / window title / browser tab / app name → stream.** That approach is *fundamentally unsound* and is a known dead end: the same surface belongs to different streams over time, and a single stream spans many surfaces. There is no rule that recovers the mapping — only semantic judgment does.
+
+Classification is therefore done by an LLM/human via `tt classify --apply` (per-session or temporal context), never by a fixed surface rule. Surface signals may at most be **weak temporal hints** for that classifier — never an attribution rule. Events with no resolvable stream stay **UNASSIGNED** until semantically classified; they must not be silently dropped, nor back-filled by surface heuristics.
 
 ### Testing
 
