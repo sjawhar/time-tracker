@@ -21,7 +21,7 @@ Computes direct (human focus) and delegated (agent) time per stream.
 2. Build **agent activity timeline** from `agent_session` + `agent_tool_use` events
 3. Walk intervals: attribute time based on focus state and agent state
 
-> **Capture status (important):** `tmux_scroll` and `browser_tab` are *consumed* by the algorithm but have **no emission path** — there is no tmux hook and no `tt ingest` subcommand that produces them, so there are **0 such events ever** in the DB. The CLI help text claiming "scroll" capture (`cli.rs`) and `config/tmux-hook.conf` are both missing it (the hook only emits `tmux_pane_focus` on focus changes). Treat `tmux_scroll`/`browser_tab` as **unimplemented inputs**, not live signals, until a capture path is wired. Their absence means in-pane reading/scrolling produces no events, so heads-down terminal work leans entirely on the `attention_window` cap.
+> **Capture status (important):** `tmux_scroll` is now emitted by `tt ingest scroll`, wired to the `pane-mode-changed` tmux hook in `config/tmux-hook.conf` (fires on copy-mode *entry*, e.g. mouse-wheel up — NOT on every wheel tick, so long copy-mode reading past the `attention_window` still relies on the cap). `window_focus`/`afk_change` come from the COSMIC `tt-watcher` daemon. `browser_tab` remains an **unimplemented input** — no emission path, 0 such events in the DB — so browser focus falls back to the window's own stream (→ UNASSIGNED until classified). Heads-down terminal work between focus/scroll events still leans on the `attention_window` cap.
 
 ### Key Types
 

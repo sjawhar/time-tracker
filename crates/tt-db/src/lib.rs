@@ -890,9 +890,17 @@ impl Database {
         end: chrono::DateTime<chrono::Utc>,
         stream_id: &str,
     ) -> Result<u64, DbError> {
+        if start >= end {
+            return Ok(0);
+        }
+        // Time-range assignment is for non-session focus signals only (window/tmux
+        // focus, scroll, afk, browser tab). Agent/session events (agent_session,
+        // agent_tool_use, user_message) are attributed via their session, never by a
+        // temporal window — assigning them here would mis-bucket delegated work.
         let count = self.conn.execute(
             "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
-             WHERE stream_id IS NULL AND timestamp >= ?2 AND timestamp < ?3",
+             WHERE stream_id IS NULL AND timestamp >= ?2 AND timestamp < ?3 \
+             AND type IN ('window_focus', 'tmux_pane_focus', 'tmux_scroll', 'afk_change', 'browser_tab')",
             params![stream_id, format_timestamp(start), format_timestamp(end)],
         )?;
         Ok(count as u64)
@@ -2444,6 +2452,35 @@ mod tests {
                 .iter()
                 .any(|e| e.id == "outside")
         );
+    }
+
+    #[test]
+    fn assign_events_by_time_range_skips_session_and_agent_events() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("dpi"))).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 6, 24, 15, 30, 0).unwrap();
+        // Focus event -> assignable by time.
+        db.insert_event(&make_event("focus", t, tt_core::EventType::WindowFocus))
+            .unwrap();
+        // Session/agent events -> must NOT be time-assigned; they belong to their session.
+        db.insert_event(&make_event("tool", t, tt_core::EventType::AgentToolUse))
+            .unwrap();
+        db.insert_event(&make_event("agent", t, tt_core::EventType::AgentSession))
+            .unwrap();
+        db.insert_event(&make_event("msg", t, tt_core::EventType::UserMessage))
+            .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 6, 24, 15, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 24, 16, 0, 0).unwrap();
+        let assigned = db.assign_events_by_time_range(start, end, "s1").unwrap();
+
+        // Only the window_focus event is assigned.
+        assert_eq!(assigned, 1);
+        let s1 = db.get_events_by_stream("s1").unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].id, "focus");
+        // Inverted/empty range is a no-op.
+        assert_eq!(db.assign_events_by_time_range(end, start, "s1").unwrap(), 0);
     }
 
     #[test]
