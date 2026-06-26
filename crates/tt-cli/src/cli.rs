@@ -451,6 +451,25 @@ pub enum IngestEvent {
         window: Option<u32>,
     },
 
+    /// Record a tmux scroll (copy-mode) event.
+    Scroll {
+        /// The tmux pane ID (e.g., %3).
+        #[arg(long)]
+        pane: String,
+
+        /// The current working directory of the pane.
+        #[arg(long)]
+        cwd: String,
+
+        /// The tmux session name.
+        #[arg(long)]
+        session: String,
+
+        /// The tmux window index (optional).
+        #[arg(long)]
+        window: Option<u32>,
+    },
+
     /// Index coding assistant sessions.
     ///
     /// Scans Claude Code (~/.claude/projects/) and `OpenCode`

@@ -63,6 +63,19 @@ fn main() -> Result<()> {
                     tracing::debug!("event debounced");
                 }
             }
+            IngestEvent::Scroll {
+                pane,
+                cwd,
+                session,
+                window,
+            } => {
+                let written = ingest::ingest_scroll(pane, session, *window, cwd)?;
+                if written {
+                    tracing::debug!("scroll event ingested");
+                } else {
+                    tracing::debug!("scroll event debounced");
+                }
+            }
             IngestEvent::Sessions => {
                 let (db, _config) = open_database(cli.config.as_deref())?;
                 ingest::index_sessions(&db)?;

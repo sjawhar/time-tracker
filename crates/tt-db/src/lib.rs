@@ -877,6 +877,27 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Assigns currently-unassigned events in a half-open time window `[start, end)`
+    /// to a stream.
+    ///
+    /// Unlike `assign_events_by_pattern`, this matches by time alone (no cwd) and only
+    /// touches events with `stream_id IS NULL` — for attributing GUI/`window_focus`
+    /// activity (which carries no cwd or session) to a stream by semantic temporal
+    /// judgment. Returns the number of events updated.
+    pub fn assign_events_by_time_range(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        stream_id: &str,
+    ) -> Result<u64, DbError> {
+        let count = self.conn.execute(
+            "UPDATE events SET stream_id = ?1, assignment_source = 'inferred' \
+             WHERE stream_id IS NULL AND timestamp >= ?2 AND timestamp < ?3",
+            params![stream_id, format_timestamp(start), format_timestamp(end)],
+        )?;
+        Ok(count as u64)
+    }
+
     /// Retrieves events assigned to a specific stream.
     ///
     /// Events are returned ordered by timestamp ascending.
@@ -2371,6 +2392,58 @@ mod tests {
         let events = db.get_events_by_stream("s1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "e1");
+    }
+
+    #[test]
+    fn assign_events_by_time_range_assigns_only_unassigned_in_window() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("dpi"))).unwrap();
+        db.insert_stream(&make_stream("s2", Some("other"))).unwrap();
+
+        let in_window = Utc.with_ymd_and_hms(2026, 6, 24, 15, 30, 0).unwrap();
+        let out_window = Utc.with_ymd_and_hms(2026, 6, 24, 17, 0, 0).unwrap();
+
+        // Unassigned event inside the window -> should be assigned to s1.
+        db.insert_event(&make_event(
+            "inside",
+            in_window,
+            tt_core::EventType::WindowFocus,
+        ))
+        .unwrap();
+        // Already-assigned event inside the window -> must NOT be clobbered.
+        db.insert_event(&make_event(
+            "assigned",
+            in_window,
+            tt_core::EventType::WindowFocus,
+        ))
+        .unwrap();
+        db.assign_event_to_stream("assigned", "s2", "inferred")
+            .unwrap();
+        // Unassigned event outside the window -> must stay unassigned.
+        db.insert_event(&make_event(
+            "outside",
+            out_window,
+            tt_core::EventType::WindowFocus,
+        ))
+        .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 6, 24, 15, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 24, 16, 0, 0).unwrap();
+        let updated = db.assign_events_by_time_range(start, end, "s1").unwrap();
+
+        assert_eq!(updated, 1);
+        let s1_events = db.get_events_by_stream("s1").unwrap();
+        assert_eq!(s1_events.len(), 1);
+        assert_eq!(s1_events[0].id, "inside");
+        // s2's pre-assigned event is untouched.
+        assert_eq!(db.get_events_by_stream("s2").unwrap().len(), 1);
+        // The out-of-window event stays unassigned.
+        assert!(
+            db.get_events_without_stream()
+                .unwrap()
+                .iter()
+                .any(|e| e.id == "outside")
+        );
     }
 
     #[test]

@@ -178,6 +178,8 @@ classify those sessions before computing time. After `tt report`, also check tha
 total. If the `(unassigned)` bucket is large, the report is INCOMPLETE — classify,
 recompute, and re-pull. Never report per-project time off an uncovered day.
 
+**Classifying the day is YOUR job, not the user's.** When you find unassigned cwds, you do NOT ask the user whether to classify, and you do NOT offer per-project times as an optional extra ("want me to run the full recompute?"). An uncovered day is a bug you silently fix: build the `assign_by_session` JSON (one entry per window session) plus `assign_by_pattern` for the residual non-session events (afk/focus by cwd+window), `tt classify --apply`, let it recompute, and re-pull `tt report`. Personal/meta cwds (this repo, dotfiles, etc.) still get a stream so they're cleanly *excluded* from the post, not left festering in the unassigned bucket. The ONLY things you ask the user are plans/blockers (Phase 10) and content edits (Phase 12) — never permission to do the data pipeline.
+
 **The coverage gate applies to the WEEK, not just the day.** The Weekly Priority Check (Phase 7) reads `tt report --week`, so run this same coverage check across the whole week window (Mon→now), not just yesterday. A brand-new working directory (e.g. a freshly-cloned sub-project or new worktree) starts out unassigned to any stream and silently vanishes from the totals — close that gap before trusting the priority proportions.
 
 ## Phase 6: Get Computed Time
@@ -436,6 +438,7 @@ mkdir -p "$DIR"
 | Inventing a per-priority % | Most priorities have no `tt` signal. Show where time *did* go and reason about alignment; attach hours only when a priority cleanly maps to a stream/tag. |
 | Coverage-gating only yesterday | The priority beat reads `tt report --week`; run the same coverage check (Phase 5) across the whole week (Mon→now), not just yesterday, or new working directories stay unattributed and skew the proportions. |
 | Editing `priorities.md` beyond what the user said | Only tick/add/drop based on what the user actually confirmed this standup. Carried-from-review items stay in their "confirm" section until confirmed. |
+| Asking the user whether to classify, or offering per-project times as an optional "want me to run the recompute?" | **Never.** An uncovered day is a bug you silently fix (Phase 5). Build `assign_by_session` + `assign_by_pattern`, `tt classify --apply`, recompute, re-pull. Only ask the user for plans/blockers and content edits. |
 
 ## Example Output
 

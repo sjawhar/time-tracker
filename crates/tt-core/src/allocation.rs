@@ -728,8 +728,9 @@ fn is_browser_app(app: &str) -> bool {
 ///
 /// Hierarchy:
 /// - If window is a terminal app -> use tmux focus stream
-/// - If window is a browser app -> use browser tab stream, falling back to window focus stream
-/// - Otherwise -> use window focus stream
+/// - If window is a browser app -> browser tab stream, else the window's own stream,
+///   else the UNASSIGNED bucket (active GUI time is never dropped to nothing)
+/// - Otherwise (non-terminal GUI) -> the window's own stream, else UNASSIGNED
 fn resolve_focus_stream(
     window_state: &WindowFocusState,
     tmux_stream_id: Option<&str>,
@@ -737,10 +738,19 @@ fn resolve_focus_stream(
 ) -> Option<String> {
     match &window_state.app {
         Some(app) if is_terminal_app(app) => tmux_stream_id.map(String::from),
-        Some(app) if is_browser_app(app) => browser_stream_id
-            .map(String::from)
-            .or_else(|| window_state.stream_id.clone()),
-        Some(_) => window_state.stream_id.clone(),
+        Some(app) if is_browser_app(app) => Some(
+            browser_stream_id
+                .or(window_state.stream_id.as_deref())
+                .unwrap_or(UNASSIGNED_STREAM_ID)
+                .to_string(),
+        ),
+        Some(_) => Some(
+            window_state
+                .stream_id
+                .as_deref()
+                .unwrap_or(UNASSIGNED_STREAM_ID)
+                .to_string(),
+        ),
         None => tmux_stream_id.map(String::from), // Fallback to tmux if no window info
     }
 }
@@ -1968,6 +1978,48 @@ mod tests {
 
         // Focus with no stream accrues direct time to the unassigned bucket (1min window),
         // and must not appear as a real stream.
+        assert_eq!(result.unassigned_direct_ms, 60_000);
+        assert!(result.stream_times.is_empty());
+    }
+
+    #[test]
+    fn test_browser_focus_without_stream_accrues_unassigned_direct() {
+        // Given: focus on a browser window with no resolvable stream (no browser_tab,
+        // no window stream) — e.g. reading a doc in Brave.
+        let events = vec![TestEvent::window_focus(ts(0), "brave-browser", None)];
+
+        // When: time is allocated over a 5-minute period.
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Then: the active browser time accrues to the unassigned bucket (1-min window),
+        // not zero, and does not appear as a real stream.
+        assert_eq!(result.unassigned_direct_ms, 60_000);
+        assert!(result.stream_times.is_empty());
+    }
+
+    #[test]
+    fn test_gui_focus_without_stream_accrues_unassigned_direct() {
+        // Given: focus on a non-terminal GUI window (Slack) with no stream.
+        let events = vec![TestEvent::window_focus(ts(0), "slack", None)];
+
+        // When: time is allocated over a 5-minute period.
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Then: the active GUI time accrues to the unassigned bucket, not zero.
         assert_eq!(result.unassigned_direct_ms, 60_000);
         assert!(result.stream_times.is_empty());
     }
