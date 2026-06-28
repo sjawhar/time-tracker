@@ -363,10 +363,15 @@ pub fn allocate_time<E: AllocatableEvent>(
                         tmux_focus_stream_id.as_deref(),
                         browser_focus_state.stream_id.as_deref(),
                     );
-                    // Only reset attention window if this event is for the resolved stream
-                    let event_stream = Some(event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID));
+                    // Reset the attention window if this scroll belongs to the
+                    // focused pane. The tmux hook emits scroll events with no stream
+                    // of their own, so an unassigned scroll counts toward the
+                    // currently focused stream; a scroll tagged to a DIFFERENT stream
+                    // is ignored.
+                    let event_stream = event.stream_id();
                     if let Some(resolved_stream) = &resolved {
-                        if event_stream == Some(resolved_stream.as_str()) {
+                        if event_stream.is_none() || event_stream == Some(resolved_stream.as_str())
+                        {
                             if event_time > *focus_start {
                                 let max_end = *focus_start
                                     + Duration::milliseconds(config.attention_window_ms);
@@ -711,6 +716,7 @@ fn is_terminal_app(app: &str) -> bool {
         || app_lower.contains("kitty")
         || app_lower.contains("konsole")
         || app_lower.contains("gnome-terminal")
+        || app_lower.contains("ghostty")
 }
 
 /// Returns true if the app name indicates a browser application.
@@ -1407,6 +1413,67 @@ mod tests {
         let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
         // Window focus + tmux focus on same stream = 1 minute (attention window)
         assert_eq!(stream_a.time_direct_ms, 60 * 1000);
+    }
+
+    #[test]
+    fn test_ghostty_window_focus_resolves_to_tmux_stream() {
+        // Regression: the user's terminal app id is "com.mitchellh.ghostty". Its
+        // watcher window-focus events (which carry no stream of their own) must credit
+        // the active tmux stream, not leak to the UNASSIGNED bucket.
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::window_focus(ts(2), "com.mitchellh.ghostty", None),
+            TestEvent::tmux_focus(ts(10), "A"),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        assert!(stream_a.time_direct_ms > 0);
+        assert_eq!(result.unassigned_direct_ms, 0);
+    }
+
+    #[test]
+    fn test_unassigned_scroll_refreshes_focused_tmux_stream() {
+        // Regression: the tmux hook emits tmux_scroll events with no stream of their
+        // own. Such a scroll must refresh the attention window on the currently
+        // focused tmux stream (heads-down scrolling stays "active"), instead of being
+        // ignored because its stream != the focused stream.
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent {
+                timestamp: ts(4),
+                event_type: EventType::TmuxScroll,
+                stream_id: None,
+                session_id: None,
+                action: None,
+                data: json!({"direction": "up"}),
+            },
+        ];
+
+        let config = AllocationConfig {
+            attention_window_ms: 5 * 60 * 1000,
+            agent_timeout_ms: 30 * 60 * 1000,
+        };
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(8)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // Scroll at 4min resets the window, so A accrues 0->4 plus 4->8 = 8 min;
+        // without the reset it would cap at the single 0->5 window (5 min).
+        assert!(stream_a.time_direct_ms > 5 * 60 * 1000);
     }
 
     #[test]

@@ -15,6 +15,7 @@ Use `tt todo` and `tt priority` as the shared source of truth for priorities, to
 4. **Partner mode is read-only.** When asked to think, choose, prioritize, or diagnose drift, read `tt todo check` and `tt todo drift`, then reason in chat. Mutate the store only after an explicit edit request.
 5. **Order is shared; value is the user’s.** You may reposition todos with `tt todo rank`. Never add, finish, or change priority values unless the user explicitly asks for that priority operation.
 6. **Standup integration.** During standup work, resurface `when:` items whose local day has arrived and archive plan-vs-actual notes under `w<NN>/<DATE>.md` in `daily-standups/` (the standup archive, separate from the tt store).
+7. **Proactive curation.** Don't wait to be asked to dedup. Whenever you surface the list (`next`/`ls`) or run a standup, scan for and flag likely duplicates/overlaps, stale long-deferred items (deferred past their date with no movement), orphans the user doesn't recognize, and mis-tagged priorities — then propose consolidation (fold redundant items via `done`, naming the survivor). Surface it; never silently delete, and don't make the user spot the mess first.
 
 ## Command Vocabulary
 

@@ -47,6 +47,8 @@ These rules take priority over other instructions:
 
 3. **Confirm before phase transitions** — Always confirm with the user before moving from narration (Phase 5) to structured presentation (Phase 6). Don't assume "done" from ambiguous signals.
 
+4. **`tt report` is the single source of truth for time — never re-derive it.** Every time number comes from `tt report`, which already merges ALL focus sources (tmux pane focus, COSMIC window-focus, browser, afk) into one allocation. NEVER compute active/direct time yourself in python or SQL, NEVER pick-and-choose event types (no "watcher-only" vs "terminal-only" — they are one focus timeline), and NEVER hand the user a tight/loose range — the allocator yields one exact number. If a figure looks impossible (a full workday reading ~3h, or direct ≪ a normal day), **suspect the BINARY or the DATA, not the algorithm**: check `tt --version` against the repo's latest release / `Cargo.toml` and rebuild/`mise upgrade` if stale, then run the Phase 1 coverage gate. Hand-rolling time math in python is the exact failure that turns a stale-binary bug into hours of wrong analysis — do not do it.
+
 ## Argument Parsing
 
 The JSONL path is passed as the skill's `args` parameter:
