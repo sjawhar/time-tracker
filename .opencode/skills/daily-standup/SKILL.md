@@ -173,12 +173,17 @@ sqlite3 "$DB" "SELECT COALESCE(stream_id,'NULL') AS sid, cwd, COUNT(*) AS n
 ```
 
 If any cwd with meaningful activity has `stream_id = NULL`, **GO BACK to Phase 4** and
-classify those sessions before computing time. After `tt report`, also check that
-`totals.unassigned_direct_ms + totals.unassigned_delegated_ms` is a small fraction of the
-total. If the `(unassigned)` bucket is large, the report is INCOMPLETE — classify,
-recompute, and re-pull. Never report per-project time off an uncovered day.
+classify those sessions before computing time. After `tt report`, **`totals.unassigned_direct_ms`
+must be ~zero** (a few-minute rounding remainder, not "a small fraction") — there is no
+acceptable percentage of unassigned *direct* time; hours of it is a bug to fix, never a caveat
+to note. Delegated time may keep a small boundary-session tail. If direct is not zero, the
+report is INCOMPLETE: the unattributed time is loose events not grouped into a stream — route
+`window_focus` by `window_title`, `tmux_pane_focus` by the stream that dominates its cwd in the
+window, and boundary `agent_session`/`user_message` by session-dominant-then-cwd; `afk_change`
+markers are cwd-less and don't drive direct time (ignore). Recompute and re-pull until
+`unassigned_direct_ms` is zero. Never report per-project time off an uncovered day.
 
-**Classifying the day is YOUR job, not the user's.** When you find unassigned cwds, you do NOT ask the user whether to classify, and you do NOT offer per-project times as an optional extra ("want me to run the full recompute?"). An uncovered day is a bug you silently fix: build the `assign_by_session` JSON (one entry per window session) plus `assign_by_pattern` for the residual non-session events (afk/focus by cwd+window), `tt classify --apply`, let it recompute, and re-pull `tt report`. Personal/meta cwds (this repo, dotfiles, etc.) still get a stream so they're cleanly *excluded* from the post, not left festering in the unassigned bucket. The ONLY things you ask the user are plans/blockers (Phase 10) and content edits (Phase 12) — never permission to do the data pipeline.
+**Classifying the day is YOUR job, not the user's.** When you find unassigned cwds/events, you do NOT ask the user whether to classify, and you do NOT offer per-project times as an optional extra ("want me to run the recompute?"). An uncovered day is a bug you silently fix. **Classify per the ontology + the infer-streams Classification Discipline: project from session/window CONTENT, never the cwd/folder (a folder is not a workstream); `window_focus` browser/Slack events by `window_title`, never by proximity or a catch-all; project (WHAT) and activity (HOW) are separate axes — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; overhead is work, NOT `personal` (which is life only).** Then `tt classify --apply` (`assign_by_session` for sessions, title-match for window events, `assign_by_pattern` for residual afk/tmux), let it recompute, and re-pull `tt report`. Personal/meta cwds (this repo, dotfiles) get their real stream so they're cleanly *excluded* from the post, not festering in unassigned. The ONLY things you ask the user are plans/blockers (Phase 10) and content edits (Phase 12) — never permission to do the data pipeline.
 
 **The coverage gate applies to the WEEK, not just the day.** The Weekly Priority Check (Phase 7) reads `tt report --week`, so run this same coverage check across the whole week window (Mon→now), not just yesterday. A brand-new working directory (e.g. a freshly-cloned sub-project or new worktree) starts out unassigned to any stream and silently vanishes from the totals — close that gap before trusting the priority proportions.
 

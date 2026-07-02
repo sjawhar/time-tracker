@@ -29,6 +29,26 @@ expression: output
       ]
     }
   ],
+  "streams": [
+    {
+      "id": "abc123def456",
+      "name": "tmux/dev/session-1",
+      "time_direct_ms": 3600000,
+      "time_delegated_ms": 0,
+      "tags": [
+        "dev"
+      ]
+    },
+    {
+      "id": "def456ghi789",
+      "name": "tmux/dev/session-2",
+      "time_direct_ms": 1800000,
+      "time_delegated_ms": 600000,
+      "tags": [
+        "ops"
+      ]
+    }
+  ],
   "untagged": {
     "time_direct_ms": 0,
     "time_delegated_ms": 0,

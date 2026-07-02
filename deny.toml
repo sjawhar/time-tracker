@@ -4,7 +4,15 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 version = 2
-ignore = []
+ignore = [
+    # quick-xml DoS advisories (quadratic runtime on duplicate attrs / unbounded namespace
+    # allocation from malicious XML). quick-xml is pulled ONLY by wayland-scanner, a build-time
+    # proc-macro that parses the fixed, trusted Wayland protocol XML at compile time (tt-watcher
+    # only) — never untrusted input, so not reachable. No semver-compatible fix yet; drop when
+    # the cosmic/wayland toolchain bumps quick-xml.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
