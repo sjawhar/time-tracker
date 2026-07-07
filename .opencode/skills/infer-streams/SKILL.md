@@ -13,11 +13,27 @@ Identify work streams from time-tracker data, persist them in tt's database, and
 
 | Concept | Definition | Example |
 |---------|-----------|---------|
-| **Project** | A codebase/repository. Subdirectories are the SAME project. | `~/code/webapp/agents` → `webapp` |
+| **Project** | A logical, time-bound work *initiative*, inferred from session CONTENT — **not** a repo/cwd (see Classification Discipline + ontology rule #1). | folder `monorepo/teammate-x` → the *work* done there, e.g. `webapp: reviewing a teammate's PRs` |
 | **Stream** | A specific task/feature/PR within a project. Spans hours to 2-3 days. | "webapp: engine refactor", "cli-tool: WRK-125" |
 
 **BAD names:** "webapp work", "cli-tool development" (too coarse)
 **GOOD names:** "webapp: pipeline API redesign", "cli-tool: controller-worker separation"
+
+## Classification Discipline (READ FIRST — overrides any "project = repo" guidance below)
+
+The shared ontology (`~/.config/time-tracker/ontology.toml`) is the source of truth and **overrides this skill** wherever they conflict. Load it every run — it defines the valid project + activity vocabulary; use only tags from it. Its rules, restated because they get violated constantly:
+
+1. **Project = a unit of WORK, inferred from CONTENT — never the directory/cwd/repo.** A monorepo (or any repo) can host many projects at once, and one project can span repos. A folder like `monorepo/teammate-x` is not a workstream — the workstream is *what was done there* (e.g. reviewing a teammate's submissions). Infer the project + stream from session `summary`, `starting_prompt`, PR/issue/ticket/work-order refs, and window titles. cwd is at most a weak tiebreaker; by itself it is never a valid project or stream name.
+
+2. **window_focus / browser / Slack events carry their context in `window_title` + `window_app_id` — that IS their cwd-equivalent.** Classify them by what the title says (which doc, which channel, which site), exactly like you classify a tmux event by its cwd. NEVER assign a *titled* window event by time-proximity, and NEVER dump window activity into a catch-all. Only a blank / `New Tab` / sign-in flicker with no usable title may fall through.
+
+3. **Project (WHAT) and activity (HOW) are different axes — do not confuse them.** Activity types (e.g. `meetings`, `messages`, `ops`, `admin`, `planning`) describe the *nature* of work; they are **NOT projects or workstreams**. A planning meeting about project X is `project:X` + `activity:meetings`; a message thread about a contract is the relevant project + `activity:messages` — never a workstream called "meetings" or "messages". Overhead that genuinely serves no single project (a general standup, a cross-channel message scroll) → `project:other`/`misc` + its activity tag, still never a project named after the activity.
+
+4. **Overhead is work, not `personal`.** Enterprise/compliance work (MFA, device management, credential policy, security forms) is its own project per the ontology (rule #2). `personal` is **life only** (media, food, personal messages, errands). Lumping meetings, comms, security, or contract work into `personal` is a bug.
+
+5. **Every stream gets a project tag AND a primary `activity:` tag**, and is named by the work done (`webapp: pipeline API redesign`) — never by a folder or by an activity type.
+
+6. **No lazy catch-all `ELSE`.** If one bucket sweeps up many distinct kinds of work, you have not classified it — split it by content.
 
 ## Arguments
 
@@ -84,13 +100,14 @@ Every cwd with `sid = NULL` and non-trivial `n` MUST be assigned a stream in Pha
 
 ## Phase 3: Identify Streams
 
-For each project, group agent sessions into streams using:
+Group sessions into streams by **what was worked on** — content first, cwd last:
 
-1. **`summary`** — describes what was worked on
-2. **`starting_prompt`** — reveals intent
-3. **`project_path`** / `cwd` — identifies repo (merge subdirectories)
-4. **Temporal gaps** — >2 hours between activity often means different streams
-5. **Semantic similarity** — related sessions = ONE stream
+1. **`summary`** — what was actually done (the primary signal)
+2. **`starting_prompt`** — intent
+3. **PR / issue / Taiga / work-order refs** in the content → identify the project
+4. **`window_title`** (browser/Slack/window_focus) — the doc/channel/site names the work
+5. **Temporal + semantic clustering** — related sessions within >2h gaps = ONE stream
+6. **`cwd`** — a *weak tiebreaker only*, NEVER the basis for a project or stream name (ontology rule #1): a monorepo hosts many projects; a folder like `monorepo/teammate-x` is not a workstream.
 
 Present the proposed streams to the user for review before persisting.
 
@@ -119,7 +136,7 @@ Build a JSON file matching the `tt classify --apply` format:
 ```
 
 - Use `assign_by_session` for agent session events (all events for that session move together)
-- Use `assign_by_pattern` for non-session events (tmux_pane_focus, AFK) by CWD + time range
+- Use `assign_by_pattern` for non-session events (`tmux_pane_focus`, AFK) by cwd + time range. For **`window_focus`** events (browser/Slack — no cwd) classify by **`window_title` content** with title-match rules (which doc/channel/site), NOT by cwd, proximity, or a catch-all — the title is their context (Classification Discipline #2).
 
 Apply:
 
@@ -166,10 +183,13 @@ Present a consolidated table. All times in Pacific Time (UTC-8).
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
 | Reporting partial results | **Never** show a report or time number if remotes haven't been synced or events are unassigned. Incomplete data = wrong answer. |
 | Starting from "8 hours ago" | Check `tt streams list` — start from where streams end. |
-| Treating project as stream | Project = repo. Stream = task/feature. |
-| Splitting subdirectories | `/webapp/agents` is part of `webapp`. |
+| Tagging project by cwd/repo | Project = a work *initiative* inferred from CONTENT (ontology rule #1). A folder is not a project — never tag by directory. |
+| Naming a stream after a folder or an activity | Name streams by the work done (`webapp: pipeline API redesign`), not a directory (`repo/subdir`) or an activity type (`meetings`). |
 | Streams too coarse | "webapp work" → "webapp: pipeline API redesign". |
 | Leaving events unassigned | Everything gets assigned. Use "misc: {activity}" for unclear. |
+| Assigning window/browser/Slack events by cwd, proximity, or a catch-all | They carry `window_title` — classify by it, exactly like any other event. Only a blank/New-Tab/sign-in flicker may fall through. |
+| Lumping meetings / comms / infosec / contracts into `personal` | Overhead is work: meetings → `activity:meetings`, Slack/email → `activity:messages`, MDM/MFA/security-forms → `infosec`, contracts/billing → `activity:admin`. `personal` = life only. |
+| A stream with only a project tag | Every stream needs a project tag AND a primary `activity:` tag. |
 | Stopping after classify --apply | `tt classify --apply` runs recompute automatically. No separate step needed. |
 
 ## Done When

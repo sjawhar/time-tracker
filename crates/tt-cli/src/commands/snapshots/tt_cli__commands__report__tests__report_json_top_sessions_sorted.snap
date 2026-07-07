@@ -12,6 +12,15 @@ expression: output
     "type": "week"
   },
   "by_tag": [],
+  "streams": [
+    {
+      "id": "abc123def456",
+      "name": "tmux/dev/session-1",
+      "time_direct_ms": 7200000,
+      "time_delegated_ms": 4500000,
+      "tags": []
+    }
+  ],
   "untagged": {
     "time_direct_ms": 7200000,
     "time_delegated_ms": 4500000,

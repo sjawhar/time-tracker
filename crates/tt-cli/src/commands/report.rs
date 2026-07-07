@@ -704,6 +704,7 @@ pub struct JsonReport {
     pub week_start_day: String,
     pub period: JsonPeriod,
     pub by_tag: Vec<JsonTagEntry>,
+    pub streams: Vec<JsonStreamEntry>,
     pub untagged: JsonUntagged,
     pub agent_sessions: JsonAgentSessionSummary,
     pub totals: JsonTotals,
@@ -728,6 +729,16 @@ pub struct JsonTagEntry {
     pub time_direct_ms: i64,
     pub time_delegated_ms: i64,
     pub streams: Vec<String>,
+}
+
+/// Per-stream computed time within the report period.
+#[derive(Debug, Serialize)]
+pub struct JsonStreamEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub time_direct_ms: i64,
+    pub time_delegated_ms: i64,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -836,6 +847,24 @@ fn build_json_report(data: &ReportData) -> JsonReport {
         build_agent_session_summary(&data.agent_sessions, data.period_start, data.period_end);
 
     let by_tag = build_tag_entries(&data.streams, &data.tags_by_stream);
+
+    let mut stream_entries: Vec<JsonStreamEntry> = data
+        .streams
+        .iter()
+        .filter(|s| s.time_direct_ms > 0 || s.time_delegated_ms > 0)
+        .map(|s| {
+            let mut tags = data.tags_by_stream.get(&s.id).cloned().unwrap_or_default();
+            tags.sort();
+            JsonStreamEntry {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                time_direct_ms: s.time_direct_ms,
+                time_delegated_ms: s.time_delegated_ms,
+                tags,
+            }
+        })
+        .collect();
+    stream_entries.sort_by_key(|s| std::cmp::Reverse(s.time_direct_ms));
     let mut untagged_direct_ms = 0;
     let mut untagged_delegated_ms = 0;
     let mut untagged_streams = Vec::new();
@@ -860,6 +889,7 @@ fn build_json_report(data: &ReportData) -> JsonReport {
             period_type: data.period_type,
         },
         by_tag,
+        streams: stream_entries,
         untagged: JsonUntagged {
             time_direct_ms: untagged_direct_ms,
             time_delegated_ms: untagged_delegated_ms,
@@ -1297,6 +1327,7 @@ mod tests {
                 "type": "week"
               },
               "by_tag": [],
+              "streams": [],
               "untagged": {
                 "time_direct_ms": 0,
                 "time_delegated_ms": 0,
@@ -1326,6 +1357,7 @@ mod tests {
                 "type": "week"
               },
               "by_tag": [],
+              "streams": [],
               "untagged": {
                 "time_direct_ms": 0,
                 "time_delegated_ms": 0,
@@ -1385,6 +1417,7 @@ mod tests {
                 "type": "week"
               },
               "by_tag": [],
+              "streams": [],
               "untagged": {
                 "time_direct_ms": 0,
                 "time_delegated_ms": 0,
@@ -1414,6 +1447,7 @@ mod tests {
                 "type": "week"
               },
               "by_tag": [],
+              "streams": [],
               "untagged": {
                 "time_direct_ms": 0,
                 "time_delegated_ms": 0,
@@ -1443,6 +1477,7 @@ mod tests {
                 "type": "week"
               },
               "by_tag": [],
+              "streams": [],
               "untagged": {
                 "time_direct_ms": 0,
                 "time_delegated_ms": 0,

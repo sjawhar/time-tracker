@@ -97,12 +97,25 @@ Invoke the classify-streams skill:
 
 Full pipeline: load ontology, ingest sessions, identify untagged streams, classify (path heuristics + LLM), apply tags, report. **Wait for it to finish** before Phase 2.
 
+**Discipline (do not shortcut — this is where it goes wrong most):** classify per the ontology + the infer-streams *Classification Discipline*. Project comes from session/window **CONTENT, never cwd/path/folder** (a folder is not a workstream — name streams by the work done). Classify `window_focus` browser/Slack events by **`window_title`**, never by proximity or a catch-all. **Project (WHAT) and activity (HOW) are separate axes** — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; tag the project + the activity. **Overhead is work, NOT `personal`** (which is life only).
+
 ### Hard gate — do NOT advance to Phase 2 until BOTH hold
 
 1. You actually ran classification (not just read the unassigned count and noted it).
-2. Unattributed time is a **small fraction** of the total (rule of thumb: < ~15% of direct time). Verify explicitly after classifying.
+2. **`tt report` `totals.unassigned_direct_ms` is ~zero** — a rounding remainder (a few minutes), NOT "a small fraction." There is no acceptable percentage of unassigned *direct* time. If the report shows hours (or even a percent or two) of unattributed direct time, that is a **bug to fix**, not a caveat to note. Do not rationalize it, do not present it, do not save it. Drive it to zero.
 
-If a big unattributed bucket remains, the streams aren't the issue — loose events aren't grouped into streams (assignment conflicts, a new cwd, an ingestion gap). Investigate and re-run; don't proceed. If you're about to present time tables with a large unattributed bucket: **STOP**, fix it, or tell the user plainly that the time data is unusable this week and why.
+**Why zero and not "< 15%":** direct time is the human-attention signal the whole review rests on. 8 unattributed hours is an entire workday you cannot see — enough to flip "you barely touched sales" into "sales was a third of your week." A 15% escape hatch is exactly how a broken instrument ships looking grounded. Delegated time may retain a small unattributed tail (boundary agent sessions); **direct must be zero.**
+
+### How to actually close it (this is the part people skip)
+
+Unassigned direct time is almost never "untagged streams" — `tt report`'s `untagged` block is usually empty while `totals.unassigned_direct_ms` is large. The time is in **loose events not grouped into any stream.** Query the DB directly (`~/.local/share/time-tracker/tt.db`, `events` table, `stream_id IS NULL`, scoped to the window) and route by event type — one tight pass each, then `tt recompute` and re-check the total:
+
+- **`window_focus`** (browser/Slack/terminal-app focus — has `window_title`, no cwd): assign by `window_title` content to the matching stream (work comms→messages, meetings→meetings, project docs→that project, Disney+/gaming/shopping→personal). Content-free nav (New Tab, Sign in, system settings) is transient — route by workday-vs-context, not a blanket personal dump.
+- **`tmux_pane_focus`** (devbox terminal panes — has `cwd`, no session): route each `cwd` to the stream that **already dominates that cwd in the window** (compute the top assigned `stream_id` per cwd; don't invent a cwd→project table — let the classified sessions decide). This is the biggest direct-time bucket and the one the sync's auto-assign misses.
+- **`agent_session` / `user_message` / `agent_tool_use`** left unassigned (boundary sessions whose first event predates the window): assign by **session-dominant stream** where the session has assigned events elsewhere, else fall back to the same **cwd-dominant** routing. These anchor stray direct minutes between focus events.
+- **`afk_change`** and other cwd-less markers: these do **not** drive direct time — ignore them; they will remain "unassigned" harmlessly and will not move `unassigned_direct_ms`.
+
+Re-run `tt recompute` and re-read `totals.unassigned_direct_ms` after each pass. Iterate until it is zero. Only then advance.
 
 ### Fallback — genuine tool failure ONLY
 
