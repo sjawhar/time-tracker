@@ -77,6 +77,7 @@ impl RenderLine for TodoFileItem {
                     pin: todo.pin,
                     quick: todo.quick,
                     block: todo.block.clone(),
+                    sessions: todo.sessions.clone(),
                 };
                 let prefix = if todo.done {
                     TODO_DONE_PREFIX

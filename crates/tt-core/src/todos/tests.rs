@@ -64,6 +64,33 @@ fn round_trips_block_field_and_omits_when_absent() {
 }
 
 #[test]
+fn todo_sessions_roundtrip() {
+    let line = "- [ ] Fix watcher <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"sessions\":[\"ses_abc\",\"0199-uuid\"]} -->\n";
+    let (file, diagnostics) = parse_todos(line);
+    assert!(diagnostics.is_empty());
+    let TodoFileItem::Todo(todo) = &file.items[0].item else {
+        panic!("expected todo");
+    };
+    assert_eq!(todo.sessions, ["ses_abc", "0199-uuid"]);
+    assert!(
+        file.to_string()
+            .contains("\"sessions\":[\"ses_abc\",\"0199-uuid\"]")
+    );
+}
+
+#[test]
+fn todo_without_sessions_parses_and_renders_without_field() {
+    let line = "- [ ] Old todo <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false} -->\n";
+    let (file, diagnostics) = parse_todos(line);
+    assert!(diagnostics.is_empty());
+    let TodoFileItem::Todo(todo) = &file.items[0].item else {
+        panic!("expected todo");
+    };
+    assert!(todo.sessions.is_empty());
+    assert!(!file.to_string().contains("sessions"));
+}
+
+#[test]
 fn preserves_malformed_lines() {
     // Given: a malformed JSON todo line surrounded by raw markdown.
     let input = "## Later\n- [ ] Broken <!-- tt-todo:{bad json} -->\nplain note\n";
@@ -236,6 +263,7 @@ fn serializes_none_line_ending_as_separator_when_line_becomes_non_final() {
             quick: false,
             done: false,
             block: None,
+            sessions: Vec::new(),
         }),
         line_ending: LineEnding::None,
     });

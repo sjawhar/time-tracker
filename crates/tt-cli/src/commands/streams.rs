@@ -14,6 +14,8 @@ use super::report::format_duration;
 
 mod link;
 pub use link::{LinkOptions, link};
+mod slug;
+pub use slug::set_slug;
 
 // ========== Period Calculation ==========
 
@@ -47,6 +49,7 @@ fn last_7_days_boundary(today: NaiveDate) -> DateTime<Utc> {
 pub struct StreamEntry {
     pub id: String,
     pub id_short: String,
+    pub slug: Option<String>,
     pub name: Option<String>,
     pub time_direct_ms: i64,
     pub time_delegated_ms: i64,
@@ -72,6 +75,7 @@ pub fn get_streams_for_display(db: &Database, today: NaiveDate) -> Result<Vec<St
         .map(|(stream, tags)| {
             let id_short: String = stream.id.chars().take(6).collect();
             StreamEntry {
+                slug: stream.slug,
                 id: stream.id,
                 id_short,
                 name: stream.name,
@@ -111,18 +115,24 @@ pub fn format_streams(entries: &[StreamEntry]) -> String {
     // Header
     writeln!(
         output,
-        "{:<7}  {:<22}  {:>8}  {:>9}  Tags",
-        "ID", "Name", "Direct", "Delegated"
+        "{:<7}  {:<16}  {:<22}  {:>8}  {:>9}  Tags",
+        "ID", "Slug", "Name", "Direct", "Delegated"
     )
     .unwrap();
     writeln!(
         output,
-        "───────  ──────────────────────  ────────  ─────────  ──────────────────"
+        "───────  ────────────────  ──────────────────────  ────────  ─────────  ──────────────────"
     )
     .unwrap();
 
     // Rows
     for entry in entries {
+        let slug = entry.slug.as_deref().unwrap_or("-");
+        let slug_display = if slug.chars().count() > 16 {
+            format!("{}...", slug.chars().take(13).collect::<String>())
+        } else {
+            slug.to_string()
+        };
         let name = entry.name.as_deref().unwrap_or("(unnamed)");
         // Truncate by characters, not bytes, to avoid panics on multi-byte UTF-8
         let name_display = if name.chars().count() > 22 {
@@ -136,8 +146,8 @@ pub fn format_streams(entries: &[StreamEntry]) -> String {
 
         writeln!(
             output,
-            "{:<7}  {:<22}  {:>8}  {:>9}  {}",
-            entry.id_short, name_display, direct, delegated, tags
+            "{:<7}  {:<16}  {:<22}  {:>8}  {:>9}  {}",
+            entry.id_short, slug_display, name_display, direct, delegated, tags
         )
         .unwrap();
     }
@@ -214,6 +224,7 @@ pub fn create(db: &Database, name: String) -> Result<()> {
     let stream = Stream {
         id: Uuid::new_v4().to_string(),
         name: Some(name),
+        slug: None,
         created_at: now,
         updated_at: now,
         time_direct_ms: 0,

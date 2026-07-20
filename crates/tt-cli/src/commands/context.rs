@@ -924,6 +924,7 @@ mod tests {
         let stream = tt_db::Stream {
             id: "stream-xyz".to_string(),
             name: Some("test-stream".to_string()),
+            slug: None,
             created_at: chrono::DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -1018,6 +1019,7 @@ mod tests {
         let stream = tt_db::Stream {
             id: "stream-abc".to_string(),
             name: Some("time-tracker".to_string()),
+            slug: None,
             created_at: chrono::DateTime::parse_from_rfc3339("2026-01-15T09:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),

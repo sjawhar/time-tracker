@@ -49,6 +49,7 @@ pub fn todo(
         quick: false,
         done,
         block: None,
+        sessions: Vec::new(),
     }
 }
 

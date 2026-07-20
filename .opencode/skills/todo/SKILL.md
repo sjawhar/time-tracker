@@ -17,12 +17,24 @@ Use `tt todo` and `tt priority` as the shared source of truth for priorities, to
 6. **Standup integration.** During standup work, resurface `when:` items whose local day has arrived and archive plan-vs-actual notes under `w<NN>/<DATE>.md` in `daily-standups/` (the standup archive, separate from the tt store).
 7. **Proactive curation.** Don't wait to be asked to dedup. Whenever you surface the list (`next`/`ls`) or run a standup, scan for and flag likely duplicates/overlaps, stale long-deferred items (deferred past their date with no movement), orphans the user doesn't recognize, and mis-tagged priorities — then propose consolidation (fold redundant items via `done`, naming the survivor). Surface it; never silently delete, and don't make the user spot the mess first.
 
+## Linking your session
+
+When you start working on a todo, link your session to it (zero-arg session detection from
+`CLAUDE_CODE_SESSION_ID` / `OPENCODE_SESSION_ID`):
+
+    tt todo link <todo-id>
+
+This feeds classification: your session inherits the todo's stream, or the todo acquires a stream
+when the session gets classified.
+
 ## Command Vocabulary
 
 ```bash
 tt todo next [--top N --quick --json --by-priority --later]
 tt todo ls
-tt todo add "<text>" [--priority <slug>...] [--stream <name>] [--due <date>] [--when <date>] [--quick] [--pin]
+tt todo add "<text>" [--priority <slug>...] [--stream <slug>] [--due <date>] [--when <date>] [--quick] [--pin]
+tt todo link <todo-id> [--session <id>]
+tt todo unlink <todo-id> [--session <id>]
 tt todo done <id>
 tt todo defer <id> <date>
 tt todo rank <id> --top|--above <id>|--below <id>

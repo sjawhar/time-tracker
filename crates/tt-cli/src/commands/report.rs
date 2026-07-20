@@ -1217,6 +1217,7 @@ mod tests {
         db.insert_stream(&tt_db::Stream {
             id: "stream-a".to_string(),
             name: Some("Stream A".to_string()),
+            slug: None,
             created_at: start,
             updated_at: start,
             time_direct_ms: 0,
@@ -1229,6 +1230,7 @@ mod tests {
         db.insert_stream(&tt_db::Stream {
             id: "stream-b".to_string(),
             name: Some("Stream B".to_string()),
+            slug: None,
             created_at: start,
             updated_at: start,
             time_direct_ms: 0,
@@ -1980,6 +1982,7 @@ Delegated time: 3h 13m (36%)
         let zero_stream = tt_db::Stream {
             id: "zero-stream".to_string(),
             name: Some("empty".to_string()),
+            slug: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -2016,6 +2019,7 @@ Delegated time: 3h 13m (36%)
         db.insert_stream(&tt_db::Stream {
             id: stream_id.to_string(),
             name: Some("cross-boundary stream".to_string()),
+            slug: None,
             created_at: stream_created_at,
             updated_at: stream_created_at,
             time_direct_ms: 0,

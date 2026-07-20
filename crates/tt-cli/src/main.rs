@@ -157,10 +157,19 @@ fn main() -> Result<()> {
                         },
                     )?;
                 }
+                StreamsAction::Slug { stream, slug } => streams::set_slug(&db, stream, slug)?,
             }
         }
         Some(Commands::Todo(action)) => {
-            if matches!(action, TodoAction::Drift { .. }) {
+            if matches!(action, TodoAction::Drift { .. })
+                || matches!(
+                    action,
+                    TodoAction::Add {
+                        stream: Some(_),
+                        ..
+                    }
+                )
+            {
                 let (db, config) = open_database(cli.config.as_deref())?;
                 run_todo_action(Some(&db), &config, action)?;
             } else {
@@ -218,12 +227,13 @@ fn main() -> Result<()> {
             gaps,
             gap_threshold,
         }) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
+            let (db, config) = open_database(cli.config.as_deref())?;
             if let Some(input_path) = apply {
-                classify::run_apply(&db, input_path)?;
+                classify::run_apply(&db, &config, input_path)?;
             } else {
                 classify::run_show(
                     &db,
+                    &config,
                     *unclassified,
                     *summary,
                     *json,

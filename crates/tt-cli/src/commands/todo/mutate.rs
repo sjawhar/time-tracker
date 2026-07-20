@@ -11,7 +11,19 @@ use super::{AddOptions, RankOptions};
 use crate::Config;
 use crate::todo_store::{LoadedTodoStore, load_mutating, write_todos};
 
-pub fn run_add(config: &Config, options: AddOptions) -> Result<()> {
+pub fn run_add(config: &Config, db: Option<&tt_db::Database>, options: AddOptions) -> Result<()> {
+    if let Some(slug) = options.stream.as_deref() {
+        let db = db.context("--stream requires the database")?;
+        if db
+            .get_stream_by_slug(slug)
+            .context("failed to look up stream slug")?
+            .is_none()
+        {
+            bail!(
+                "no stream with slug '{slug}'; create it via classification or set one with: tt streams slug <stream> {slug}"
+            );
+        }
+    }
     let when = parse_optional_date(options.when.as_deref(), "--when")?;
     let due = parse_optional_date(options.due.as_deref(), "--due")?;
     let mut loaded = load_mutating(config)?;
@@ -29,6 +41,7 @@ pub fn run_add(config: &Config, options: AddOptions) -> Result<()> {
         quick: options.quick,
         done: false,
         block: None,
+        sessions: Vec::new(),
     };
     insert_todo_by_rank(&mut loaded, todo);
     write_todos(config, &loaded.store.todos)
@@ -118,7 +131,7 @@ pub fn run_normalize_ids(config: &Config) -> Result<()> {
     write_todos(config, &loaded.store.todos)
 }
 
-fn unique_todo_line_index(loaded: &LoadedTodoStore, id: &str) -> Result<usize> {
+pub(super) fn unique_todo_line_index(loaded: &LoadedTodoStore, id: &str) -> Result<usize> {
     let matches = loaded
         .store
         .todos
@@ -196,4 +209,64 @@ fn parse_optional_date(value: Option<&str>, label: &str) -> Result<Option<NaiveD
 fn parse_date(value: &str, label: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .with_context(|| format!("invalid {label} date '{value}', expected YYYY-MM-DD"))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use tt_db::{Database, Stream};
+
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Config) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            database_path: temp.path().join("tt.db"),
+            todo_store_path: temp.path().join("todo-store"),
+        };
+        (temp, config)
+    }
+
+    fn add_options(stream: Option<&str>) -> AddOptions {
+        AddOptions {
+            text: "Add task".to_string(),
+            priority: Vec::new(),
+            stream: stream.map(str::to_string),
+            due: None,
+            when: None,
+            quick: false,
+            pin: false,
+        }
+    }
+
+    fn insert_stream(db: &Database, slug: &str) {
+        let now = Utc::now();
+        db.insert_stream(&Stream {
+            id: "stream-1".to_string(),
+            name: Some("Project X".to_string()),
+            slug: Some(slug.to_string()),
+            created_at: now,
+            updated_at: now,
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: false,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn add_with_stream_requires_existing_slug() {
+        let (_temp, config) = fixture();
+        let db = Database::open_in_memory().unwrap();
+        insert_stream(&db, "proj-x");
+
+        run_add(&config, Some(&db), add_options(Some("proj-x"))).unwrap();
+
+        let err = run_add(&config, Some(&db), add_options(Some("typo-slug"))).unwrap_err();
+        assert!(err.to_string().contains("no stream with slug"));
+
+        run_add(&config, None, add_options(None)).unwrap();
+    }
 }

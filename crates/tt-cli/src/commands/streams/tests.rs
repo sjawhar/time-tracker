@@ -15,6 +15,7 @@ fn make_stream(
     Stream {
         id: id.to_string(),
         name: name.map(String::from),
+        slug: None,
         created_at: now,
         updated_at: now,
         time_direct_ms: direct_ms,
@@ -45,13 +46,14 @@ fn test_streams_single_stream_no_tags() {
     let today = NaiveDate::from_ymd_opt(2025, 1, 29).unwrap();
     let recent = Utc.with_ymd_and_hms(2025, 1, 28, 12, 0, 0).unwrap();
 
-    let stream = make_stream(
+    let mut stream = make_stream(
         "abc123def456",
         Some("tmux/dev/session-1"),
         8_100_000,
         16_200_000,
         Some(recent),
     );
+    stream.slug = Some("acme-sprint-42".to_owned());
     db.insert_stream(&stream).unwrap();
 
     let entries = get_streams_for_display(&db, today).unwrap();
@@ -60,6 +62,7 @@ fn test_streams_single_stream_no_tags() {
     assert!(entries[0].tags.is_empty());
 
     let output = format_streams(&entries);
+    assert!(output.contains("acme-sprint-42"));
     insta::with_settings!({snapshot_path => "../snapshots"}, {
         assert_snapshot!(output);
     });
@@ -72,13 +75,14 @@ fn test_streams_multiple_with_tags() {
     let recent = Utc.with_ymd_and_hms(2025, 1, 28, 12, 0, 0).unwrap();
 
     // Stream 1: higher total time, multiple tags
-    let stream1 = make_stream(
+    let mut stream1 = make_stream(
         "abc123def456",
         Some("tmux/dev/session-1"),
         8_100_000,
         16_200_000,
         Some(recent),
     );
+    stream1.slug = Some("acme-sprint-42".to_owned());
     db.insert_stream(&stream1).unwrap();
     db.add_tag("abc123def456", "acme-webapp").unwrap();
     db.add_tag("abc123def456", "urgent").unwrap();
@@ -186,18 +190,20 @@ fn test_streams_json_output() {
     let today = NaiveDate::from_ymd_opt(2025, 1, 29).unwrap();
     let recent = Utc.with_ymd_and_hms(2025, 1, 28, 12, 0, 0).unwrap();
 
-    let stream = make_stream(
+    let mut stream = make_stream(
         "abc123def456",
         Some("tmux/dev/session-1"),
         8_100_000,
         16_200_000,
         Some(recent),
     );
+    stream.slug = Some("acme-sprint-42".to_owned());
     db.insert_stream(&stream).unwrap();
     db.add_tag("abc123def456", "acme-webapp").unwrap();
 
     let entries = get_streams_for_display(&db, today).unwrap();
     let output = format_streams_json(&entries, today).unwrap();
+    assert!(output.contains("\"slug\": \"acme-sprint-42\""));
     insta::with_settings!({snapshot_path => "../snapshots"}, {
         assert_snapshot!(output);
     });
