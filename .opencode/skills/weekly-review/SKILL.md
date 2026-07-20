@@ -99,6 +99,8 @@ Full pipeline: load ontology, ingest sessions, identify untagged streams, classi
 
 **Discipline (do not shortcut — this is where it goes wrong most):** classify per the ontology + the infer-streams *Classification Discipline*. Project comes from session/window **CONTENT, never cwd/path/folder** (a folder is not a workstream — name streams by the work done). Classify `window_focus` browser/Slack events by **`window_title`**, never by proximity or a catch-all. **Project (WHAT) and activity (HOW) are separate axes** — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; tag the project + the activity. **Overhead is work, NOT `personal`** (which is life only).
 
+**Use todo-link evidence first.** Sessions in `tt classify --json` may carry `linked_todo: {id, text, stream_slug}` — the agent linked itself to a todo while working (`tt todo link`). Treat it as the strongest classification signal: sessions sharing a `linked_todo.id` are the same stream, the todo text names the work, and sessions whose todo already has a `stream_slug` were auto-assigned before the output printed.
+
 ### Hard gate — do NOT advance to Phase 2 until BOTH hold
 
 1. You actually ran classification (not just read the unassigned count and noted it).

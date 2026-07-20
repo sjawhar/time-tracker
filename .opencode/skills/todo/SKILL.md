@@ -48,13 +48,15 @@ tt priority value <slug> N
 tt priority ls
 tt priority done <slug>
 
-tt streams link <stream-name> <priority-slug>
+tt streams slug <stream-ref> <slug>       # give a stream a stable slug (ref = id, slug, or exact name)
+tt streams link <stream-slug> <priority-slug>
 ```
 
 ## Model
 
 - Priorities have a user-set scalar importance `value`.
 - Todos link to priorities directly with `--priority` or indirectly through a stream linked by `tt streams link`.
+- Streams are referenced by SLUG (short kebab-case identity), never by display name. A stream needs a slug (`tt streams slug`) before todos or priority links can reference it. Todo `stream` fields are backfilled automatically when a linked session gets classified.
 - `tt todo drift` compares priority importance against tracked time in two lenses: direct-only and direct+delegated. Unlinked stream time appears as unattributed work.
 - Dates are system-local calendar days. `when:` hides a todo until that day; `due:` appears in the Due section and overrides `when:`.
 
