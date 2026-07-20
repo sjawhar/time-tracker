@@ -89,13 +89,17 @@ The only reason to pull tt data at all is to give the user an **objective check 
 
 ### Procedure
 
-Invoke the classify-streams skill:
+Run the classification pipeline directly (the old `classify-streams` skill is gone — `tt
+classify` replaced it):
 
-```
-/classify-streams 1 week ago
+```bash
+tt classify --json --start "$WEEK_START" --end "$WEEK_END" > /tmp/classify-week.json
 ```
 
-Full pipeline: load ontology, ingest sessions, identify untagged streams, classify (path heuristics + LLM), apply tags, report. **Wait for it to finish** before Phase 2.
+Then **invoke the `infer-streams` skill** via the Skill tool (do NOT launch a subagent) and
+follow it to identify streams, build the `tt classify --apply` JSON (every new stream in
+`"streams"` REQUIRES a `"slug"`; `assign_by_*` refs use slugs), apply it, and tag streams.
+**Wait for the full pipeline — classify, apply, `tt report` — to finish** before Phase 2.
 
 **Discipline (do not shortcut — this is where it goes wrong most):** classify per the ontology + the infer-streams *Classification Discipline*. Project comes from session/window **CONTENT, never cwd/path/folder** (a folder is not a workstream — name streams by the work done). Classify `window_focus` browser/Slack events by **`window_title`**, never by proximity or a catch-all. **Project (WHAT) and activity (HOW) are separate axes** — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; tag the project + the activity. **Overhead is work, NOT `personal`** (which is life only).
 
@@ -121,7 +125,7 @@ Re-run `tt recompute` and re-read `totals.unassigned_direct_ms` after each pass.
 
 ### Fallback — genuine tool failure ONLY
 
-"It's annoying / the unclassified list is junk / I'm short on time" is **not** a valid reason to skip. The only thing that can interrupt classification is the tooling itself failing (classify-streams crashes, tt unavailable) — and even then you do **NOT** auto-skip. **STOP, tell the user the tool failed and what it means (the review's time data would be unreliable), and ask for express permission to proceed without it.** Continue only if the user explicitly grants it; then run on manual estimates only, note it in the saved entry, and do not present per-project tt numbers as if they're sound. No automatic skipping, ever — a bypass requires the user's express okay.
+"It's annoying / the unclassified list is junk / I'm short on time" is **not** a valid reason to skip. The only thing that can interrupt classification is the tooling itself failing (`tt classify` crashes, tt unavailable) — and even then you do **NOT** auto-skip. **STOP, tell the user the tool failed and what it means (the review's time data would be unreliable), and ask for express permission to proceed without it.** Continue only if the user explicitly grants it; then run on manual estimates only, note it in the saved entry, and do not present per-project tt numbers as if they're sound. No automatic skipping, ever — a bypass requires the user's express okay.
 
 ## Phase 2: Trend Analysis
 
@@ -451,7 +455,7 @@ Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.
 ## Fallback Handling
 
 ### Classification Failure (Phase 1)
-Classification is the data-integrity gate. If classify-streams is unavailable or fails, do **NOT** auto-skip and proceed — bypassing the gate requires the user's express permission.
+Classification is the data-integrity gate. If `tt classify` is unavailable or fails, do **NOT** auto-skip and proceed — bypassing the gate requires the user's express permission.
 1. **STOP.** Tell the user: "Stream classification FAILED — I won't bypass it without your okay, because the time data for this review would be unreliable. Here's what failed: …"
 2. Ask for explicit permission to proceed without trustworthy time data.
 3. Only if the user expressly grants it: continue on manual estimates, note in the saved entry that the time data is unreliable, and do not present per-project tt numbers as sound. Otherwise, pause the review until classification can run.
@@ -503,7 +507,7 @@ If user declines to run them at the confirmation prompt: end the review without 
 
 | Mistake | Fix |
 |---------|-----|
-| Skipping Phase 1 (classify-streams) | **Always** run classify-streams first. Tagged data makes the entire review more meaningful. |
+| Skipping Phase 1 (classification) | **Always** run the `tt classify` + infer-streams pipeline first. Tagged data makes the entire review more meaningful. |
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt report`. Without it you miss most data. |
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
 | Presenting partial results | Run the FULL pipeline (ingest → sync → infer streams → recompute → report). Don't stop partway and show incomplete numbers — it's worse than no answer. |
