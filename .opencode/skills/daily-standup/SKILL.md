@@ -131,6 +131,13 @@ jq -r '[.sessions[] | select(
   | "\(.start_time) → \(.end_time) | \(.project_name) | \(.summary // "(none)")"' /tmp/classify-yesterday.json
 ```
 
+**Todo-linked sessions are pre-classified evidence.** Sessions may carry a
+`linked_todo: {id, text, stream_slug}` field (`tt todo link` ran inside them). Sessions
+sharing a `linked_todo.id` belong to the same stream, and the todo text is a
+ready-made description of the work. If the linked todo already has a `stream_slug`
+matching an existing stream, `tt classify` auto-assigned the session before printing —
+it will already show a `stream_id`.
+
 ## Phase 4: Create Streams
 
 **REQUIRED: Invoke the `infer-streams` skill** via the Skill tool (do NOT launch a subagent):
@@ -139,7 +146,7 @@ jq -r '[.sessions[] | select(
 Skill("infer-streams")
 ```
 
-Use the "Streams I recognize across days" section of your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions, then:
+Use the "Streams I recognize across days" section of your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions — every new stream in `"streams"` REQUIRES a `"slug"` (lowercase kebab-case, ≤32 chars), and `assign_by_*` stream refs should use slugs (see the infer-streams skill for the full JSON shape). Then:
 
 ```bash
 tt classify --apply /tmp/standup-assignments.json
@@ -150,7 +157,7 @@ This persists streams AND runs `tt recompute --force`. On a large DB the recompu
 Look up existing streams matching your common patterns:
 
 ```bash
-sqlite3 ~/.local/share/time-tracker/tt.db "SELECT id, name FROM streams ORDER BY name;"
+sqlite3 ~/.local/share/time-tracker/tt.db "SELECT id, slug, name FROM streams ORDER BY name;"
 ```
 
 ## Phase 5: Coverage Gate (MANDATORY — do not skip)
