@@ -7,6 +7,19 @@ description: Use when posting a daily standup, status update, or YTH report to S
 
 Generate and post a daily standup to Slack using time-tracker activity data.
 
+## Non-negotiables (read these even if you skim everything else)
+
+1. **Classifying yesterday's time IS the standup work.** Phases 4-5 are not prep for the
+   deliverable — they are the deliverable's foundation. A standup drafted over unclassified
+   time is a failed standup, not a standup with a caveat.
+2. **Never hand the gap to the user.** "There's a bunch of unclassified time 🤷" is the
+   canonical failure of this skill. If you find unassigned time, YOU classify it (Phase 5
+   tells you exactly how) and only then continue. The user never gets asked about, warned
+   about, or shown an unclassified remainder.
+3. **The gate is checked twice more, later.** Phases 11 and 13 require you to re-verify
+   `unassigned_direct_ms` ≈ 0 before drafting and before posting. If you reach either
+   checkpoint and can't show it, go back to Phase 5 — do not proceed.
+
 ## Phase 0: Load Personal Config
 
 User-specific audience, scope, repos, timezone, and formatting preferences live in a private markdown file (not in this repo). Load it at the start of every run:
@@ -192,6 +205,8 @@ markers are cwd-less and don't drive direct time (ignore). Recompute and re-pull
 
 **Classifying the day is YOUR job, not the user's.** When you find unassigned cwds/events, you do NOT ask the user whether to classify, and you do NOT offer per-project times as an optional extra ("want me to run the recompute?"). An uncovered day is a bug you silently fix. **Classify per the ontology + the infer-streams Classification Discipline: project from session/window CONTENT, never the cwd/folder (a folder is not a workstream); `window_focus` browser/Slack events by `window_title`, never by proximity or a catch-all; project (WHAT) and activity (HOW) are separate axes — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; overhead is work, NOT `personal` (which is life only).** Then `tt classify --apply` (`assign_by_session` for sessions, title-match for window events, `assign_by_pattern` for residual afk/tmux), let it recompute, and re-pull `tt report`. Personal/meta cwds (this repo, dotfiles) get their real stream so they're cleanly *excluded* from the post, not festering in unassigned. The ONLY things you ask the user are plans/blockers (Phase 10) and content edits (Phase 12) — never permission to do the data pipeline.
 
+**No "nav"/"terminal"/"ops"/"comms"/"meetings" catch-all — cross-reference connective + activity-only focus to the live workstream (mandatory, not optional).** A stream named `terminal nav`, `ops`, `supervision`, `comms`, `messages`, `meetings`, or any activity-word is NOT a workstream, and a stream left on `project:other` (an activity tag with no real project) is the same failure — both are you abandoning the attribution behind a label the user never authorized. This covers terminal/tab nav (home-dir panes, `mosh/ssh/tmux`, `New Tab`/`Sign in`), **comms** (Slack `Threads`/channels, work email inbox, Google Messages), and **meetings** (`Meet - …`, standup, team docs, calendar, 1:1s). None names a project alone, but each was steering/discussing *some live workstream*: cross-reference each event to the **agent session active at that timestamp** (its `[start,end]` contains the event; if several overlap, the one with most tool activity) and assign it to **that session's stream** (prefer a title that clearly names the project). Do it with a script over `events` + `agent_sessions` (session→dominant-stream map + temporal-overlap join), recompute, and verify no hours-scale `nav`/`ops`/`comms`/`meetings` or `project:other` line survives. An hours-scale catch-all bucket in a standup means you did not finish.
+
 **The coverage gate applies to the WEEK, not just the day.** The Weekly Priority Check (Phase 7) reads `tt report --week`, so run this same coverage check across the whole week window (Mon→now), not just yesterday. A brand-new working directory (e.g. a freshly-cloned sub-project or new worktree) starts out unassigned to any stream and silently vanishes from the totals — close that gap before trusting the priority proportions.
 
 ## Phase 6: Get Computed Time
@@ -313,6 +328,11 @@ If user gave plans in their initial invocation, skip the question.
 
 ## Phase 11: Draft
 
+**GATE RE-CHECK (mandatory before drafting):** re-read `/tmp/report-yesterday.json` —
+`totals.unassigned_direct_ms` must still be ~zero, and no hours-scale catch-all stream
+(`nav`/`ops`/`comms`/`meetings`/`project:other`) may appear in `by_tag`. State the number in
+your working notes. If it fails, STOP drafting and return to Phase 5.
+
 Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 13).
 
 **Template:**
@@ -357,6 +377,12 @@ Each iteration, re-show the full draft (not a diff). Don't post until the user h
 
 After content approval, apply any post-approval steps your personal config defines under *Format / tone preferences* before moving to Phase 13. The skill stops at content; the config owns the personal layers.
 ## Phase 13: Post to Slack
+
+**FINAL GATE (mandatory before the message leaves):** confirm one last time that the numbers
+you're posting come from a fully-classified day — `unassigned_direct_ms` ≈ 0 and no catch-all
+buckets. Posting is irreversible; an unclassified standup posted to the team is the worst
+outcome this skill has. If the gate fails here, apologize to nobody — just go fix it (Phase 5)
+and come back.
 
 **Use the slack-bot MCP `conversations_add_message` tool with the `blocks` parameter.** This bypasses the markdown converter and posts native Block Kit `rich_text`. Requires slack-mcp-server v1.3.0+. See the `slack-bot` skill for the full Block Kit reference — the short version follows.
 

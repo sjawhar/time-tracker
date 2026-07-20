@@ -49,6 +49,8 @@ These rules take priority over other instructions:
 
 4. **`tt report` is the single source of truth for time — never re-derive it.** Every time number comes from `tt report`, which already merges ALL focus sources (tmux pane focus, COSMIC window-focus, browser, afk) into one allocation. NEVER compute active/direct time yourself in python or SQL, NEVER pick-and-choose event types (no "watcher-only" vs "terminal-only" — they are one focus timeline), and NEVER hand the user a tight/loose range — the allocator yields one exact number. If a figure looks impossible (a full workday reading ~3h, or direct ≪ a normal day), **suspect the BINARY or the DATA, not the algorithm**: check `tt --version` against the repo's latest release / `Cargo.toml` and rebuild/`mise upgrade` if stale, then run the Phase 1 coverage gate. Hand-rolling time math in python is the exact failure that turns a stale-binary bug into hours of wrong analysis — do not do it.
 
+5. **Classification is part of the review, not a precondition someone else handles.** If you find unassigned time or catch-all streams at ANY phase, you classify them yourself (Phase 1 tells you exactly how) and re-pull the numbers. Presenting, saving, or narrating over unclassified time — or telling the user "there's a bunch of unclassified time" and moving on — is a failed review. The gate is re-checked at Phase 4 (before presenting) and Phase 8 (before saving).
+
 ## Argument Parsing
 
 The JSONL path is passed as the skill's `args` parameter:
@@ -122,6 +124,20 @@ Unassigned direct time is almost never "untagged streams" — `tt report`'s `unt
 - **`afk_change`** and other cwd-less markers: these do **not** drive direct time — ignore them; they will remain "unassigned" harmlessly and will not move `unassigned_direct_ms`.
 
 Re-run `tt recompute` and re-read `totals.unassigned_direct_ms` after each pass. Iterate until it is zero. Only then advance.
+
+### MANDATORY: no "nav" / "terminal" / "ops" catch-all — cross-reference connective focus to the live workstream
+
+**Assigning every event to a real, content-derived workstream is your job, not optional, and there is no ambiguity about it.** A stream named `terminal nav`, `ops`, `supervision`, `misc`, **`comms`, `messages`, `meetings`**, or any activity-word is **NOT a workstream** and is never acceptable — it is you giving up on the attribution and hiding it behind a label the user never authorized. **A stream tagged `project:other` (an activity tag with no real project) is the same failure** and must not survive into a presented or saved review: every stream needs a REAL project tag, inferred from what the time actually served.
+
+This applies to **all** connective / activity-only time, not just terminals:
+
+- **Terminal/tab nav** — devbox home-dir panes (`/home/ubuntu`, `/home/sami`), laptop terminal focus (`mosh devbox`, `ssh devbox`, `tmux …`), content-free flickers (`New Tab`, `Sign in`).
+- **Comms** — Slack (`Threads …`, channels), work email inbox, Google Messages.
+- **Meetings** — `Meet - …`, standup, team-meeting docs, calendar, 1:1s.
+
+None of these name a project on their own, but **none are unattributable** — each was in service of *some live workstream*. You MUST cross-reference each event to the **agent session active at that timestamp** (the session whose `[start,end]` contains the event; if several overlap, the one with the most tool activity) and assign it to **that session's stream** — i.e. whatever work you were steering/discussing at that moment. Where a title clearly names the project (a doc, a named 1:1, a channel), prefer that; otherwise use the temporal cross-reference.
+
+Do this with a script over the `events` + `agent_sessions` tables (session→dominant-stream map, then a temporal-overlap join), `tt recompute`, and verify the catch-all stream drops to ~zero direct. Only a genuinely session-less flicker with zero concurrent activity may remain, and that is minutes, not hours. **If you are about to present or save a review with an hours-scale `nav`/`ops`/`terminal` line, STOP — you have not finished the classification.**
 
 ### Fallback — genuine tool failure ONLY
 
@@ -225,6 +241,11 @@ tt classify --json --start "$WEEK_START" --end "$WEEK_END"
 This provides full session data with `summary`, `starting_prompt`, `tool_call_count`, etc.
 
 ## Phase 4: Present Context
+
+**GATE RE-CHECK (mandatory before presenting):** re-read the `tt report` totals —
+`totals.unassigned_direct_ms` must still be ~zero and no hours-scale catch-all stream
+(`nav`/`ops`/`comms`/`meetings`/`project:other`) may appear. If this fails, STOP: you are
+not ready to present. Return to Phase 1 and finish classification first.
 
 1. **Load ontology** from `~/.config/time-tracker/ontology.toml` — use `projects.names[]` and `activities.names[]` to organize the presentation.
 
@@ -368,6 +389,12 @@ On track (personal): Unsure
 **Present challenges** to the user. Let them respond and revise if needed.
 
 ## Phase 8: Save
+
+**FINAL GATE (mandatory before saving):** the entry you save becomes permanent history that
+future reviews trend against. Confirm one last time that its time numbers come from a
+fully-classified week (`unassigned_direct_ms` ≈ 0, no catch-all buckets). Saving an entry
+built on unclassified time poisons every future trend comparison — if the gate fails here,
+go back to Phase 1, fix it, re-pull, and re-present before saving.
 
 1. **Build the JSON object** with all collected data (see schema below)
    - Include `red_team` with challenges raised and user responses
