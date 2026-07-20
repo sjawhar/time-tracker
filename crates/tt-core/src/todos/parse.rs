@@ -189,6 +189,7 @@ fn todo_from_metadata(text: &str, metadata: TodoMetadata, done: bool) -> Todo {
         quick: metadata.quick,
         done,
         block: metadata.block,
+        sessions: metadata.sessions,
     }
 }
 

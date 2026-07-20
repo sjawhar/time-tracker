@@ -101,6 +101,7 @@ fn insert_stream(db: &Database) {
     db.insert_stream(&Stream {
         id: "idle".to_string(),
         name: Some("Idle Stream".to_string()),
+        slug: None,
         created_at: now,
         updated_at: now,
         time_direct_ms: 0,

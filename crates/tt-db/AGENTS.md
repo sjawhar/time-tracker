@@ -1,21 +1,21 @@
 # tt-db — SQLite Storage Layer
 
-Single-file monolith (`src/lib.rs`, ~2580 lines). All database types and methods in one file.
+Single-file monolith (`src/lib.rs`). All database types and methods in one file.
 
-## Schema (v9)
+## Schema (v10)
 
-Additive forward migrations for supported older versions (e.g. v8→v9: `ALTER TABLE events ADD COLUMN …` in a transaction inside `init()`). Any other version mismatch (newer-than-expected, or an unsupported older version) = `DbError::SchemaVersionMismatch` (hard error). To evolve: bump the `SCHEMA_VERSION` constant, add the columns to the `CREATE TABLE`, and add a migration arm in `init()`.
+Additive forward migrations for supported older versions (v8/v9→v10: `ALTER TABLE … ADD COLUMN …` in a transaction inside `init()`). Any other version mismatch (newer-than-expected, or an unsupported older version) = `DbError::SchemaVersionMismatch` (hard error). To evolve: bump the `SCHEMA_VERSION` constant, add the columns to the `CREATE TABLE`, and add a migration arm in `init()`.
 
 ### Tables
 
 ```sql
-events (id TEXT PK, timestamp TEXT, type TEXT, source TEXT, schema_version INT,
+events (id TEXT PK, timestamp TEXT, type TEXT, source TEXT, machine_id TEXT, schema_version INT,
         cwd TEXT, git_project TEXT, git_workspace TEXT, pane_id TEXT,
         tmux_session TEXT, window_index INT, status TEXT, idle_duration_ms INT,
         action TEXT, session_id TEXT, stream_id TEXT FK, assignment_source TEXT,
         window_app_id TEXT, window_title TEXT)
 
-streams (id TEXT PK, created_at TEXT, updated_at TEXT, name TEXT,
+streams (id TEXT PK, created_at TEXT, updated_at TEXT, name TEXT, slug TEXT,
          time_direct_ms INT, time_delegated_ms INT,
          first_event_at TEXT, last_event_at TEXT, needs_recompute INT)
 
@@ -25,14 +25,14 @@ agent_sessions (session_id TEXT PK, source TEXT, parent_session_id TEXT,
                 session_type TEXT, project_path TEXT, project_name TEXT,
                 start_time TEXT, end_time TEXT, message_count INT,
                 summary TEXT, user_prompts TEXT, starting_prompt TEXT,
-                assistant_message_count INT, tool_call_count INT)
+                assistant_message_count INT, tool_call_count INT, machine_id TEXT)
 ```
 
 Timestamps: ISO 8601 TEXT (`2024-01-15T10:30:00.000Z`), always UTC, millisecond precision. Lexicographic order = chronological order.
 
 ### Indexes
 
-`idx_events_timestamp`, `idx_events_type`, `idx_events_stream`, `idx_events_cwd`, `idx_events_session`, `idx_events_git_project`, `idx_streams_updated`, `idx_stream_tags_tag`, `idx_agent_sessions_start_time`, `idx_agent_sessions_project_path`, `idx_agent_sessions_parent`
+`idx_events_timestamp`, `idx_events_type`, `idx_events_stream`, `idx_events_cwd`, `idx_events_session`, `idx_events_git_project`, `idx_events_machine`, `idx_streams_updated`, `idx_streams_slug`, `idx_stream_tags_tag`, `idx_agent_sessions_start_time`, `idx_agent_sessions_project_path`, `idx_agent_sessions_parent`
 
 ## Key Types
 
@@ -58,9 +58,10 @@ Timestamps: ISO 8601 TEXT (`2024-01-15T10:30:00.000Z`), always UTC, millisecond 
 | Method | Purpose |
 |--------|---------|
 | `insert_stream` | Create new stream |
-| `get_stream` / `get_streams` | Retrieve by ID or all |
+| `get_stream` / `get_streams` / `get_stream_by_slug` | Retrieve by ID, all, or slug |
+| `set_stream_slug` | Set a stream's unique stable slug |
 | `streams_in_range` | Streams overlapping a time range |
-| `resolve_stream` | Find by ID prefix or name |
+| `resolve_stream` | Find by ID, slug, or exact name |
 | `assign_event_to_stream` / `assign_events_to_stream` | Set stream_id on events |
 | `clear_inferred_assignments` | Remove auto-assigned stream_ids |
 | `delete_orphaned_streams` | Remove streams with no events |

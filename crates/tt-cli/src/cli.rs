@@ -259,6 +259,15 @@ pub enum StreamsAction {
         /// Priority slug from priorities.md.
         priority: String,
     },
+
+    /// Set a stream's slug (short stable identifier used by todo references).
+    Slug {
+        /// Stream reference: ID, existing slug, or exact display name.
+        stream: String,
+
+        /// New slug: lowercase kebab-case, max 32 chars.
+        slug: String,
+    },
 }
 
 /// Todo subcommand actions.
@@ -298,8 +307,8 @@ pub enum TodoAction {
         #[arg(long = "priority", value_name = "SLUG")]
         priority: Vec<String>,
 
-        /// Stream name served by this todo.
-        #[arg(long, value_name = "NAME")]
+        /// Stream slug served by this todo (must exist in the DB).
+        #[arg(long, value_name = "SLUG")]
         stream: Option<String>,
 
         /// Due date (YYYY-MM-DD).
@@ -315,6 +324,26 @@ pub enum TodoAction {
 
         #[arg(long)]
         pin: bool,
+    },
+
+    /// Link the current agent session to a todo.
+    ///
+    /// Session is auto-detected from `CLAUDE_CODE_SESSION_ID` or `OPENCODE_SESSION_ID`.
+    Link {
+        id: String,
+
+        /// Explicit session ID (overrides env detection).
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+
+    /// Remove an agent session link from a todo.
+    Unlink {
+        id: String,
+
+        /// Explicit session ID (overrides env detection).
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
     },
 
     /// Mark a todo done by id.

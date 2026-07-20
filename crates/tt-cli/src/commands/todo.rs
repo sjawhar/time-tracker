@@ -10,11 +10,14 @@ mod check;
 mod drift;
 mod ids;
 mod json;
+mod link;
 mod mutate;
 mod order_edit;
 mod raw;
 mod render;
 mod view;
+
+pub use link::{run_link, run_unlink};
 
 #[derive(Debug, Clone, Copy)]
 #[expect(
@@ -67,8 +70,8 @@ pub fn run_ls(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn run_add(config: &Config, options: AddOptions) -> Result<()> {
-    mutate::run_add(config, options)
+pub fn run_add(config: &Config, db: Option<&Database>, options: AddOptions) -> Result<()> {
+    mutate::run_add(config, db, options)
 }
 
 pub fn run_done(config: &Config, id: &str) -> Result<()> {

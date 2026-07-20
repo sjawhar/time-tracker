@@ -4,14 +4,18 @@
 //! - **Show**: Display unclassified sessions and events for LLM-based classification
 //! - **Apply**: Accept JSON assignments and propagate to events
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use tt_core::slug::validate_slug;
+use tt_core::todos::TodoFileItem;
 
 use super::util::parse_datetime;
+use crate::Config;
+use crate::todo_store::{LoadedTodoStore, load_mutating, load_read_only, write_todos};
 
 // ── Show mode ──────────────────────────────────────────────────────────────
 
@@ -33,6 +37,15 @@ struct SessionSummary {
     user_prompt_count: usize,
     stream_id: Option<String>,
     proposed_stream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linked_todo: Option<LinkedTodo>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LinkedTodo {
+    id: String,
+    text: String,
+    stream_slug: Option<String>,
 }
 
 /// Non-session event cluster for classification output.
@@ -63,12 +76,20 @@ struct WindowRun {
 #[derive(Debug, Serialize)]
 struct ClassifyOutput {
     time_range: TimeRange,
+    streams: Vec<StreamRef>,
     sessions: Vec<SessionSummary>,
     event_clusters: Vec<EventCluster>,
     window_runs: Vec<WindowRun>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gaps: Option<Vec<GapInfo>>,
     stats: ClassifyStats,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamRef {
+    id: String,
+    slug: Option<String>,
+    name: Option<String>,
 }
 
 /// A gap between user activity events.
@@ -93,6 +114,75 @@ struct ClassifyStats {
     unclassified_event_clusters: usize,
 }
 
+fn build_session_todo_index(loaded: &LoadedTodoStore) -> HashMap<String, LinkedTodo> {
+    let mut index: HashMap<String, LinkedTodo> = HashMap::new();
+
+    for line in &loaded.store.todos.items {
+        let TodoFileItem::Todo(todo) = &line.item else {
+            continue;
+        };
+        if todo.done {
+            continue;
+        }
+
+        let linked_todo = LinkedTodo {
+            id: todo.id.clone(),
+            text: todo.text.clone(),
+            stream_slug: todo.stream.clone(),
+        };
+        for session_id in &todo.sessions {
+            if let Some(first_todo) = index.get(session_id) {
+                if first_todo.id != todo.id {
+                    eprintln!(
+                        "todo {} duplicates session {session_id} linked by todo {}; keeping first link",
+                        todo.id, first_todo.id
+                    );
+                }
+                continue;
+            }
+            index.insert(session_id.clone(), linked_todo.clone());
+        }
+    }
+
+    index
+}
+
+fn auto_assign_linked_sessions(
+    db: &tt_db::Database,
+    index: &HashMap<String, LinkedTodo>,
+) -> Result<Vec<String>> {
+    let mut session_ids: Vec<_> = index.keys().collect();
+    session_ids.sort_unstable();
+
+    let mut notes = Vec::new();
+    for session_id in session_ids {
+        let linked_todo = &index[session_id];
+        let Some(slug) = &linked_todo.stream_slug else {
+            continue;
+        };
+
+        match db
+            .get_stream_by_slug(slug)
+            .with_context(|| format!("failed to query stream slug '{slug}'"))?
+        {
+            Some(stream) => {
+                db.assign_events_by_session_id(session_id, &stream.id, "todo_link")
+                    .with_context(|| {
+                        format!(
+                            "failed to assign events for linked session {session_id} to stream '{slug}'"
+                        )
+                    })?;
+            }
+            None => notes.push(format!(
+                "todo {} references slug '{slug}' with no matching stream; session {session_id} left unclassified",
+                linked_todo.id
+            )),
+        }
+    }
+
+    Ok(notes)
+}
+
 /// Show unclassified sessions and events.
 #[expect(
     clippy::too_many_arguments,
@@ -102,6 +192,7 @@ struct ClassifyStats {
 )]
 pub fn run_show(
     db: &tt_db::Database,
+    config: &Config,
     unclassified: bool,
     summary: bool,
     json: bool,
@@ -110,6 +201,12 @@ pub fn run_show(
     gaps: bool,
     gap_threshold: u32,
 ) -> Result<()> {
+    let loaded = load_read_only(config)?;
+    let session_todo_index = build_session_todo_index(&loaded);
+    for note in auto_assign_linked_sessions(db, &session_todo_index)? {
+        eprintln!("{note}");
+    }
+
     let (start_time, end_time) = resolve_time_range(start, end)?;
 
     // Get sessions in range
@@ -137,6 +234,7 @@ pub fn run_show(
         .iter()
         .map(|s| (s.id.clone(), s.name.clone().unwrap_or_default()))
         .collect();
+    let streams = streams_referenced_by_events(&classified_events, &all_streams);
 
     // Build session summaries — filter out subagents
     let mut session_summaries: Vec<SessionSummary> = sessions
@@ -170,6 +268,7 @@ pub fn run_show(
                 user_prompt_count: s.user_prompts.len(),
                 stream_id,
                 proposed_stream: proposed,
+                linked_todo: session_todo_index.get(&s.session_id).cloned(),
             }
         })
         .collect();
@@ -237,6 +336,7 @@ pub fn run_show(
             start: start_time.to_rfc3339(),
             end: end_time.to_rfc3339(),
         },
+        streams,
         sessions: session_summaries,
         event_clusters: clusters,
         window_runs,
@@ -482,6 +582,27 @@ fn synthesize_window_runs(events: &[&tt_db::StoredEvent]) -> Vec<WindowRun> {
     runs
 }
 
+fn streams_referenced_by_events(
+    events: &[tt_db::StoredEvent],
+    all_streams: &[tt_db::Stream],
+) -> Vec<StreamRef> {
+    let stream_ids: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| event.stream_id.as_deref())
+        .collect();
+    let mut streams: Vec<_> = all_streams
+        .iter()
+        .filter(|stream| stream_ids.contains(stream.id.as_str()))
+        .map(|stream| StreamRef {
+            id: stream.id.clone(),
+            slug: stream.slug.clone(),
+            name: stream.name.clone(),
+        })
+        .collect();
+    streams.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    streams
+}
+
 struct WindowRunBuilder {
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -560,6 +681,7 @@ pub struct ClassifyApplyInput {
 #[derive(Debug, Deserialize)]
 pub struct StreamDef {
     pub name: String,
+    pub slug: String,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -593,12 +715,13 @@ pub struct TimeAssignment {
     pub stream: String,
 }
 
+#[derive(Debug)]
+pub struct ApplyOutcome {
+    pub session_stream_slugs: HashMap<String, String>,
+}
+
 /// Apply stream assignments from JSON input.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential phases of stream creation, assignment, and recompute"
-)]
-pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
+pub fn run_apply(db: &tt_db::Database, config: &Config, input_path: &str) -> Result<()> {
     let input_str = if input_path == "-" {
         let mut buf = String::new();
         std::io::stdin()
@@ -613,35 +736,101 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
     let input: ClassifyApplyInput =
         serde_json::from_str(&input_str).context("failed to parse classify input JSON")?;
 
+    let outcome = apply_input(db, input)?;
+    for line in backfill_todo_streams(config, &outcome.session_stream_slugs)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn backfill_todo_streams(
+    config: &Config,
+    session_stream_slugs: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    if session_stream_slugs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut loaded = load_mutating(config)?;
+    let mut lines = Vec::new();
+    for file_line in &mut loaded.store.todos.items {
+        let TodoFileItem::Todo(todo) = &mut file_line.item else {
+            continue;
+        };
+        if todo.stream.is_some() || todo.done {
+            continue;
+        }
+        let Some(slug) = todo
+            .sessions
+            .iter()
+            .find_map(|session| session_stream_slugs.get(session))
+        else {
+            continue;
+        };
+
+        todo.stream = Some(slug.clone());
+        lines.push(format!("Backfilled stream '{slug}' → {}", todo.id));
+    }
+
+    if !lines.is_empty() {
+        write_todos(config, &loaded.store.todos)?;
+    }
+    Ok(lines)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential phases of stream creation, assignment, and recompute"
+)]
+fn apply_input(db: &tt_db::Database, input: ClassifyApplyInput) -> Result<ApplyOutcome> {
+    let ClassifyApplyInput {
+        streams,
+        assign_by_session,
+        assign_by_pattern,
+        assign_by_event_ids,
+        assign_by_time,
+    } = input;
+
     // Phase 1: Create/resolve streams
-    let mut stream_name_to_id: HashMap<String, String> = HashMap::new();
+    let mut ref_to_id: HashMap<String, String> = HashMap::new();
+    let mut stream_slug_by_id: HashMap<String, String> = HashMap::new();
 
     let existing = db.get_streams().context("failed to query streams")?;
     for s in &existing {
+        if let Some(slug) = &s.slug {
+            ref_to_id.insert(slug.clone(), s.id.clone());
+            stream_slug_by_id.insert(s.id.clone(), slug.clone());
+        }
         if let Some(name) = &s.name {
-            stream_name_to_id.insert(name.clone(), s.id.clone());
+            ref_to_id
+                .entry(name.clone())
+                .or_insert_with(|| s.id.clone());
         }
     }
 
-    // Create new streams from definitions + resolve from assignments
-    let all_stream_names: Vec<String> = input
-        .streams
-        .iter()
-        .map(|s| s.name.clone())
-        .chain(input.assign_by_session.iter().map(|a| a.stream.clone()))
-        .chain(input.assign_by_pattern.iter().map(|a| a.stream.clone()))
-        .chain(input.assign_by_event_ids.iter().map(|a| a.stream.clone()))
-        .chain(input.assign_by_time.iter().map(|a| a.stream.clone()))
-        .collect();
-
-    for name in &all_stream_names {
-        if !stream_name_to_id.contains_key(name) {
+    for def in &streams {
+        validate_slug(&def.slug)?;
+        let stream_id = if let Some(existing) = db
+            .get_stream_by_slug(&def.slug)
+            .context("failed to query stream by slug")?
+        {
+            if existing.name.as_deref() != Some(def.name.as_str()) {
+                bail!(
+                    "slug '{}' already belongs to stream '{}'; refusing to reuse it for '{}'",
+                    def.slug,
+                    existing.name.as_deref().unwrap_or("(unnamed)"),
+                    def.name
+                );
+            }
+            existing.id
+        } else {
             let id = uuid::Uuid::new_v4().to_string();
             let stream = tt_db::Stream {
                 id: id.clone(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                name: Some(name.clone()),
+                name: Some(def.name.clone()),
+                slug: Some(def.slug.clone()),
                 time_direct_ms: 0,
                 time_delegated_ms: 0,
                 first_event_at: None,
@@ -649,15 +838,20 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
                 needs_recompute: true,
             };
             db.insert_stream(&stream)
-                .with_context(|| format!("failed to create stream: {name}"))?;
-            stream_name_to_id.insert(name.clone(), id.clone());
-            println!("Created stream: {name} ({})", &id[..8]);
-        }
+                .with_context(|| format!("failed to create stream: {}", def.name))?;
+            println!("Created stream: {} [{}] ({})", def.name, def.slug, &id[..8]);
+            id
+        };
+        ref_to_id.insert(def.slug.clone(), stream_id.clone());
+        ref_to_id
+            .entry(def.name.clone())
+            .or_insert_with(|| stream_id.clone());
+        stream_slug_by_id.insert(stream_id, def.slug.clone());
     }
 
     // Apply tags from stream definitions
-    for stream_def in &input.streams {
-        let stream_id = &stream_name_to_id[&stream_def.name];
+    for stream_def in &streams {
+        let stream_id = resolve_stream_id(&ref_to_id, &stream_def.slug)?;
         for tag in &stream_def.tags {
             db.add_tag(stream_id, tag).with_context(|| {
                 format!("failed to add tag {tag} to stream {}", stream_def.name)
@@ -667,10 +861,9 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
 
     // Phase 2: Session assignments
     let mut total_assigned = 0u64;
-    for assignment in &input.assign_by_session {
-        let stream_id = stream_name_to_id
-            .get(&assignment.stream)
-            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+    let mut session_stream_slugs = HashMap::new();
+    for assignment in &assign_by_session {
+        let stream_id = resolve_stream_id(&ref_to_id, &assignment.stream)?;
 
         let count = db
             .assign_events_by_session_id(&assignment.session_id, stream_id, "inferred")
@@ -689,14 +882,15 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
                 "assigned session events"
             );
             total_assigned += count;
+            if let Some(slug) = stream_slug_by_id.get(stream_id) {
+                session_stream_slugs.insert(assignment.session_id.clone(), slug.clone());
+            }
         }
     }
 
     // Phase 3: Pattern assignments
-    for assignment in &input.assign_by_pattern {
-        let stream_id = stream_name_to_id
-            .get(&assignment.stream)
-            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+    for assignment in &assign_by_pattern {
+        let stream_id = resolve_stream_id(&ref_to_id, &assignment.stream)?;
 
         let start = assignment
             .start
@@ -732,10 +926,8 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
     }
 
     // Phase 4: Explicit event ID assignments
-    for assignment in &input.assign_by_event_ids {
-        let stream_id = stream_name_to_id
-            .get(&assignment.stream)
-            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+    for assignment in &assign_by_event_ids {
+        let stream_id = resolve_stream_id(&ref_to_id, &assignment.stream)?;
 
         let count = db
             .assign_events_by_ids(&assignment.event_ids, stream_id, "inferred")
@@ -759,10 +951,8 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
 
     // Phase 4.5: Time-range assignments — attribute unassigned GUI/window_focus time
     // (no cwd/session) to a stream by semantic temporal judgment.
-    for assignment in &input.assign_by_time {
-        let stream_id = stream_name_to_id
-            .get(&assignment.stream)
-            .with_context(|| format!("unknown stream: {}", assignment.stream))?;
+    for assignment in &assign_by_time {
+        let stream_id = resolve_stream_id(&ref_to_id, &assignment.stream)?;
 
         let start = parse_datetime(&assignment.start)
             .context("invalid start time in time-range assignment")?;
@@ -798,7 +988,23 @@ pub fn run_apply(db: &tt_db::Database, input_path: &str) -> Result<()> {
         println!("No events to assign.");
     }
 
-    Ok(())
+    Ok(ApplyOutcome {
+        session_stream_slugs,
+    })
+}
+
+fn resolve_stream_id<'a>(
+    ref_to_id: &'a HashMap<String, String>,
+    stream_ref: &str,
+) -> Result<&'a str> {
+    ref_to_id
+        .get(stream_ref)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown stream: '{stream_ref}' — define it in \"streams\" or use an existing slug"
+            )
+        })
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────
@@ -870,6 +1076,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn auto_assign_matches_existing_slug_only() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        let stream = tt_db::Stream {
+            id: "proj-x".to_string(),
+            created_at: ts(0),
+            updated_at: ts(0),
+            name: Some("Project X".to_string()),
+            slug: Some("proj-x".to_string()),
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: true,
+        };
+        db.insert_stream(&stream).unwrap();
+
+        for event in [
+            make_event(
+                "e1",
+                ts(0),
+                tt_core::EventType::AgentToolUse,
+                Some("sess-1"),
+                "/project-x",
+            ),
+            make_event(
+                "e2",
+                ts(1),
+                tt_core::EventType::AgentToolUse,
+                Some("sess-1"),
+                "/project-x",
+            ),
+            make_event(
+                "e3",
+                ts(2),
+                tt_core::EventType::AgentToolUse,
+                Some("sess-2"),
+                "/project-y",
+            ),
+        ] {
+            db.insert_event(&event).unwrap();
+        }
+
+        let mut index = HashMap::new();
+        index.insert(
+            "sess-1".to_string(),
+            LinkedTodo {
+                id: "td_1".to_string(),
+                text: "do the thing".to_string(),
+                stream_slug: Some("proj-x".to_string()),
+            },
+        );
+        index.insert(
+            "sess-2".to_string(),
+            LinkedTodo {
+                id: "td_2".to_string(),
+                text: "other".to_string(),
+                stream_slug: Some("no-such-stream".to_string()),
+            },
+        );
+
+        let notes = auto_assign_linked_sessions(&db, &index).unwrap();
+
+        let assigned = db.get_events_by_stream(&stream.id).unwrap();
+        assert_eq!(assigned.len(), 2);
+        assert!(assigned.iter().all(|event| {
+            event.session_id.as_deref() == Some("sess-1")
+                && event.assignment_source.as_deref() == Some("todo_link")
+        }));
+        let unassigned = db.get_events_without_stream().unwrap();
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(unassigned[0].id, "e3");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("no-such-stream"));
+    }
+
+    #[test]
+    fn session_todo_index_reads_sessions_from_store() {
+        let loaded = crate::todo_store::parse_store_contents(
+            "",
+            "- [ ] Fix it <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[],\"stream\":\"proj-x\",\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"sessions\":[\"ses_abc\"]} -->\n",
+            "",
+        );
+
+        let index = build_session_todo_index(&loaded);
+
+        assert_eq!(index["ses_abc"].stream_slug.as_deref(), Some("proj-x"));
+    }
+
+    #[test]
+    fn backfill_sets_stream_on_streamless_linked_todos_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = temp.path().join("todo-store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("todos.md"),
+            concat!(
+                "- [ ] Backfill me <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"sessions\":[\"sess-1\"]} -->\n",
+                "- [ ] Already assigned <!-- tt-todo:{\"id\":\"td_2\",\"priority\":[],\"stream\":\"existing\",\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"sessions\":[\"sess-1\"]} -->\n",
+                "- [ ] Different session <!-- tt-todo:{\"id\":\"td_3\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false,\"sessions\":[\"sess-9\"]} -->\n",
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            database_path: temp.path().join("tt.db"),
+            todo_store_path: store,
+        };
+        let session_stream_slugs = HashMap::from([("sess-1".to_string(), "proj-x".to_string())]);
+
+        let lines = backfill_todo_streams(&config, &session_stream_slugs).unwrap();
+
+        assert_eq!(lines, ["Backfilled stream 'proj-x' → td_1"]);
+        let loaded = crate::todo_store::load_read_only(&config).unwrap();
+        let todos: HashMap<_, _> = loaded
+            .store
+            .todos
+            .items
+            .iter()
+            .filter_map(|file_line| {
+                let TodoFileItem::Todo(todo) = &file_line.item else {
+                    return None;
+                };
+                Some((todo.id.clone(), todo.stream.clone()))
+            })
+            .collect();
+        assert_eq!(todos["td_1"].as_deref(), Some("proj-x"));
+        assert_eq!(todos["td_2"].as_deref(), Some("existing"));
+        assert_eq!(todos["td_3"].as_deref(), None);
+    }
+
+    #[test]
+    fn backfill_skips_todo_store_when_no_sessions_were_assigned() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            database_path: temp.path().join("tt.db"),
+            todo_store_path: temp.path().join("missing-store"),
+        };
+
+        let lines = backfill_todo_streams(&config, &HashMap::new()).unwrap();
+
+        assert!(lines.is_empty());
+        assert!(!config.todo_store_path.exists());
+    }
+
     fn make_window_event(
         id: &str,
         timestamp: DateTime<Utc>,
@@ -884,6 +1234,51 @@ mod tests {
         event.window_app_id = Some(app_id.to_string());
         event.window_title = Some(title.to_string());
         event
+    }
+
+    #[test]
+    fn stream_refs_include_only_streams_referenced_by_period_events() {
+        let mut event = make_event(
+            "e1",
+            ts(0),
+            tt_core::EventType::AgentToolUse,
+            Some("sess-1"),
+            "/project",
+        );
+        event.stream_id = Some("referenced".to_string());
+        let streams = vec![
+            tt_db::Stream {
+                id: "referenced".to_string(),
+                created_at: ts(0),
+                updated_at: ts(0),
+                name: Some("Referenced stream".to_string()),
+                slug: Some("referenced-stream".to_string()),
+                time_direct_ms: 0,
+                time_delegated_ms: 0,
+                first_event_at: None,
+                last_event_at: None,
+                needs_recompute: true,
+            },
+            tt_db::Stream {
+                id: "other".to_string(),
+                created_at: ts(0),
+                updated_at: ts(0),
+                name: Some("Other stream".to_string()),
+                slug: Some("other-stream".to_string()),
+                time_direct_ms: 0,
+                time_delegated_ms: 0,
+                first_event_at: None,
+                last_event_at: None,
+                needs_recompute: true,
+            },
+        ];
+
+        let refs = streams_referenced_by_events(&[event], &streams);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, "referenced");
+        assert_eq!(refs[0].slug.as_deref(), Some("referenced-stream"));
+        assert_eq!(refs[0].name.as_deref(), Some("Referenced stream"));
     }
 
     #[test]
@@ -951,13 +1346,21 @@ mod tests {
                 "assign_by_event_ids": [{
                     "event_ids": ["w1", "w2"],
                     "stream": "proposal"
+                }],
+                "streams": [{
+                    "name": "proposal",
+                    "slug": "proposal"
                 }]
             }))
             .unwrap(),
         )
         .unwrap();
 
-        run_apply(&db, input_path.to_str().unwrap()).unwrap();
+        let config = Config {
+            database_path: dir.path().join("tt.db"),
+            todo_store_path: dir.path().join("todo-store"),
+        };
+        run_apply(&db, &config, input_path.to_str().unwrap()).unwrap();
 
         let stream = db.resolve_stream("proposal").unwrap().unwrap();
         let assigned = db.get_events_by_stream(&stream.id).unwrap();
@@ -1026,10 +1429,12 @@ mod tests {
             streams: vec![
                 StreamDef {
                     name: "stream-x".to_string(),
+                    slug: "stream-x".to_string(),
                     tags: vec!["project:x".to_string()],
                 },
                 StreamDef {
                     name: "stream-y".to_string(),
+                    slug: "stream-y".to_string(),
                     tags: vec![],
                 },
             ],
@@ -1063,6 +1468,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 name: Some(stream_def.name.clone()),
+                slug: None,
                 time_direct_ms: 0,
                 time_delegated_ms: 0,
                 first_event_at: None,
@@ -1131,6 +1537,152 @@ mod tests {
         assert_eq!(sess_a_count, 2, "both sess-a events should be in stream-x");
     }
 
+    fn empty_apply_input() -> ClassifyApplyInput {
+        ClassifyApplyInput {
+            streams: vec![],
+            assign_by_session: vec![],
+            assign_by_pattern: vec![],
+            assign_by_event_ids: vec![],
+            assign_by_time: vec![],
+        }
+    }
+
+    fn insert_session_event(db: &tt_db::Database, session_id: &str) {
+        let event = make_event(
+            "session-event",
+            ts(0),
+            tt_core::EventType::AgentToolUse,
+            Some(session_id),
+            "/project",
+        );
+        db.insert_event(&event).unwrap();
+    }
+
+    #[test]
+    fn apply_rejects_unknown_assignment_stream() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        insert_session_event(&db, "sess-1");
+        let input = ClassifyApplyInput {
+            streams: vec![],
+            assign_by_session: vec![SessionAssignment {
+                session_id: "sess-1".to_string(),
+                stream: "never-defined".to_string(),
+            }],
+            assign_by_pattern: vec![],
+            assign_by_event_ids: vec![],
+            assign_by_time: vec![],
+        };
+
+        let err = apply_input(&db, input).unwrap_err();
+
+        assert!(err.to_string().contains("unknown stream"));
+    }
+
+    #[test]
+    fn apply_creates_stream_with_slug_and_resolves_assignment_by_slug() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        insert_session_event(&db, "sess-1");
+        let input = ClassifyApplyInput {
+            streams: vec![StreamDef {
+                name: "agent-c: eval-3 moto".to_string(),
+                slug: "eval3-moto".to_string(),
+                tags: vec![],
+            }],
+            assign_by_session: vec![SessionAssignment {
+                session_id: "sess-1".to_string(),
+                stream: "eval3-moto".to_string(),
+            }],
+            assign_by_pattern: vec![],
+            assign_by_event_ids: vec![],
+            assign_by_time: vec![],
+        };
+
+        let outcome = apply_input(&db, input).unwrap();
+
+        let stream = db.get_stream_by_slug("eval3-moto").unwrap().unwrap();
+        assert_eq!(stream.name.as_deref(), Some("agent-c: eval-3 moto"));
+        assert_eq!(
+            outcome.session_stream_slugs.get("sess-1"),
+            Some(&"eval3-moto".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_rejects_invalid_slug() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        let input = ClassifyApplyInput {
+            streams: vec![StreamDef {
+                name: "x".to_string(),
+                slug: "Not A Slug".to_string(),
+                tags: vec![],
+            }],
+            ..empty_apply_input()
+        };
+
+        assert!(apply_input(&db, input).is_err());
+    }
+
+    #[test]
+    fn apply_reapply_same_slug_and_name_is_idempotent() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        let def = || StreamDef {
+            name: "x".to_string(),
+            slug: "x-slug".to_string(),
+            tags: vec![],
+        };
+
+        apply_input(
+            &db,
+            ClassifyApplyInput {
+                streams: vec![def()],
+                ..empty_apply_input()
+            },
+        )
+        .unwrap();
+        apply_input(
+            &db,
+            ClassifyApplyInput {
+                streams: vec![def()],
+                ..empty_apply_input()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.get_streams().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_slug_collision_with_different_name() {
+        let db = tt_db::Database::open_in_memory().unwrap();
+        apply_input(
+            &db,
+            ClassifyApplyInput {
+                streams: vec![StreamDef {
+                    name: "x".to_string(),
+                    slug: "shared".to_string(),
+                    tags: vec![],
+                }],
+                ..empty_apply_input()
+            },
+        )
+        .unwrap();
+
+        let err = apply_input(
+            &db,
+            ClassifyApplyInput {
+                streams: vec![StreamDef {
+                    name: "different".to_string(),
+                    slug: "shared".to_string(),
+                    tags: vec![],
+                }],
+                ..empty_apply_input()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("shared"));
+    }
+
     #[test]
     fn test_classify_apply_preserves_user_assignments() {
         let db = tt_db::Database::open_in_memory().unwrap();
@@ -1141,6 +1693,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             name: Some("user-assigned".to_string()),
+            slug: None,
             time_direct_ms: 0,
             time_delegated_ms: 0,
             first_event_at: None,
@@ -1166,6 +1719,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             name: Some("new-stream".to_string()),
+            slug: None,
             time_direct_ms: 0,
             time_delegated_ms: 0,
             first_event_at: None,

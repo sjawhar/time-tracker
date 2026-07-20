@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
-use tt_core::todos::{DriftReport, StreamTimeInput, compute_drift};
+use tt_core::todos::{DriftReport, StreamPriorityLink, StreamTimeInput, compute_drift};
 use tt_db::Database;
 
 use crate::Config;
@@ -21,7 +21,9 @@ pub fn run(db: &Database, config: &Config, period: Period, json: bool) -> Result
     let loaded = load_read_only(config)?;
     let priorities = priority_items(&loaded);
     let links = stream_links(&loaded);
-    let warnings = duplicate_named_stream_warnings(db)?;
+    let mut warnings = duplicate_stream_key_warnings(db)?;
+    let (links, mut link_warnings) = resolve_stream_links(db, links)?;
+    warnings.append(&mut link_warnings);
     let stream_times = stream_times_with_idle_named_streams(db, &report_data.streams)?;
     let drift =
         compute_drift(&priorities, &links, &stream_times).context("failed to compute drift")?;
@@ -82,24 +84,77 @@ fn render_warnings(warnings: &[String]) -> Result<String> {
     Ok(output)
 }
 
-fn warning_line(stream_name: &str) -> String {
-    format!("WARNING: DB stream name '{stream_name}' appears more than once; times were combined")
+fn warning_line(warning: &str) -> String {
+    format!("WARNING: {warning}")
 }
 
-fn duplicate_named_stream_warnings(db: &Database) -> Result<Vec<String>> {
+fn duplicate_stream_key_warnings(db: &Database) -> Result<Vec<String>> {
     let streams = db
         .get_streams()
-        .context("failed to get streams for todo drift duplicate-name warnings")?;
-    let mut counts_by_name = BTreeMap::new();
+        .context("failed to get streams for todo drift duplicate-key warnings")?;
+    let mut counts_by_key = BTreeMap::new();
     for stream in streams {
-        if let Some(name) = stream.name {
-            *counts_by_name.entry(name).or_insert(0usize) += 1;
+        if let Some(key) = stream.slug.or(stream.name) {
+            *counts_by_key.entry(key).or_insert(0usize) += 1;
         }
     }
-    Ok(counts_by_name
+    Ok(counts_by_key
         .into_iter()
-        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .filter_map(|(key, count)| {
+            (count > 1).then_some(format!(
+                "DB stream key '{key}' appears more than once; times were combined"
+            ))
+        })
         .collect())
+}
+
+/// Resolves streams.md references to the key used by drift calculations.
+///
+/// A stream's key is its slug when present, otherwise its display name. Legacy display-name
+/// references to one slugged stream are rewritten and reported; unknown or ambiguous references
+/// are preserved so `compute_drift` continues to report them as errors.
+fn resolve_stream_links(
+    db: &Database,
+    links: Vec<StreamPriorityLink>,
+) -> Result<(Vec<StreamPriorityLink>, Vec<String>)> {
+    let streams = db
+        .get_streams()
+        .context("failed to get streams for todo drift link resolution")?;
+    let known_keys: HashSet<String> = streams
+        .iter()
+        .filter_map(|stream| stream.slug.clone().or_else(|| stream.name.clone()))
+        .collect();
+    let mut resolved_links = Vec::with_capacity(links.len());
+    let mut warnings = Vec::new();
+
+    for link in links {
+        if known_keys.contains(&link.stream) {
+            resolved_links.push(link);
+            continue;
+        }
+
+        let matching_names = streams
+            .iter()
+            .filter(|stream| stream.name.as_deref() == Some(link.stream.as_str()))
+            .collect::<Vec<_>>();
+        if let [stream] = matching_names.as_slice()
+            && let Some(slug) = &stream.slug
+        {
+            warnings.push(format!(
+                "streams.md reference '{}' matches by name; update to slug '{slug}'",
+                link.stream
+            ));
+            resolved_links.push(StreamPriorityLink {
+                stream: slug.clone(),
+                priority: link.priority,
+            });
+            continue;
+        }
+
+        resolved_links.push(link);
+    }
+
+    Ok((resolved_links, warnings))
 }
 
 fn percentage(share: f64) -> f64 {
@@ -110,93 +165,39 @@ fn stream_times_with_idle_named_streams(
     db: &Database,
     report_streams: &[report::ReportStreamTime],
 ) -> Result<Vec<StreamTimeInput>> {
-    let mut stream_times = db
+    let stream_keys_by_id = db
         .get_streams()
         .context("failed to get streams for todo drift")?
         .into_iter()
         .filter_map(|stream| {
-            stream.name.map(|stream_name| StreamTimeInput {
-                stream_name,
-                direct_ms: 0,
-                delegated_ms: 0,
-            })
+            stream
+                .slug
+                .or(stream.name)
+                .map(|stream_key| (stream.id, stream_key))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut stream_times = stream_keys_by_id
+        .values()
+        .cloned()
+        .map(|stream_name| StreamTimeInput {
+            stream_name,
+            direct_ms: 0,
+            delegated_ms: 0,
         })
         .collect::<Vec<_>>();
-    stream_times.extend(report_streams.iter().map(|stream| StreamTimeInput {
-        stream_name: stream.name.clone().unwrap_or_else(|| stream.id.clone()),
-        direct_ms: stream.time_direct_ms,
-        delegated_ms: stream.time_delegated_ms,
+    stream_times.extend(report_streams.iter().map(|stream| {
+        StreamTimeInput {
+            stream_name: stream_keys_by_id
+                .get(&stream.id)
+                .cloned()
+                .unwrap_or_else(|| stream.name.clone().unwrap_or_else(|| stream.id.clone())),
+            direct_ms: stream.time_direct_ms,
+            delegated_ms: stream.time_delegated_ms,
+        }
     }));
     Ok(stream_times)
 }
 
 #[cfg(test)]
-mod tests {
-    use chrono::{TimeZone, Utc};
-    use tt_core::todos::{Priority, PriorityStatus, StreamPriorityLink, compute_drift};
-    use tt_db::Stream;
-
-    use super::*;
-
-    #[test]
-    fn duplicate_named_db_streams_warn_and_keep_combined_time() {
-        // Given: the DB has two streams with the same display name and the period report has time
-        // for both stream IDs under that shared name.
-        let db = Database::open_in_memory().unwrap();
-        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
-        for id in ["stream-a", "stream-b"] {
-            db.insert_stream(&Stream {
-                id: id.to_string(),
-                name: Some("Shared stream".to_string()),
-                created_at,
-                updated_at: created_at,
-                time_direct_ms: 0,
-                time_delegated_ms: 0,
-                first_event_at: None,
-                last_event_at: None,
-                needs_recompute: false,
-            })
-            .unwrap();
-        }
-        let report_streams = vec![
-            report::ReportStreamTime {
-                id: "stream-a".to_string(),
-                name: Some("Shared stream".to_string()),
-                time_direct_ms: 60_000,
-                time_delegated_ms: 0,
-            },
-            report::ReportStreamTime {
-                id: "stream-b".to_string(),
-                name: Some("Shared stream".to_string()),
-                time_direct_ms: 120_000,
-                time_delegated_ms: 0,
-            },
-        ];
-
-        // When: stream times and warnings are built for drift.
-        let stream_times = stream_times_with_idle_named_streams(&db, &report_streams).unwrap();
-        let warnings = duplicate_named_stream_warnings(&db).unwrap();
-        let drift = compute_drift(
-            &[Priority {
-                slug: "ipi".to_string(),
-                value: 9,
-                status: PriorityStatus::Active,
-                description: None,
-            }],
-            &[StreamPriorityLink {
-                stream: "Shared stream".to_string(),
-                priority: "ipi".to_string(),
-            }],
-            &stream_times,
-        )
-        .unwrap();
-
-        // Then: drift does not error, combines both streams' time, and warns about the shared name.
-        assert_eq!(drift.priorities[0].direct_ms, 180_000);
-        assert_eq!(warnings, vec!["Shared stream".to_string()]);
-        let rendered = render_warnings(&warnings).unwrap();
-        assert!(rendered.contains(
-            "WARNING: DB stream name 'Shared stream' appears more than once; times were combined"
-        ));
-    }
-}
+#[path = "drift_tests.rs"]
+mod tests;

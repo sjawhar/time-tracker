@@ -12,6 +12,27 @@ fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
 
+fn configured_command(config_path: &std::path::Path) -> Command {
+    let mut command = Command::new(tt_binary());
+    command
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("OPENCODE_SESSION_ID")
+        .arg("--config")
+        .arg(config_path);
+    command
+}
+
+fn write_stdin(child: &mut std::process::Child, input: &str) {
+    use std::io::Write;
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+}
+
 /// Initialize machine identity in the given temp directory.
 /// Required before any `ingest` command.
 fn init_machine(temp: &std::path::Path) {
@@ -659,6 +680,7 @@ fn test_delegated_time_from_agent_session_events() {
     let stream = Stream {
         id: "stream-1".to_string(),
         name: Some("test-stream".to_string()),
+        slug: None,
         created_at: base,
         updated_at: base,
         time_direct_ms: 0,
@@ -740,5 +762,121 @@ fn test_delegated_time_from_agent_session_events() {
     assert!(
         stream_time.time_delegated_ms > 0,
         "delegated time should be non-zero"
+    );
+}
+
+#[test]
+fn e2e_todo_session_link_flow() {
+    let temp = TempDir::new().unwrap();
+    let database_path = temp.path().join("tt.db");
+    let todo_store_path = temp.path().join("todo-store");
+    let config_path = temp.path().join("config.toml");
+    std::fs::create_dir_all(&todo_store_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "database_path = \"{}\"\ntodo_store_path = \"{}\"\n",
+            database_path.display(),
+            todo_store_path.display()
+        ),
+    )
+    .unwrap();
+
+    // Given an empty todo store, add a todo and capture its generated id.
+    let add_output = configured_command(&config_path)
+        .args(["todo", "add", "Prototype watcher rewrite"])
+        .output()
+        .unwrap();
+    assert!(
+        add_output.status.success(),
+        "todo add should succeed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let todos_path = todo_store_path.join("todos.md");
+    let todos_before_link = std::fs::read_to_string(&todos_path).unwrap();
+    let (_, todo_metadata) = todos_before_link
+        .split_once("\"id\":\"")
+        .expect("todo metadata should contain an id");
+    let (todo_id, _) = todo_metadata
+        .split_once('"')
+        .expect("todo id should be terminated by a quote");
+
+    // When the detected OpenCode session is linked to that todo, the CLI reports the link.
+    let link_output = configured_command(&config_path)
+        .env("OPENCODE_SESSION_ID", "ses_e2e")
+        .args(["todo", "link"])
+        .arg(todo_id)
+        .output()
+        .unwrap();
+    let link_stdout = String::from_utf8_lossy(&link_output.stdout);
+    assert!(
+        link_output.status.success(),
+        "todo link should succeed: {}",
+        String::from_utf8_lossy(&link_output.stderr)
+    );
+    assert!(
+        link_stdout.contains("Linked ses_e2e"),
+        "todo link should report the session: {link_stdout}"
+    );
+
+    // Given an unassigned event from the linked session, import it into the configured database.
+    let session_event = r#"{"id":"event-e2e-session","timestamp":"2025-01-29T12:00:00Z","source":"test.agent","type":"agent_session","session_id":"ses_e2e","data":{}}
+"#;
+    let mut import_child = configured_command(&config_path)
+        .arg("import")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write_stdin(&mut import_child, session_event);
+    let import_output = import_child.wait_with_output().unwrap();
+    assert!(
+        import_output.status.success(),
+        "event import should succeed: {}",
+        String::from_utf8_lossy(&import_output.stderr)
+    );
+
+    // When classify applies a session assignment to a slugged stream, it backfills the linked todo.
+    let classify_input = r#"{"streams":[{"name":"Watcher rewrite work","slug":"watcher-rewrite","tags":[]}],"assign_by_session":[{"session_id":"ses_e2e","stream":"watcher-rewrite"}]}"#;
+    let mut classify_child = configured_command(&config_path)
+        .args(["classify", "--apply", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write_stdin(&mut classify_child, classify_input);
+    let classify_output = classify_child.wait_with_output().unwrap();
+    let classify_stdout = String::from_utf8_lossy(&classify_output.stdout);
+    let classify_stderr = String::from_utf8_lossy(&classify_output.stderr);
+    assert!(
+        classify_output.status.success(),
+        "classify apply should succeed: {classify_stderr}"
+    );
+    assert!(
+        classify_stdout.contains(&format!("Backfilled stream 'watcher-rewrite' → {todo_id}")),
+        "classify should report the todo backfill: {classify_stdout}"
+    );
+
+    let todos_after_backfill = std::fs::read_to_string(&todos_path).unwrap();
+    assert!(
+        todos_after_backfill.contains("\"stream\":\"watcher-rewrite\""),
+        "backfilled todo should record the stream slug: {todos_after_backfill}"
+    );
+
+    // Then linking without a supplied or detected session reports the missing agent session.
+    let no_session_output = configured_command(&config_path)
+        .args(["todo", "link"])
+        .arg(todo_id)
+        .output()
+        .unwrap();
+    let no_session_stderr = String::from_utf8_lossy(&no_session_output.stderr);
+    assert!(
+        !no_session_output.status.success(),
+        "todo link should fail without a detected session"
+    );
+    assert!(
+        no_session_stderr.contains("no agent session detected"),
+        "todo link should report the missing session: {no_session_stderr}"
     );
 }

@@ -109,6 +109,10 @@ Group sessions into streams by **what was worked on** — content first, cwd las
 5. **Temporal + semantic clustering** — related sessions within >2h gaps = ONE stream
 6. **`cwd`** — a *weak tiebreaker only*, NEVER the basis for a project or stream name (ontology rule #1): a monorepo hosts many projects; a folder like `monorepo/teammate-x` is not a workstream.
 
+Sessions may carry `"linked_todo": {"id", "text", "stream_slug"}`. Sessions with the same
+`linked_todo.id` belong to the same stream; use the todo text when naming the stream and choosing
+its stable slug.
+
 Present the proposed streams to the user for review before persisting.
 
 ## Phase 4: Create Streams + Assign Events
@@ -118,23 +122,29 @@ Build a JSON file matching the `tt classify --apply` format:
 ```json
 {
   "streams": [
-    {"name": "project: stream name", "tags": ["project:project-name"]}
+    {
+      "name": "project: stream name",
+      "slug": "project-stream-name",
+      "tags": ["project:project-name"]
+    }
   ],
   "assign_by_session": [
-    {"session_id": "ses_abc", "stream": "project: stream name"},
-    {"session_id": "ses_def", "stream": "project: stream name"}
+    {"session_id": "ses_abc", "stream": "project-stream-name"},
+    {"session_id": "ses_def", "stream": "project-stream-name"}
   ],
   "assign_by_pattern": [
     {
       "cwd_like": "%/project-name/%",
       "start": "2026-02-26T08:00:00Z",
       "end": "2026-02-27T08:00:00Z",
-      "stream": "project: stream name"
+      "stream": "project-stream-name"
     }
   ]
 }
 ```
 
+- Every `streams` entry requires a stable, lowercase kebab-case `slug` of at most 32 characters. Pick a short, memorable identity such as `watcher-rewrite`.
+- Set every `assign_by_*` `stream` value to that slug. Assignment refs resolve slugs first, then display names; unknown refs error rather than creating a stream.
 - Use `assign_by_session` for agent session events (all events for that session move together)
 - Use `assign_by_pattern` for non-session events (`tmux_pane_focus`, AFK) by cwd + time range. For **`window_focus`** events (browser/Slack — no cwd) classify by **`window_title` content** with title-match rules (which doc/channel/site), NOT by cwd, proximity, or a catch-all — the title is their context (Classification Discipline #2).
 

@@ -154,6 +154,7 @@ fn insert_stream(
     db.insert_stream(&Stream {
         id: id.to_string(),
         name: name.map(ToString::to_string),
+        slug: None,
         created_at: timestamp,
         updated_at: timestamp,
         time_direct_ms: 0,

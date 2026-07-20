@@ -18,12 +18,20 @@ fn write_config(config_path: &Path, db_path: &Path) {
     .unwrap();
 }
 
-fn insert_stream(db_path: &Path, id: &str, name: Option<&str>) {
+#[derive(Clone, Copy)]
+struct StreamFixture<'a> {
+    id: &'a str,
+    name: Option<&'a str>,
+    slug: Option<&'a str>,
+}
+
+fn insert_stream(db_path: &Path, fixture: StreamFixture<'_>) {
     let db = Database::open(db_path).unwrap();
     let now = Utc::now();
     db.insert_stream(&Stream {
-        id: id.to_string(),
-        name: name.map(String::from),
+        id: fixture.id.to_string(),
+        name: fixture.name.map(String::from),
+        slug: fixture.slug.map(String::from),
         created_at: now,
         updated_at: now,
         time_direct_ms: 0,
@@ -70,14 +78,21 @@ fn priority_line(slug: &str) -> String {
 }
 
 #[test]
-fn streams_link_writes_exact_stream_name_and_priority_slug() {
+fn streams_link_resolves_name_and_writes_stream_slug_and_priority_slug() {
     // Given: one named DB stream and a matching priority in the markdown store.
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("todos");
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-1", Some("Fable 5 DPI"));
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-1",
+            name: Some("Fable 5 DPI"),
+            slug: Some("fable-5-dpi"),
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("priorities.md"), priority_line("ipi")).unwrap();
 
@@ -88,10 +103,10 @@ fn streams_link_writes_exact_stream_name_and_priority_slug() {
         &["streams", "link", "Fable 5 DPI", "ipi"],
     );
 
-    // Then: streams.md contains the exact display name and reparses cleanly.
+    // Then: streams.md contains the stream slug and reparses cleanly.
     assert_success(&output);
     let streams = std::fs::read_to_string(store.join("streams.md")).unwrap();
-    assert!(streams.contains("- Fable 5 DPI"), "streams.md:\n{streams}");
+    assert!(streams.contains("- fable-5-dpi"), "streams.md:\n{streams}");
     assert!(
         streams.contains("\"priority\":\"ipi\""),
         "streams.md:\n{streams}"
@@ -104,7 +119,7 @@ fn streams_link_writes_exact_stream_name_and_priority_slug() {
     assert!(
         parsed.items.iter().any(|line| matches!(
             &line.item,
-            StreamFileItem::Link(link) if link.stream == "Fable 5 DPI" && link.priority == "ipi"
+            StreamFileItem::Link(link) if link.stream == "fable-5-dpi" && link.priority == "ipi"
         )),
         "parsed streams: {parsed:?}"
     );
@@ -118,8 +133,22 @@ fn streams_link_rejects_duplicate_stream_names_without_changing_file() {
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-1", Some("Shared"));
-    insert_stream(&db_path, "stream-2", Some("Shared"));
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-1",
+            name: Some("Shared"),
+            slug: Some("shared-one"),
+        },
+    );
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-2",
+            name: Some("Shared"),
+            slug: Some("shared-two"),
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("priorities.md"), priority_line("ipi")).unwrap();
     let streams_path = store.join("streams.md");
@@ -130,7 +159,10 @@ fn streams_link_rejects_duplicate_stream_names_without_changing_file() {
     let output = run_tt(&config_path, &store, &["streams", "link", "Shared", "ipi"]);
 
     // Then: the command fails and streams.md is byte-identical.
-    assert_failure_contains(&output, "'Shared' is ambiguous: 2 streams share that name");
+    assert_failure_contains(
+        &output,
+        "multiple streams named 'Shared'; refer to it by slug instead",
+    );
     assert_eq!(std::fs::read_to_string(&streams_path).unwrap(), original);
 }
 
@@ -142,7 +174,14 @@ fn streams_link_rejects_unnamed_stream_target_without_changing_file() {
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-unnamed", None);
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-unnamed",
+            name: None,
+            slug: None,
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("priorities.md"), priority_line("ipi")).unwrap();
     let streams_path = store.join("streams.md");
@@ -156,20 +195,27 @@ fn streams_link_rejects_unnamed_stream_target_without_changing_file() {
         &["streams", "link", "stream-unnamed", "ipi"],
     );
 
-    // Then: exact-name resolution rejects it and streams.md is unchanged.
-    assert_failure_contains(&output, "no stream named 'stream-unnamed'");
+    // Then: slug-or-name resolution rejects it and streams.md is unchanged.
+    assert_failure_contains(&output, "no stream with slug or name 'stream-unnamed'");
     assert_eq!(std::fs::read_to_string(&streams_path).unwrap(), original);
 }
 
 #[test]
-fn streams_link_rejects_second_link_for_same_stream_without_changing_file() {
+fn streams_link_rejects_legacy_name_link_for_same_stream_without_changing_file() {
     // Given: streams.md already links the target stream to a priority.
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("todos");
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-1", Some("Fable 5 DPI"));
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-1",
+            name: Some("Fable 5 DPI"),
+            slug: Some("fable-5-dpi"),
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
         store.join("priorities.md"),
@@ -180,15 +226,15 @@ fn streams_link_rejects_second_link_for_same_stream_without_changing_file() {
     let original = "- Fable 5 DPI <!-- tt-stream:{\"priority\":\"ipi\"} -->\n";
     std::fs::write(&streams_path, original).unwrap();
 
-    // When: a second link is attempted for the same exact stream name.
+    // When: a second link is attempted by slug for a stream with a legacy name link.
     let output = run_tt(
         &config_path,
         &store,
-        &["streams", "link", "Fable 5 DPI", "admin"],
+        &["streams", "link", "fable-5-dpi", "admin"],
     );
 
     // Then: v1 one-priority-per-stream is enforced and the file is unchanged.
-    assert_failure_contains(&output, "stream 'Fable 5 DPI' already has a priority link");
+    assert_failure_contains(&output, "stream 'fable-5-dpi' already has a priority link");
     assert_eq!(std::fs::read_to_string(&streams_path).unwrap(), original);
 }
 
@@ -200,7 +246,14 @@ fn streams_link_rejects_missing_priority_slug_without_changing_file() {
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-1", Some("Fable 5 DPI"));
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-1",
+            name: Some("Fable 5 DPI"),
+            slug: Some("fable-5-dpi"),
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("priorities.md"), priority_line("ipi")).unwrap();
     let streams_path = store.join("streams.md");
@@ -211,7 +264,7 @@ fn streams_link_rejects_missing_priority_slug_without_changing_file() {
     let output = run_tt(
         &config_path,
         &store,
-        &["streams", "link", "Fable 5 DPI", "missing"],
+        &["streams", "link", "fable-5-dpi", "missing"],
     );
 
     // Then: the command fails and streams.md is byte-identical.
@@ -227,7 +280,14 @@ fn streams_link_rejects_sync_conflict_before_changing_file() {
     let config_path = temp.path().join("config.toml");
     let db_path = temp.path().join("tt.db");
     write_config(&config_path, &db_path);
-    insert_stream(&db_path, "stream-1", Some("Fable 5 DPI"));
+    insert_stream(
+        &db_path,
+        StreamFixture {
+            id: "stream-1",
+            name: Some("Fable 5 DPI"),
+            slug: Some("fable-5-dpi"),
+        },
+    );
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("priorities.md"), priority_line("ipi")).unwrap();
     std::fs::write(store.join("streams.sync-conflict-20260623.md"), "conflict").unwrap();
@@ -236,7 +296,7 @@ fn streams_link_rejects_sync_conflict_before_changing_file() {
     let output = run_tt(
         &config_path,
         &store,
-        &["streams", "link", "Fable 5 DPI", "ipi"],
+        &["streams", "link", "fable-5-dpi", "ipi"],
     );
 
     // Then: the conflict blocks the mutation and streams.md is not created.

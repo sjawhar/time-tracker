@@ -37,9 +37,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version. Increment when making schema changes.
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 const EVENT_COLUMNS: &str = "id, timestamp, type, source, machine_id, schema_version, cwd, git_project, git_workspace, pane_id, tmux_session, window_index, status, idle_duration_ms, action, session_id, stream_id, assignment_source, window_app_id, window_title";
+const STREAM_COLUMNS: &str = "id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute, slug";
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -63,6 +64,9 @@ pub struct Stream {
 
     /// Human-readable name (auto-generated or user-provided).
     pub name: Option<String>,
+
+    /// Short unique identifier (kebab-case), used by todo-store references.
+    pub slug: Option<String>,
 
     /// When the stream was created.
     pub created_at: DateTime<Utc>,
@@ -96,6 +100,10 @@ pub enum DbError {
     /// Schema version mismatch.
     #[error("schema version mismatch: database has version {found}, expected {expected}")]
     SchemaVersionMismatch { found: i32, expected: i32 },
+
+    /// Slug already assigned to another stream.
+    #[error("slug '{slug}' is already in use by another stream")]
+    SlugTaken { slug: String },
 }
 
 /// Status of events from a single source.
@@ -383,10 +391,17 @@ impl Database {
 
         match existing_version {
             Some(v) if v == SCHEMA_VERSION => {}
-            Some(8) => {
+            Some(v @ (8 | 9)) => {
                 let tx = self.conn.unchecked_transaction()?;
-                tx.execute("ALTER TABLE events ADD COLUMN window_app_id TEXT", [])?;
-                tx.execute("ALTER TABLE events ADD COLUMN window_title TEXT", [])?;
+                if v == 8 {
+                    tx.execute("ALTER TABLE events ADD COLUMN window_app_id TEXT", [])?;
+                    tx.execute("ALTER TABLE events ADD COLUMN window_title TEXT", [])?;
+                }
+                tx.execute("ALTER TABLE streams ADD COLUMN slug TEXT", [])?;
+                tx.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_slug ON streams(slug)",
+                    [],
+                )?;
                 tx.execute(
                     "UPDATE schema_info SET version = ?1",
                     params![SCHEMA_VERSION],
@@ -443,6 +458,7 @@ impl Database {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 name TEXT,
+                slug TEXT,
                 time_direct_ms INTEGER DEFAULT 0,
                 time_delegated_ms INTEGER DEFAULT 0,
                 first_event_at TEXT,
@@ -467,6 +483,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_git_project ON events(git_project);
             CREATE INDEX IF NOT EXISTS idx_events_machine ON events(machine_id);
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_slug ON streams(slug);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
 
             -- Agent sessions table: indexed coding assistant sessions
@@ -685,8 +702,8 @@ impl Database {
     /// Returns an error if a stream with the same ID already exists.
     pub fn insert_stream(&self, stream: &Stream) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO streams (id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO streams (id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 stream.id,
                 format_timestamp(stream.created_at),
@@ -697,6 +714,7 @@ impl Database {
                 format_timestamp_opt(stream.first_event_at),
                 format_timestamp_opt(stream.last_event_at),
                 i32::from(stream.needs_recompute),
+                stream.slug,
             ],
         )?;
         Ok(())
@@ -706,10 +724,9 @@ impl Database {
     ///
     /// Returns `None` if no stream with the given ID exists.
     pub fn get_stream(&self, id: &str) -> Result<Option<Stream>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
-             FROM streams WHERE id = ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams WHERE id = ?1"
+        ))?;
 
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
@@ -718,14 +735,46 @@ impl Database {
         }
     }
 
+    /// Retrieves a stream by slug.
+    pub fn get_stream_by_slug(&self, slug: &str) -> Result<Option<Stream>, DbError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams WHERE slug = ?1"
+        ))?;
+        let mut rows = stmt.query(params![slug])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_stream(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Sets (or replaces) a stream's slug.
+    ///
+    /// Returns `SlugTaken` if another stream already uses the slug.
+    pub fn set_stream_slug(&self, stream_id: &str, slug: &str) -> Result<(), DbError> {
+        let result = self.conn.execute(
+            "UPDATE streams SET slug = ?1, updated_at = ?2 WHERE id = ?3",
+            params![slug, format_timestamp(Utc::now()), stream_id],
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(DbError::SlugTaken {
+                    slug: slug.to_string(),
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Retrieves all streams.
     ///
     /// Returns streams ordered by `updated_at` descending.
     pub fn get_streams(&self) -> Result<Vec<Stream>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
-             FROM streams ORDER BY updated_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams ORDER BY updated_at DESC"
+        ))?;
 
         let mut streams = Vec::new();
         let mut rows = stmt.query([])?;
@@ -948,11 +997,14 @@ impl Database {
 
     /// Clears all inferred stream assignments.
     ///
-    /// User assignments (`assignment_source = 'user'`) are preserved.
+    /// Clears both `'inferred'` and `'todo_link'` assignments (the latter are
+    /// re-established from live todo links on the next classify). User
+    /// assignments (`assignment_source = 'user'`) are preserved.
     /// Returns the number of events cleared.
     pub fn clear_inferred_assignments(&self) -> Result<u64, DbError> {
         let count = self.conn.execute(
-            "UPDATE events SET stream_id = NULL WHERE assignment_source = 'inferred'",
+            "UPDATE events SET stream_id = NULL \
+             WHERE assignment_source IN ('inferred', 'todo_link')",
             [],
         )?;
         Ok(count as u64)
@@ -1052,10 +1104,9 @@ impl Database {
 
     /// Gets streams that need recomputation.
     pub fn get_streams_needing_recompute(&self) -> Result<Vec<Stream>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
-             FROM streams WHERE needs_recompute = 1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams WHERE needs_recompute = 1"
+        ))?;
 
         let mut streams = Vec::new();
         let mut rows = stmt.query([])?;
@@ -1152,9 +1203,9 @@ impl Database {
         Ok(result)
     }
 
-    /// Resolves a stream by ID or name.
+    /// Resolves a stream by ID, slug, or name.
     ///
-    /// First checks if the query matches a stream ID, then checks names.
+    /// First checks if the query matches a stream ID, then slug, then name.
     /// Returns None if no matching stream is found.
     pub fn resolve_stream(&self, query: &str) -> Result<Option<Stream>, DbError> {
         // First try by ID
@@ -1162,11 +1213,15 @@ impl Database {
             return Ok(Some(stream));
         }
 
+        // Then try by slug
+        if let Some(stream) = self.get_stream_by_slug(query)? {
+            return Ok(Some(stream));
+        }
+
         // Then try by name
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
-             FROM streams WHERE name = ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams WHERE name = ?1"
+        ))?;
 
         let mut rows = stmt.query(params![query])?;
         match rows.next()? {
@@ -1265,6 +1320,7 @@ impl Database {
         let first_event_at_str: Option<String> = row.get(6)?;
         let last_event_at_str: Option<String> = row.get(7)?;
         let needs_recompute: i32 = row.get(8)?;
+        let slug: Option<String> = row.get(9)?;
 
         // Parse timestamps - these should always be valid in our schema
         let created_at = DateTime::parse_from_rfc3339(&created_at_str)
@@ -1293,6 +1349,7 @@ impl Database {
         Ok(Stream {
             id,
             name,
+            slug,
             created_at,
             updated_at,
             time_direct_ms,
@@ -1445,15 +1502,14 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<Stream>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, name, time_direct_ms, time_delegated_ms, first_event_at, last_event_at, needs_recompute
-             FROM streams
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams
              WHERE first_event_at IS NOT NULL
                AND last_event_at IS NOT NULL
                AND first_event_at <= ?2
                AND last_event_at >= ?1
-             ORDER BY first_event_at ASC",
-        )?;
+             ORDER BY first_event_at ASC"
+        ))?;
 
         let mut streams = Vec::new();
         let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
@@ -1926,6 +1982,7 @@ mod tests {
                 created_at: ts1,
                 updated_at: ts1,
                 name: Some(stream_id.to_string()),
+                slug: None,
                 time_direct_ms: 0,
                 time_delegated_ms: 0,
                 first_event_at: None,
@@ -2128,7 +2185,9 @@ mod tests {
                 assert_eq!(found, 1);
                 assert_eq!(expected, SCHEMA_VERSION);
             }
-            DbError::Sqlite(_) => panic!("expected SchemaVersionMismatch error"),
+            DbError::Sqlite(_) | DbError::SlugTaken { .. } => {
+                panic!("expected SchemaVersionMismatch error");
+            }
         }
     }
 
@@ -2163,7 +2222,20 @@ mod tests {
                    assignment_source TEXT DEFAULT 'inferred'
                  );
                  INSERT INTO events (id, timestamp, type, source)
-                 VALUES ('old-1','2026-06-01T00:00:00.000Z','tmux_pane_focus','remote.tmux');",
+                 VALUES ('old-1','2026-06-01T00:00:00.000Z','tmux_pane_focus','remote.tmux');
+                 CREATE TABLE streams (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    name TEXT,
+                    time_direct_ms INTEGER DEFAULT 0,
+                    time_delegated_ms INTEGER DEFAULT 0,
+                    first_event_at TEXT,
+                    last_event_at TEXT,
+                    needs_recompute INTEGER DEFAULT 0
+                 );
+                 INSERT INTO streams (id, created_at, updated_at, name)
+                 VALUES ('old-stream', '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z', 'legacy stream');",
             )
             .unwrap();
         }
@@ -2174,6 +2246,8 @@ mod tests {
         assert_eq!(events[0].id, "old-1");
         assert_eq!(events[0].window_app_id, None);
         assert_eq!(events[0].window_title, None);
+        let stream = db.get_stream("old-stream").unwrap().unwrap();
+        assert_eq!(stream.slug, None);
 
         let version = db
             .conn
@@ -2198,20 +2272,20 @@ mod tests {
     #[test]
     fn test_open_fails_on_newer_schema() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("v10.db");
+        let db_path = temp_dir.path().join("v11.db");
 
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE schema_info (version INTEGER NOT NULL);
-                 INSERT INTO schema_info (version) VALUES (10);",
+                 INSERT INTO schema_info (version) VALUES (11);",
             )
             .unwrap();
         }
 
         assert!(matches!(
             Database::open(&db_path),
-            Err(DbError::SchemaVersionMismatch { found: 10, .. })
+            Err(DbError::SchemaVersionMismatch { found: 11, .. })
         ));
     }
 
@@ -2329,6 +2403,7 @@ mod tests {
         Stream {
             id: id.to_string(),
             name: name.map(String::from),
+            slug: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -2640,26 +2715,35 @@ mod tests {
 
         let ts1 = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2025, 1, 15, 12, 0, 0).unwrap();
 
         db.insert_event(&make_event("e1", ts1, tt_core::EventType::TmuxPaneFocus))
             .unwrap();
         db.insert_event(&make_event("e2", ts2, tt_core::EventType::TmuxPaneFocus))
             .unwrap();
+        db.insert_event(&make_event("e3", ts3, tt_core::EventType::TmuxPaneFocus))
+            .unwrap();
 
         db.insert_stream(&make_stream("s1", Some("test"))).unwrap();
 
-        // Assign one as inferred, one as user
+        // Assign one as inferred, one as user, one as todo_link
         db.assign_event_to_stream("e1", "s1", "inferred").unwrap();
         db.assign_event_to_stream("e2", "s1", "user").unwrap();
+        db.assign_event_to_stream("e3", "s1", "todo_link").unwrap();
 
-        // Clear inferred assignments
+        // Clear inferred assignments (covers 'inferred' and 'todo_link')
         let cleared = db.clear_inferred_assignments().unwrap();
-        assert_eq!(cleared, 1);
+        assert_eq!(cleared, 2);
 
-        // Verify: e1 should be unassigned, e2 should still be assigned
-        let unassigned = db.get_events_without_stream().unwrap();
-        assert_eq!(unassigned.len(), 1);
-        assert_eq!(unassigned[0].id, "e1");
+        // Verify: e1 and e3 should be unassigned, e2 should still be assigned
+        let mut unassigned: Vec<_> = db
+            .get_events_without_stream()
+            .unwrap()
+            .into_iter()
+            .map(|event| event.id)
+            .collect();
+        unassigned.sort();
+        assert_eq!(unassigned, vec!["e1", "e3"]);
 
         let assigned = db.get_events_by_stream("s1").unwrap();
         assert_eq!(assigned.len(), 1);
@@ -2923,6 +3007,7 @@ mod tests {
         Stream {
             id: id.to_string(),
             name: name.map(String::from),
+            slug: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -3310,5 +3395,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn fresh_db_streams_have_nullable_slug() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        let stream = db.get_stream("s1").unwrap().unwrap();
+        assert_eq!(stream.slug, None);
+    }
+
+    #[test]
+    fn migration_from_v9_adds_slug_column() {
+        // Create a v9-shaped DB on disk, then reopen through Database::open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tt.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_info (version INTEGER NOT NULL);
+                 INSERT INTO schema_info (version) VALUES (9);
+                 CREATE TABLE streams (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    name TEXT,
+                    time_direct_ms INTEGER DEFAULT 0,
+                    time_delegated_ms INTEGER DEFAULT 0,
+                    first_event_at TEXT,
+                    last_event_at TEXT,
+                    needs_recompute INTEGER DEFAULT 0
+                 );
+                 INSERT INTO streams (id, created_at, updated_at, name)
+                 VALUES ('old1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'legacy stream');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let stream = db.get_stream("old1").unwrap().unwrap();
+        assert_eq!(stream.name.as_deref(), Some("legacy stream"));
+        assert_eq!(stream.slug, None);
+    }
+
+    #[test]
+    fn get_stream_by_slug_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        db.set_stream_slug("s1", "proj-x").unwrap();
+        let stream = db.get_stream_by_slug("proj-x").unwrap().unwrap();
+        assert_eq!(stream.id, "s1");
+        assert_eq!(stream.slug.as_deref(), Some("proj-x"));
+        assert!(db.get_stream_by_slug("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_stream_slug_overwrites_existing() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-x")))
+            .unwrap();
+        db.set_stream_slug("s1", "old").unwrap();
+        db.set_stream_slug("s1", "new").unwrap();
+        assert!(db.get_stream_by_slug("old").unwrap().is_none());
+        assert_eq!(db.get_stream_by_slug("new").unwrap().unwrap().id, "s1");
+    }
+
+    #[test]
+    fn resolve_stream_prefers_id_then_slug_then_name() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("long display name")))
+            .unwrap();
+        db.set_stream_slug("s1", "short").unwrap();
+        assert_eq!(db.resolve_stream("s1").unwrap().unwrap().id, "s1");
+        assert_eq!(db.resolve_stream("short").unwrap().unwrap().id, "s1");
+        assert_eq!(
+            db.resolve_stream("long display name").unwrap().unwrap().id,
+            "s1"
+        );
+    }
+
+    #[test]
+    fn slug_unique_index_rejects_duplicates() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("project-a")))
+            .unwrap();
+        db.insert_stream(&make_stream("s2", Some("project-b")))
+            .unwrap();
+        db.set_stream_slug("s1", "project").unwrap();
+
+        let error = db.set_stream_slug("s2", "project").unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::SlugTaken { slug } if slug == "project"
+        ));
     }
 }

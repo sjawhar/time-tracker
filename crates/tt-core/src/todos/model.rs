@@ -64,6 +64,8 @@ pub struct Todo {
     pub done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +154,8 @@ pub(super) struct TodoMetadata {
     pub(super) quick: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) block: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) sessions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

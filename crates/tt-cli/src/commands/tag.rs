@@ -48,6 +48,7 @@ mod tests {
         let stream = tt_db::Stream {
             id: "test-stream-123".to_string(),
             name: Some("project-x".to_string()),
+            slug: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -75,6 +76,7 @@ mod tests {
         let stream = tt_db::Stream {
             id: "test-stream-456".to_string(),
             name: Some("my-project".to_string()),
+            slug: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,

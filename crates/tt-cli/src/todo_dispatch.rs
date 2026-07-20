@@ -33,6 +33,7 @@ pub fn run_todo_action(db: Option<&Database>, config: &Config, action: &TodoActi
             pin,
         } => todo::run_add(
             config,
+            db,
             todo::AddOptions {
                 text: text.clone(),
                 priority: priority.clone(),
@@ -43,6 +44,8 @@ pub fn run_todo_action(db: Option<&Database>, config: &Config, action: &TodoActi
                 pin: *pin,
             },
         ),
+        TodoAction::Link { id, session } => todo::run_link(config, id, session.clone()),
+        TodoAction::Unlink { id, session } => todo::run_unlink(config, id, session.clone()),
         TodoAction::Done { id } => todo::run_done(config, id),
         TodoAction::Defer { id, date } => todo::run_defer(config, id, date),
         TodoAction::Block { id, reason } => todo::run_block(config, id, reason),

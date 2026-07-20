@@ -38,7 +38,7 @@ tt-watcher ─> tt-cli ──> (transitively pulls in tt-core, tt-db)
 |------|----------|-------|
 | Add CLI subcommand | `tt-cli/src/cli.rs` + `commands/{name}.rs` + `commands/mod.rs` | Follow existing pattern (see `tag.rs` for simple, `report.rs` for complex) |
 | Change time algorithm | `tt-core/src/allocation.rs` | 1366-line algo with extensive tests. See `tt-core/AGENTS.md` |
-| Add DB table/column | `tt-db/src/lib.rs` | Bump `SCHEMA_VERSION`, add to `init()`. No migrations—schema mismatch = fail-fast |
+| Add DB table/column | `tt-db/src/lib.rs` | Bump `SCHEMA_VERSION`, add to `init()`. Additive migrations only: supported older schema versions migrate forward in `init()`; unsupported versions fail fast. |
 | Add event type | `tt-db/src/lib.rs` (`StoredEvent`) | Then handle in `allocation.rs` and relevant command |
 | Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Claude: parse JSONL session files from `~/.claude/`. OpenCode: query SQLite database via rusqlite |
 | Config options | `tt-cli/src/config.rs` | Figment: defaults → `~/.config/time-tracker/config.toml` → `TT_*` env vars |
@@ -64,6 +64,9 @@ tt machines                     # List known remote machines
 tt classify --json              # Show sessions + events for classification
 tt classify --apply input.json  # Apply stream assignments from LLM
 tt classify --unclassified      # Show only unassigned data
+tt streams slug <stream-ref> <slug>  # Set a stream's stable slug
+tt todo link <todo-id>          # Link the current agent session to a todo
+tt todo unlink <todo-id>        # Remove the current agent-session link from a todo
 ```
 
 CI (`.github/workflows/pr-and-main.yml`): lint job (fmt + deny) + build job (clippy + test). Runs on push to main and PRs.
@@ -115,7 +118,7 @@ State:  ~/.local/state/time-tracker/ (hook.log, claude-manifest.json)
 
 ## Anti-Patterns
 
-- **No migrations**: Schema version mismatch = hard error. DB must be recreated on schema change.
+- **Additive migrations only**: Supported older schema versions migrate forward in `init()`; unsupported versions fail fast.
 - **No `unwrap()` in non-test code** (except compile-time-safe patterns like `LazyLock` regex, hardcoded `NaiveTime`)
 - **No `tt-llm` crate yet** — docs reference it but it's unimplemented
 
