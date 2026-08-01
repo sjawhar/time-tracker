@@ -9,15 +9,16 @@ Generate and post a daily standup to Slack using time-tracker activity data.
 
 ## Non-negotiables (read these even if you skim everything else)
 
-1. **Classifying yesterday's time IS the standup work.** Phases 4-5 are not prep for the
-   deliverable — they are the deliverable's foundation. A standup drafted over unclassified
-   time is a failed standup, not a standup with a caveat.
-2. **Never hand the gap to the user.** "There's a bunch of unclassified time 🤷" is the
-   canonical failure of this skill. If you find unassigned time, YOU classify it (Phase 5
-   tells you exactly how) and only then continue. The user never gets asked about, warned
-   about, or shown an unclassified remainder.
+1. **Getting yesterday's time attributed IS the standup work.** Phases 4-5 are not prep for
+   the deliverable — they are the deliverable's foundation. A standup drafted over
+   unattributed time is a failed standup, not a standup with a caveat.
+2. **Never hand the pipeline to the user.** "There's a bunch of unclassified time 🤷" is the
+   canonical failure of this skill. Running ingest, sync, and `tt classify --auto` until the
+   classifier is current is your job (Phase 5), and the user is never asked to authorize it.
+   What you *do* owe them is honesty about any remainder that survives a caught-up
+   classifier — report it, never bury it and never invent a bucket for it.
 3. **The gate is checked twice more, later.** Phases 11 and 13 require you to re-verify
-   `unassigned_direct_ms` ≈ 0 before drafting and before posting. If you reach either
+   `unassigned_direct_ms` before drafting and before posting. If you reach either
    checkpoint and can't show it, go back to Phase 5 — do not proceed.
 
 ## Phase 0: Load Personal Config
@@ -75,8 +76,8 @@ digraph standup {
   cfg [label="0. Load personal config\n(~/.config/time-tracker/standup.md)" shape=ellipse];
   start [label="1. Parse date in user's timezone"];
   ingest [label="2. Ingest + sync remotes\n(skip per config)"];
-  gather [label="3. Gather context\ntt classify --json"];
-  analyze [label="4. Create streams\n(infer-streams)"];
+  gather [label="3. Gather context\ntt report --last-day"];
+  analyze [label="4. Classifier catch-up\ntt classify --auto"];
   coverage [label="5. Coverage gate\n(all activity assigned)"];
   compute [label="6. Get computed time\ntt report --last-day + --week --json"];
   prio [label="7. Weekly priority check\n(curious debugging beat)"];
@@ -125,87 +126,97 @@ If you parallelize ingest + sync and hit `database is locked`, re-run `tt ingest
 
 ## Phase 3: Gather Context
 
-```bash
-tt classify --json --start "$START" --end "$END" > /tmp/classify-yesterday.json
-```
-
-Filter to sessions that started or were active in the window:
+The `tt-serve` daemon has already ingested and classified yesterday's sessions. Read what it
+concluded rather than re-deriving it:
 
 ```bash
-# Sessions starting in window
-jq -r '[.sessions[] | select(.start_time >= "'"$START"'" and .start_time < "'"$END"'")]
-  | sort_by(.start_time) | .[]
-  | "\(.session_id)\t\(.project_path)\t\(.duration_minutes // 0)m\tt=\(.tool_call_count)\t\(.stream_id // "-")\t\(.summary // "(none)")"' /tmp/classify-yesterday.json
-
-# Long-running sessions that started earlier but had activity yesterday
-jq -r '[.sessions[] | select(
-  .end_time != null and .end_time >= "'"$START"'" and .start_time < "'"$START"'"
-)] | sort_by(.start_time) | .[]
-  | "\(.start_time) → \(.end_time) | \(.project_name) | \(.summary // "(none)")"' /tmp/classify-yesterday.json
+tt report --last-day --json     # the authoritative time + coverage figures
+tt streams list                 # each stream's totals, tags, and description
+tt proposals ls                 # classifier suggestions still awaiting a human
 ```
 
-**Todo-linked sessions are pre-classified evidence.** Sessions may carry a
-`linked_todo: {id, text, stream_slug}` field (`tt todo link` ran inside them). Sessions
-sharing a `linked_todo.id` belong to the same stream, and the todo text is a
-ready-made description of the work. If the linked todo already has a `stream_slug`
-matching an existing stream, `tt classify` auto-assigned the session before printing —
-it will already show a `stream_id`.
+`tt report --last-day --json` gives you `by_tag[]`, `untagged[]`, per-stream rows, and
+`totals` — including `totals.unassigned_direct_ms`, which is the coverage number Phase 5
+gates on.
 
-## Phase 4: Create Streams
+**Todo-linked sessions carry their own answer.** When `tt todo link` runs inside a session and
+the todo names a stream slug, that session's events are assigned `todo_link` at link time. The
+todo text is a ready-made description of the work, and sessions sharing a todo belong together.
 
-**REQUIRED: Invoke the `infer-streams` skill** via the Skill tool (do NOT launch a subagent):
+## Phase 4: Let the Classifier Catch Up
 
-```
-Skill("infer-streams")
-```
+**You do not classify by hand.** There is exactly one machine-inference path — `tt classify
+--auto` — and it holds every guard that makes inference safe: newest-first bounded selection,
+subagent inheritance, injection filtering, and a name guard that refuses to invent a container
+(an activity, a date range, a catch-all) for work it cannot place.
 
-Use the "Streams I recognize across days" section of your config to identify recurring streams without re-naming them. Build the `tt classify --apply` JSON with `assign_by_session` entries for yesterday's sessions — every new stream in `"streams"` REQUIRES a `"slug"` (lowercase kebab-case, ≤32 chars), and `assign_by_*` stream refs should use slugs (see the infer-streams skill for the full JSON shape). Then:
+If Phase 3 shows the classifier is behind, run one bounded pass and re-pull:
 
 ```bash
-tt classify --apply /tmp/standup-assignments.json
+tt classify --auto
+tt report --last-day --json
 ```
 
-This persists streams AND runs `tt recompute --force`. On a large DB the recompute may take 2–5 minutes — use a 600s timeout.
+**Never author stream assignments in bulk** — no JSON blob, no cwd pattern, no time range, and
+never raw SQL against `tt.db`. Those surfaces are gone because an agent using them minted **68
+misnamed streams across 55,031 events** (`workorder-5: IPI envs (Jun14-20)`, `agent-c: misc`, a
+fresh bucket every week). The ontology rules meant to prevent that were prose, and prose is not
+a guard.
 
-Look up existing streams matching your common patterns:
+The two corrections you may make, both requiring that you actually looked at the work:
 
 ```bash
-sqlite3 ~/.local/share/time-tracker/tt.db "SELECT id, slug, name FROM streams ORDER BY name;"
+tt proposals accept <id>                          # confirm a classifier suggestion
+tt proposals reject <id> [--stream <ref>]         # reject it, optionally redirecting
+tt streams assign <stream-ref> --session <id>     # one session you know is misfiled
 ```
+
+`tt streams assign` writes `assignment_source = "user"`, which no machine writer overwrites —
+which is exactly why you name specific sessions and never sweep a remainder with it. It will
+not create the target stream; use `tt streams create` deliberately if one is genuinely missing.
 
 ## Phase 5: Coverage Gate (MANDATORY — do not skip)
 
-`tt report` only attributes time to events that belong to a stream. Events with no
-stream are surfaced in an **`(unassigned)`** bucket (and `totals.unassigned_*_ms`), but
-are NOT broken down by project. Auto-assign-by-cwd (run during `tt sync`) only matches
-cwds already linked to a stream, so any NEW cwd stays unassigned. If most of the day is
-unassigned, the per-project numbers are meaningless — this is the failure mode that once
-made a 12h "all one stream" report hide ~128h of real activity.
+`tt report` only attributes time to events that belong to a stream. Events with no stream are
+surfaced in an **`(unassigned)`** bucket (and `totals.unassigned_*_ms`) and are NOT broken down
+by project. If most of the day is unassigned, the per-project numbers are meaningless — this is
+the failure mode that once made a 12h "all one stream" report hide ~128h of real activity.
 
-Before trusting ANY time number, verify coverage against the raw events:
+Before trusting ANY time number, read the coverage figure from the report itself:
 
 ```bash
-# START/END = your local window (same as Phase 3)
-DB=~/.local/share/time-tracker/tt.db
-sqlite3 "$DB" "SELECT COALESCE(stream_id,'NULL') AS sid, cwd, COUNT(*) AS n
-  FROM events WHERE timestamp >= '$START' AND timestamp < '$END'
-  GROUP BY sid, cwd ORDER BY n DESC LIMIT 40;"
+tt report --last-day --json | jq '.totals'
 ```
 
-If any cwd with meaningful activity has `stream_id = NULL`, **GO BACK to Phase 4** and
-classify those sessions before computing time. After `tt report`, **`totals.unassigned_direct_ms`
-must be ~zero** (a few-minute rounding remainder, not "a small fraction") — there is no
-acceptable percentage of unassigned *direct* time; hours of it is a bug to fix, never a caveat
-to note. Delegated time may keep a small boundary-session tail. If direct is not zero, the
-report is INCOMPLETE: the unattributed time is loose events not grouped into a stream — route
-`window_focus` by `window_title`, `tmux_pane_focus` by the stream that dominates its cwd in the
-window, and boundary `agent_session`/`user_message` by session-dominant-then-cwd; `afk_change`
-markers are cwd-less and don't drive direct time (ignore). Recompute and re-pull until
-`unassigned_direct_ms` is zero. Never report per-project time off an uncovered day.
+**`totals.unassigned_direct_ms` must be small enough that no project's share is in question** —
+minutes, not hours. There is no acceptable *percentage* of unassigned direct time; hours of it
+means the instrument is broken. Delegated time may keep a larger boundary-session tail.
 
-**Classifying the day is YOUR job, not the user's.** When you find unassigned cwds/events, you do NOT ask the user whether to classify, and you do NOT offer per-project times as an optional extra ("want me to run the recompute?"). An uncovered day is a bug you silently fix. **Classify per the ontology + the infer-streams Classification Discipline: project from session/window CONTENT, never the cwd/folder (a folder is not a workstream); `window_focus` browser/Slack events by `window_title`, never by proximity or a catch-all; project (WHAT) and activity (HOW) are separate axes — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; overhead is work, NOT `personal` (which is life only).** Then `tt classify --apply` (`assign_by_session` for sessions, title-match for window events, `assign_by_pattern` for residual afk/tmux), let it recompute, and re-pull `tt report`. Personal/meta cwds (this repo, dotfiles) get their real stream so they're cleanly *excluded* from the post, not festering in unassigned. The ONLY things you ask the user are plans/blockers (Phase 10) and content edits (Phase 12) — never permission to do the data pipeline.
+If the remainder is large, diagnose the cause — do not paper over it:
 
-**No "nav"/"terminal"/"ops"/"comms"/"meetings" catch-all — cross-reference connective + activity-only focus to the live workstream (mandatory, not optional).** A stream named `terminal nav`, `ops`, `supervision`, `comms`, `messages`, `meetings`, or any activity-word is NOT a workstream, and a stream left on `project:other` (an activity tag with no real project) is the same failure — both are you abandoning the attribution behind a label the user never authorized. This covers terminal/tab nav (home-dir panes, `mosh/ssh/tmux`, `New Tab`/`Sign in`), **comms** (Slack `Threads`/channels, work email inbox, Google Messages), and **meetings** (`Meet - …`, standup, team docs, calendar, 1:1s). None names a project alone, but each was steering/discussing *some live workstream*: cross-reference each event to the **agent session active at that timestamp** (its `[start,end]` contains the event; if several overlap, the one with most tool activity) and assign it to **that session's stream** (prefer a title that clearly names the project). Do it with a script over `events` + `agent_sessions` (session→dominant-stream map + temporal-overlap join), recompute, and verify no hours-scale `nav`/`ops`/`comms`/`meetings` or `project:other` line survives. An hours-scale catch-all bucket in a standup means you did not finish.
+1. **Is the classifier healthy and current?** `tt status` reports the verdict; a missing API key
+   leaves it `Unconfigured` and nothing gets classified. Run `tt classify --auto` and see whether
+   the number moves.
+2. **Is the data even here?** `tt machines` flags remotes gone dark. An unsynced machine's events
+   simply are not present — `tt sync <remote>` and re-check.
+3. **Did the classifier deliberately refuse?** Focus events with no resolvable owner, and sessions
+   whose content names no initiative, stay unassigned **on purpose**. An unresolved event
+   registering as classification lag is the design working, not a gap to fill. **Slack is the
+   clearest case**: `Threads - … - Slack` names the workspace, not the initiative, and tt cannot
+   read thread content — leave it alone.
+
+**Getting the pipeline current is YOUR job, not the user's.** You do not ask permission to run
+`tt ingest sessions`, `tt sync`, or `tt classify --auto`, and you do not offer per-project times
+as an optional extra ("want me to run the recompute?"). The ONLY things you ask the user are
+plans/blockers (Phase 10) and content edits (Phase 12).
+
+**But an honest remainder is reported, never buried.** If time stays unattributed after the
+classifier is caught up, say so plainly in your own summary to the user. Do not invent a bucket
+for it: a stream named after an activity (`nav`, `ops`, `comms`, `meetings`, `misc`) or a date
+range is not a workstream, and `tt` now refuses to create one. `tt streams list --misnamed`
+reports containers minted before that guard existed; repairing them is a deliberate,
+per-stream operator decision (`rename` + `merge` for a real initiative bucketed weekly,
+`dissolve` for one that never named real work), not something to do mid-standup.
 
 **The coverage gate applies to the WEEK, not just the day.** The Weekly Priority Check (Phase 7) reads `tt report --week`, so run this same coverage check across the whole week window (Mon→now), not just yesterday. A brand-new working directory (e.g. a freshly-cloned sub-project or new worktree) starts out unassigned to any stream and silently vanishes from the totals — close that gap before trusting the priority proportions.
 
@@ -329,9 +340,11 @@ If user gave plans in their initial invocation, skip the question.
 ## Phase 11: Draft
 
 **GATE RE-CHECK (mandatory before drafting):** re-read `/tmp/report-yesterday.json` —
-`totals.unassigned_direct_ms` must still be ~zero, and no hours-scale catch-all stream
-(`nav`/`ops`/`comms`/`meetings`/`project:other`) may appear in `by_tag`. State the number in
-your working notes. If it fails, STOP drafting and return to Phase 5.
+`totals.unassigned_direct_ms` must still be small enough that no project's share is in
+question, and no hours-scale catch-all stream (`nav`/`ops`/`comms`/`meetings`/`project:other`)
+may appear in `by_tag`. State the number in your working notes, and carry any real remainder
+into the draft as a stated caveat rather than silently rounding it away. If the classifier is
+behind, STOP drafting and return to Phase 5.
 
 Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 13).
 
@@ -379,10 +392,10 @@ After content approval, apply any post-approval steps your personal config defin
 ## Phase 13: Post to Slack
 
 **FINAL GATE (mandatory before the message leaves):** confirm one last time that the numbers
-you're posting come from a fully-classified day — `unassigned_direct_ms` ≈ 0 and no catch-all
-buckets. Posting is irreversible; an unclassified standup posted to the team is the worst
-outcome this skill has. If the gate fails here, apologize to nobody — just go fix it (Phase 5)
-and come back.
+you're posting come from a caught-up classifier — a small `unassigned_direct_ms` and no
+catch-all buckets. Posting is irreversible; a standup posted over a stale classifier is the
+worst outcome this skill has. If the gate fails here, apologize to nobody — just go fix it
+(Phase 5) and come back.
 
 **Use the slack-bot MCP `conversations_add_message` tool with the `blocks` parameter.** This bypasses the markdown converter and posts native Block Kit `rich_text`. Requires slack-mcp-server v1.3.0+. See the `slack-bot` skill for the full Block Kit reference — the short version follows.
 
@@ -476,7 +489,8 @@ mkdir -p "$DIR"
 | Inventing a per-priority % | Most priorities have no `tt` signal. Show where time *did* go and reason about alignment; attach hours only when a priority cleanly maps to a stream/tag. |
 | Coverage-gating only yesterday | The priority beat reads `tt report --week`; run the same coverage check (Phase 5) across the whole week (Mon→now), not just yesterday, or new working directories stay unattributed and skew the proportions. |
 | Editing `priorities.md` beyond what the user said | Only tick/add/drop based on what the user actually confirmed this standup. Carried-from-review items stay in their "confirm" section until confirmed. |
-| Asking the user whether to classify, or offering per-project times as an optional "want me to run the recompute?" | **Never.** An uncovered day is a bug you silently fix (Phase 5). Build `assign_by_session` + `assign_by_pattern`, `tt classify --apply`, recompute, re-pull. Only ask the user for plans/blockers and content edits. |
+| Asking the user whether to classify, or offering per-project times as an optional "want me to run the recompute?" | **Never.** Getting the pipeline current is your job (Phase 5): `tt ingest sessions`, `tt sync`, `tt classify --auto`, re-pull. Only ask the user for plans/blockers and content edits. |
+| Hand-authoring stream assignments | **Never.** No JSON blobs, no cwd patterns, no time ranges, no raw SQL. `tt classify --auto` is the only inference path; `tt streams assign` corrects one named session or event. |
 
 ## Example Output
 

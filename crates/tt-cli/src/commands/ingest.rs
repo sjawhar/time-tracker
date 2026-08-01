@@ -3,6 +3,7 @@
 //! This module handles event ingestion on remote machines. Events are written
 //! to a JSONL file for later sync to the local machine.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tt_core::project::ProjectIdentity;
+
+mod pane_session;
 
 use crate::commands::import;
 
@@ -30,6 +33,13 @@ pub struct IngestEvent {
     /// Working directory where the event occurred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The agent session running in the focused pane, when one was identified.
+    ///
+    /// An identity rather than an inference: the pane being focused *is* running
+    /// that session. Nothing here derives a stream from it — the already-trusted
+    /// session→stream path claims the event once the session is classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// The tmux pane ID (e.g., %3).
     pub pane_id: String,
     /// The tmux session name.
@@ -112,6 +122,7 @@ impl IngestEvent {
         tmux_session: String,
         window_index: Option<u32>,
         cwd: String,
+        session_id: Option<String>,
         timestamp: DateTime<Utc>,
     ) -> Self {
         let timestamp_str = timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -125,6 +136,7 @@ impl IngestEvent {
             source: "remote.tmux".to_string(),
             event_type: "tmux_pane_focus".to_string(),
             cwd: Some(cwd),
+            session_id,
             pane_id,
             tmux_session,
             window_index,
@@ -153,6 +165,7 @@ impl IngestEvent {
             source: "remote.tmux".to_string(),
             event_type: "tmux_scroll".to_string(),
             cwd: Some(cwd),
+            session_id: None,
             pane_id,
             tmux_session,
             window_index,
@@ -305,6 +318,7 @@ fn ingest_pane_focus_impl(
     session_name: &str,
     window_index: Option<u32>,
     cwd: &str,
+    session_id: Option<String>,
 ) -> Result<bool> {
     if pane_id.is_empty() {
         anyhow::bail!("pane_id cannot be empty");
@@ -320,6 +334,7 @@ fn ingest_pane_focus_impl(
         session_name.to_string(),
         window_index,
         cwd.to_string(),
+        session_id,
         now,
     );
     write_pane_event(data_dir, pane_id, now, &event)
@@ -388,12 +403,16 @@ fn write_pane_event(
 
 /// Ingests a pane focus event to the default data directory.
 ///
-/// This is the public API used by the CLI.
+/// This is the public API used by the CLI. `pane_process_id` is the focused pane's
+/// process id as tmux reported it; it identifies the agent session running in that
+/// pane, and every way that lookup can come up empty leaves the event exactly as
+/// it would have been recorded without it.
 pub fn ingest_pane_focus(
     pane_id: &str,
     session_name: &str,
     window_index: Option<u32>,
     cwd: &str,
+    pane_process_id: Option<&str>,
 ) -> Result<bool> {
     let identity = crate::machine::require_machine_identity()?;
     ingest_pane_focus_impl(
@@ -403,6 +422,7 @@ pub fn ingest_pane_focus(
         session_name,
         window_index,
         cwd,
+        pane_session::session_for_pane(pane_id, pane_process_id),
     )
 }
 
@@ -427,18 +447,246 @@ pub fn ingest_scroll(
 }
 
 // ========== Sessions Indexing ==========
-use tt_core::opencode::scan_opencode_sessions;
-use tt_core::session::{AgentSession, scan_claude_sessions};
+use tt_core::ScanOutcome;
+use tt_core::opencode::scan_opencode_sessions_incremental;
+use tt_core::session::{AgentSession, scan_claude_sessions_incremental};
 use tt_db::StoredEvent;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestReport {
+    pub claude: usize,
+    pub opencode: usize,
+    indexed_events: usize,
+    imported_events: usize,
+    drained_events: usize,
+    stale_events_cleaned: u64,
+    injected_events_pruned: u64,
+    session_membership_assigned: u64,
+    terminal_focus_assigned: u64,
+    artifact_focus_assigned: u64,
+    projects: Vec<(String, usize)>,
+    scanned_claude: bool,
+    scanned_opencode: bool,
+}
+
+impl IngestReport {
+    pub const fn imported_events(&self) -> usize {
+        self.imported_events
+    }
+}
+
+/// Safety overlap subtracted from the scan cursor before it is used as `since`.
+///
+/// Matches the margin `tt sync` already applies to `last_sync_at`, so this codebase
+/// has one number for "how far back a cursor must reach" rather than two. It is
+/// generous against everything it has to cover: a wall clock that steps backwards
+/// across an NTP correction or a suspend/resume, and the window between `OpenCode`
+/// committing a `session` row and its shard receiving the messages that row counts.
+/// Both are sub-second to seconds in practice.
+///
+/// It is deliberately **not** the safety net for a session that failed to index —
+/// that is handled structurally, by refusing to advance the cursor at all when a scan
+/// was incomplete. Sizing the overlap to cover indexing failures would mean
+/// re-deriving a large window on every tick, which is the cost being removed.
+pub const SCAN_OVERLAP_MINUTES: i64 = 5;
+
+/// Whether a pass re-derives only what changed, or the whole corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanMode {
+    /// Re-derive only sessions touched since the scan cursor. The daemon's ~30s tick.
+    #[default]
+    Incremental,
+    /// Ignore the cursor and re-derive everything.
+    ///
+    /// Needed for the two things a cursor cannot answer for itself: a change to what
+    /// the extractor derives (the corrected rows only appear for sessions actually
+    /// re-read, and `prune_user_message_events` only retires superseded rows for
+    /// sessions in its keep-set), and any suspicion the cursor drifted.
+    Full,
+}
+
+/// Where this machine's transcript stores and local event spool live.
+///
+/// A parameter rather than three calls to the environment, so ingest can be tested
+/// against a fixture corpus instead of the developer's own `~/.claude`.
+#[derive(Debug, Clone)]
+pub struct IngestPaths {
+    pub claude_projects: PathBuf,
+    pub opencode_db: PathBuf,
+    pub data_dir: PathBuf,
+}
+
+impl IngestPaths {
+    /// Resolves the real store locations for this machine.
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            claude_projects: get_claude_projects_dir(),
+            opencode_db: get_opencode_db_path()?,
+            data_dir: default_data_dir(),
+        })
+    }
+}
 
 /// Run the sessions index command.
 ///
 /// Scans Claude Code session directories and the `OpenCode` `SQLite`
 /// database, then upserts discovered sessions into the database.
-pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
-    let machine_id = crate::machine::load_machine_identity()?.map(|m| m.machine_id);
+pub fn index_sessions(db: &tt_db::Database, mode: ScanMode) -> Result<()> {
+    let report = index_sessions_quiet(db, mode)?;
 
-    let mut all_sessions = Vec::new();
+    // Under `Incremental` these counts are what *changed*, not what the store holds:
+    // a settled corpus reports zero and that is the healthy steady state.
+    let scope = match mode {
+        ScanMode::Incremental => "new or changed",
+        ScanMode::Full => "total",
+    };
+    if report.scanned_claude {
+        println!("Scanning Claude Code sessions...");
+        println!("  Found {} {scope} Claude sessions", report.claude);
+    }
+    if report.scanned_opencode {
+        println!("Scanning OpenCode sessions...");
+        println!("  Found {} {scope} OpenCode sessions", report.opencode);
+    }
+    if report.claude + report.opencode == 0 {
+        println!("No {scope} sessions found.");
+        return Ok(());
+    }
+    if report.stale_events_cleaned > 0 {
+        println!(
+            "Cleaned {} stale user_message events from non-user sessions",
+            report.stale_events_cleaned
+        );
+    }
+    println!(
+        "Indexed {} sessions ({} events)",
+        report.claude + report.opencode,
+        report.indexed_events
+    );
+    println!("\nSessions by project:");
+    for (project, count) in &report.projects[..report.projects.len().min(10)] {
+        println!("  {project}: {count} sessions");
+    }
+    if report.projects.len() > 10 {
+        println!("  ... and {} more projects", report.projects.len() - 10);
+    }
+    if report.drained_events > 0 {
+        println!(
+            "Drained {} local events from events.jsonl",
+            report.drained_events
+        );
+    }
+    if report.session_membership_assigned > 0 {
+        println!(
+            "Attributed {} events to the stream their own classified session was placed on",
+            report.session_membership_assigned
+        );
+    }
+    if report.terminal_focus_assigned > 0 {
+        println!(
+            "Attributed {} terminal-focus events to concurrent remote work",
+            report.terminal_focus_assigned
+        );
+    }
+    if report.artifact_focus_assigned > 0 {
+        println!(
+            "Attributed {} window-focus events to the work that did the pull request or issue they name",
+            report.artifact_focus_assigned
+        );
+    }
+    if report.injected_events_pruned > 0 {
+        println!(
+            "Pruned {} user_message events that were harness-injected text",
+            report.injected_events_pruned
+        );
+    }
+    Ok(())
+}
+
+/// Sessions discovered on this machine, and which sources were present to scan.
+struct ScannedSessions {
+    sessions: Vec<AgentSession>,
+    claude: usize,
+    opencode: usize,
+    scanned_claude: bool,
+    scanned_opencode: bool,
+    /// Whether every store present could be read in full.
+    ///
+    /// False means some part of a store was unreadable, so the sessions returned are
+    /// not the whole answer for this window and the scan cursor must not advance past
+    /// it. See `tt_core::ScanOutcome`.
+    complete: bool,
+}
+
+/// Scans both agent transcript stores, bounded by `since`. A store that is absent is
+/// not an error — most machines run only one of the two, and an absent store leaves
+/// the scan complete so it cannot freeze the cursor forever.
+fn scan_all_sessions(paths: &IngestPaths, since: Option<DateTime<Utc>>) -> Result<ScannedSessions> {
+    let scanned_claude = paths.claude_projects.exists();
+    let claude = if scanned_claude {
+        scan_claude_sessions_incremental(&paths.claude_projects, since)
+            .context("failed to scan Claude Code sessions")?
+    } else {
+        ScanOutcome::complete(Vec::new())
+    };
+
+    let scanned_opencode = paths.opencode_db.exists();
+    let opencode = if scanned_opencode {
+        scan_opencode_sessions_incremental(&paths.opencode_db, since)
+            .context("failed to scan OpenCode sessions")?
+    } else {
+        ScanOutcome::complete(Vec::new())
+    };
+
+    // One cursor covers both stores, so it may only advance when both were read in
+    // full. Holding it back for a store that succeeded costs one cheap re-scan of a
+    // small window; advancing it for a store that failed loses that window for good.
+    let complete = claude.complete && opencode.complete;
+
+    Ok(ScannedSessions {
+        claude: claude.sessions.len(),
+        opencode: opencode.sessions.len(),
+        sessions: claude
+            .sessions
+            .into_iter()
+            .chain(opencode.sessions)
+            .collect(),
+        scanned_claude,
+        scanned_opencode,
+        complete,
+    })
+}
+
+/// The `since` bound for this pass: the cursor less the safety overlap, or `None` to
+/// re-derive everything.
+fn scan_since(db: &tt_db::Database, mode: ScanMode) -> Result<Option<DateTime<Utc>>> {
+    if mode == ScanMode::Full {
+        return Ok(None);
+    }
+    let cursor = db
+        .get_session_scan_cursor()
+        .context("failed to read session scan cursor")?;
+    Ok(cursor.map(|at| at - chrono::Duration::minutes(SCAN_OVERLAP_MINUTES)))
+}
+
+/// Indexes sessions from this machine's real store locations.
+pub fn index_sessions_quiet(db: &tt_db::Database, mode: ScanMode) -> Result<IngestReport> {
+    let paths = IngestPaths::from_env()?;
+    index_sessions_in(db, &paths, mode)
+}
+
+/// Indexes sessions from the given store locations.
+///
+/// The scan cursor is captured *before* reading and written only after the pass has
+/// committed everything it derived. A session written while the scan runs therefore
+/// carries a timestamp after the recorded cursor and is picked up next pass, rather
+/// than falling into the gap between "scanned" and "finished".
+pub fn index_sessions_in(
+    db: &tt_db::Database,
+    paths: &IngestPaths,
+    mode: ScanMode,
+) -> Result<IngestReport> {
+    let machine_id = crate::machine::load_machine_identity()?.map(|m| m.machine_id);
 
     let (migrated_start, migrated_end) = db
         .migrate_legacy_event_types()
@@ -447,197 +695,223 @@ pub fn index_sessions(db: &tt_db::Database) -> Result<()> {
         tracing::info!(migrated_start, migrated_end, "migrated legacy event types");
     }
 
-    // Claude Code
-    let claude_dir = get_claude_projects_dir();
-    if claude_dir.exists() {
-        println!("Scanning Claude Code sessions...");
-        let claude_sessions =
-            scan_claude_sessions(&claude_dir).context("failed to scan Claude Code sessions")?;
-        println!("  Found {} Claude sessions", claude_sessions.len());
-        all_sessions.extend(claude_sessions);
-    }
+    let scan_started_at = Utc::now();
+    let since = scan_since(db, mode)?;
 
-    // OpenCode
-    let opencode_db = get_opencode_db_path()?;
-    if opencode_db.exists() {
-        println!("Scanning OpenCode sessions...");
-        let opencode_sessions = scan_opencode_sessions(&opencode_db, None)
-            .context("failed to scan OpenCode sessions")?;
-        println!("  Found {} OpenCode sessions", opencode_sessions.len());
-        all_sessions.extend(opencode_sessions);
-    }
+    let ScannedSessions {
+        sessions: all_sessions,
+        claude,
+        opencode,
+        scanned_claude,
+        scanned_opencode,
+        complete,
+    } = scan_all_sessions(paths, since)?;
 
     if all_sessions.is_empty() {
-        println!("No sessions found.");
-        return Ok(());
+        // The steady state, not a failure: nothing changed since the cursor. The
+        // cursor still advances, so the re-read window stays one overlap wide instead
+        // of growing without bound.
+        advance_scan_cursor(db, scan_started_at, complete)?;
+        return Ok(IngestReport {
+            claude,
+            opencode,
+            indexed_events: 0,
+            imported_events: 0,
+            drained_events: 0,
+            stale_events_cleaned: 0,
+            injected_events_pruned: 0,
+            session_membership_assigned: 0,
+            terminal_focus_assigned: 0,
+            artifact_focus_assigned: 0,
+            projects: Vec::new(),
+            scanned_claude,
+            scanned_opencode,
+        });
     }
 
-    let mut event_count = 0usize;
+    let mut indexed_events = 0usize;
+    let mut inserted_events = 0usize;
+    // What the current extractor derives, per session. Feeding this to
+    // `prune_user_message_events` retires user_message rows that an earlier,
+    // laxer extractor wrote — event inserts are `INSERT OR IGNORE`, so a
+    // correction adds the right rows but cannot remove the wrong ones.
+    //
+    // Under `ScanMode::Incremental` this keep-set holds only the sessions this pass
+    // actually re-derived, and that is exactly the contract the prune is written to:
+    // a session absent from the map is left untouched, because a caller can only
+    // speak for transcripts it read. So a smaller keep-set prunes *less*, never
+    // wrongly. The cost is that an extractor change no longer reaches settled
+    // sessions on its own — which is one of the two reasons `ScanMode::Full` exists.
+    let mut derived_user_messages: HashMap<String, HashSet<chrono::DateTime<chrono::Utc>>> =
+        HashMap::with_capacity(all_sessions.len());
     for session in &all_sessions {
         db.upsert_agent_session(session, None)
             .with_context(|| format!("failed to upsert session {}", session.session_id))?;
 
         let events = create_session_events(session, machine_id.as_deref());
-        event_count += events.len();
-        db.insert_events(&events).with_context(|| {
+        derived_user_messages.insert(
+            session.session_id.clone(),
+            events
+                .iter()
+                .filter(|event| event.event_type == tt_core::EventType::UserMessage)
+                .map(|event| event.timestamp)
+                .collect(),
+        );
+        indexed_events += events.len();
+        inserted_events += db.insert_events(&events).with_context(|| {
             format!("failed to insert events for session {}", session.session_id)
         })?;
     }
 
-    // Clean up stale user_message events from sessions that were reclassified
-    // (e.g., Legion workers previously classified as User, now Agent).
-    let cleaned = db
+    let injected_events_pruned = db
+        .prune_user_message_events(&derived_user_messages)
+        .context("failed to prune superseded user_message events")?;
+    if injected_events_pruned > 0 {
+        tracing::info!(
+            pruned = injected_events_pruned,
+            "pruned user_message events no longer derived from session transcripts"
+        );
+    }
+
+    let stale_events_cleaned = db
         .delete_non_user_message_events()
         .context("failed to clean up stale user_message events")?;
-    if cleaned > 0 {
-        println!("Cleaned {cleaned} stale user_message events from non-user sessions");
-    }
-
-    println!(
-        "Indexed {} sessions ({} events)",
-        all_sessions.len(),
-        event_count
-    );
-
-    let mut projects: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for session in &all_sessions {
-        *projects.entry(&session.project_name).or_default() += 1;
-    }
-
-    let mut project_list: Vec<_> = projects.into_iter().collect();
-    project_list.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
-
-    println!("\nSessions by project:");
-    for (project, count) in &project_list[..project_list.len().min(10)] {
-        println!("  {project}: {count} sessions");
-    }
-
-    if project_list.len() > 10 {
-        println!("  ... and {} more projects", project_list.len() - 10);
-    }
-
-    // Drain local events.jsonl (tmux pane focus events) into the DB. The local
-    // tmux hook appends to events.jsonl but no automated mechanism moves those
-    // events into the DB — `tt sync` pulls from remotes only. Without this
-    // call, local laptop focus events accumulate in JSONL but never appear in
-    // reports. Must run before `auto_assign_events_to_streams` so the freshly
-    // imported tmux focus events get routed to streams by cwd.
-    let drained = import_local_events(db, &default_data_dir())
+    let drained = import_local_events(db, &paths.data_dir)
         .context("failed to drain local events.jsonl into DB")?;
-    if drained > 0 {
-        println!("Drained {drained} local events from events.jsonl");
-    }
+    let attribution = attribute_unassigned_events(db)?;
 
-    // Auto-assign unassigned events to existing streams based on cwd matching.
-    let assigned =
-        auto_assign_events_to_streams(db).context("failed to auto-assign events to streams")?;
-    if assigned > 0 {
-        println!("Auto-assigned {assigned} events to streams (by cwd)");
+    let mut projects: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for session in &all_sessions {
+        *projects.entry(session.project_name.clone()).or_default() += 1;
     }
+    let mut projects: Vec<_> = projects.into_iter().collect();
+    projects.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
 
+    advance_scan_cursor(db, scan_started_at, complete)?;
+
+    Ok(IngestReport {
+        claude,
+        opencode,
+        indexed_events,
+        imported_events: inserted_events + drained,
+        drained_events: drained,
+        stale_events_cleaned,
+        injected_events_pruned,
+        session_membership_assigned: attribution.session_membership,
+        terminal_focus_assigned: attribution.terminal_focus,
+        artifact_focus_assigned: attribution.artifact_reference,
+        projects,
+        scanned_claude,
+        scanned_opencode,
+    })
+}
+
+/// Records the scan cursor, but only for a scan that actually read everything.
+///
+/// A scan that degraded returned fewer sessions than the window really held, and
+/// nothing distinguishes that from "nothing changed". Advancing here would ask the
+/// next pass for a *later* window, so every session in this one would be skipped
+/// permanently — no later pass would ever look at it again. Standing still instead
+/// costs one repeated scan of a bounded window and is self-healing.
+fn advance_scan_cursor(
+    db: &tt_db::Database,
+    scan_started_at: DateTime<Utc>,
+    complete: bool,
+) -> Result<()> {
+    if !complete {
+        tracing::warn!(
+            "session scan was incomplete; leaving the scan cursor in place so the next \
+             pass re-reads this window"
+        );
+        return Ok(());
+    }
+    db.set_session_scan_cursor(scan_started_at)
+        .context("failed to record session scan cursor")?;
     Ok(())
 }
 
-/// Extracts the relative project path by stripping the home directory prefix.
-///
-/// `/home/sami/time-tracker/default` → `time-tracker/default`
-/// `/home/ubuntu/agent-c/taiga`      → `agent-c/taiga`
-fn project_suffix(cwd: &str) -> Option<&str> {
-    let path = cwd.strip_prefix("/home/")?;
-    // Skip the username component
-    let after_user = path.find('/')? + 1;
-    let suffix = &path[after_user..];
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix)
-    }
+/// What one run of the attribution passes assigned, counted per pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AttributionCounts {
+    session_membership: u64,
+    terminal_focus: u64,
+    artifact_reference: u64,
 }
 
-/// Auto-assign unassigned events to existing streams based on `cwd` matching.
+/// Runs every attribution pass `tt ingest sessions` applies to unassigned events.
 ///
-/// Only assigns events when the CWD maps to exactly ONE existing stream
-/// (no ambiguity). If a CWD could match multiple streams, the event is left
-/// unassigned for the LLM to classify via `tt classify`.
+/// One seam so the set of passes is a single, testable list rather than statements
+/// buried in the middle of session indexing.
 ///
-/// First tries exact `cwd` match, then falls back to matching by project suffix
-/// (path after `/home/<user>/`). This handles multi-machine setups where the
-/// same project lives under different home directories.
+/// All three resolve a *specific* identity — the session an event belongs to, a remote
+/// host, a pull request — to work that is already classified, and leave whatever they
+/// cannot resolve unassigned. None reads a working directory. A fourth pass that did
+/// was removed; see root `AGENTS.md`, "A folder is not a project".
+fn attribute_unassigned_events(db: &tt_db::Database) -> Result<AttributionCounts> {
+    // First, because it repeats a verdict already made about the very session these
+    // events belong to, while the two below resolve a surface to work found nearby or
+    // referenced elsewhere. A certain identity should reach an event before a
+    // correlation does.
+    let session_membership = db
+        .claim_unassigned_events_for_classified_sessions()
+        .context("failed to attribute events to their own classified session's stream")?;
+    let terminal_focus =
+        assign_terminal_focus(db).context("failed to attribute terminal-focus events")?;
+    // After the terminal pass, which resolves the focus events this one cannot.
+    let artifact_reference =
+        assign_artifact_focus(db).context("failed to attribute artifact-focus events")?;
+    Ok(AttributionCounts {
+        session_membership,
+        terminal_focus,
+        artifact_reference,
+    })
+}
+
+/// Attribute unassigned terminal-window focus to the work its remote host was doing.
 ///
-/// Returns the number of newly assigned events.
-fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
-    use std::collections::HashMap;
+/// `window_focus` events carry no `cwd` and no session, so no other pass reaches
+/// them at all. A terminal focus is resolvable anyway: the remote host's own events
+/// already classified, and whichever stream dominated activity within
+/// `TERMINAL_CORRELATION_WINDOW_MS` of the focus is the work being looked at.
+///
+/// Candidate activity is loaded ONCE for the whole span and binary-searched per
+/// event. A correlated query per focus event would not finish on real data:
+/// ~200k focus events against ~52k candidate rows in a single week.
+///
+/// Events that do not resolve are left unassigned rather than placed in an
+/// invented container. Returns the number of events assigned.
+fn assign_terminal_focus(db: &tt_db::Database) -> Result<u64> {
+    use tt_core::attribution::{
+        TERMINAL_CORRELATION_WINDOW_MS, is_terminal_focus, resolve_terminal_focus,
+    };
 
-    // Build cwd → set of stream_ids and suffix → set of stream_ids from assigned events.
-    // We track ALL matching streams per CWD, not just the first.
-    let streams = db.get_streams().context("failed to get streams")?;
-    let mut cwd_to_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
-    let mut suffix_to_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let candidates: Vec<StoredEvent> = db
+        .unattributed_terminal_focus_events()
+        .context("failed to get unattributed window_focus events")?
+        .into_iter()
+        .filter(|event| {
+            is_terminal_focus(
+                event.window_app_id.as_deref(),
+                event.window_title.as_deref(),
+            )
+        })
+        .collect();
 
-    for stream in &streams {
-        let events = db
-            .get_events_by_stream(&stream.id)
-            .context("failed to get events for stream")?;
-        for event in &events {
-            if let Some(cwd) = &event.cwd {
-                cwd_to_streams
-                    .entry(cwd.clone())
-                    .or_default()
-                    .insert(stream.id.clone());
-                if let Some(suffix) = project_suffix(cwd) {
-                    suffix_to_streams
-                        .entry(suffix.to_string())
-                        .or_default()
-                        .insert(stream.id.clone());
-                }
-            }
-        }
-    }
-
-    if cwd_to_streams.is_empty() && suffix_to_streams.is_empty() {
+    let (Some(first), Some(last)) = (candidates.first(), candidates.last()) else {
         return Ok(0);
-    }
+    };
 
-    // Find unassigned events whose cwd maps to exactly ONE stream.
-    let unassigned = db
-        .get_events_without_stream()
-        .context("failed to get unassigned events")?;
+    let window = chrono::Duration::milliseconds(TERMINAL_CORRELATION_WINDOW_MS);
+    let activity = db
+        .remote_activity_for_correlation(first.timestamp - window, last.timestamp + window)
+        .context("failed to load remote activity for correlation")?;
 
-    let assignments: Vec<(String, String)> = unassigned
+    let assignments: Vec<(String, String)> = candidates
         .iter()
         .filter_map(|event| {
-            let cwd = event.cwd.as_ref()?;
-
-            // Try exact CWD match first
-            if let Some(stream_ids) = cwd_to_streams.get(cwd.as_str()) {
-                if stream_ids.len() == 1 {
-                    let stream_id = stream_ids.iter().next()?;
-                    return Some((event.id.clone(), stream_id.clone()));
-                }
-                tracing::debug!(
-                    cwd = %cwd,
-                    streams = stream_ids.len(),
-                    "skipping ambiguous CWD match"
-                );
-                return None;
-            }
-
-            // Fall back to suffix match
-            let suffix = project_suffix(cwd)?;
-            if let Some(stream_ids) = suffix_to_streams.get(suffix) {
-                if stream_ids.len() == 1 {
-                    let stream_id = stream_ids.iter().next()?;
-                    return Some((event.id.clone(), stream_id.clone()));
-                }
-                tracing::debug!(
-                    cwd = %cwd,
-                    suffix = %suffix,
-                    streams = stream_ids.len(),
-                    "skipping ambiguous suffix match"
-                );
-            }
-
-            None
+            let stream_id =
+                resolve_terminal_focus(event.timestamp, &activity, TERMINAL_CORRELATION_WINDOW_MS)?;
+            Some((event.id.clone(), stream_id))
         })
         .collect();
 
@@ -646,8 +920,65 @@ fn auto_assign_events_to_streams(db: &tt_db::Database) -> Result<u64> {
     }
 
     let count = db
-        .assign_events_to_stream(&assignments, "auto")
-        .context("failed to assign events to streams")?;
+        .assign_events_to_stream(&assignments, "terminal_focus")
+        .context("failed to assign terminal-focus events to streams")?;
+    Ok(count)
+}
+
+/// Attributes window focus that is displaying a pull request or issue.
+///
+/// The title names a *durable artifact*, and the work it belongs to is whichever
+/// stream actually did that artifact — recorded by a classified session that wrote
+/// the artifact's URL or its `#number`. Nothing temporal enters this pass: a
+/// browser is not a view of the machine's current activity the way a terminal is,
+/// and correlating it against concurrent work was measured at 53.7% agreement
+/// against artifact-bound ground truth, which is a coin flip.
+///
+/// Everything else the browser shows is left unassigned, where it reads as
+/// classification lag. Returns the number of events assigned.
+fn assign_artifact_focus(db: &tt_db::Database) -> Result<u64> {
+    use tt_core::attribution::{artifact_in_title, resolve_artifact_focus};
+
+    let candidates: Vec<(StoredEvent, tt_core::attribution::ArtifactRef)> = db
+        .unattributed_terminal_focus_events()
+        .context("failed to get unattributed window_focus events")?
+        .into_iter()
+        .filter_map(|event| {
+            let artifact = artifact_in_title(event.window_title.as_deref())?;
+            Some((event, artifact))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let mentions = db
+        .artifact_mentions_for_binding()
+        .context("failed to load artifact references from classified work")?;
+
+    let assignments: Vec<(String, String)> = candidates
+        .iter()
+        .filter_map(|(event, artifact)| {
+            let stream_id = resolve_artifact_focus(artifact, &mentions)?;
+            Some((event.id.clone(), stream_id))
+        })
+        .collect();
+
+    tracing::debug!(
+        candidates = candidates.len(),
+        mentions = mentions.len(),
+        resolved = assignments.len(),
+        "artifact-focus attribution"
+    );
+
+    if assignments.is_empty() {
+        return Ok(0);
+    }
+
+    let count = db
+        .assign_events_to_stream(&assignments, "artifact_reference")
+        .context("failed to assign artifact-focus events to streams")?;
     Ok(count)
 }
 
@@ -810,8 +1141,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "", "main", None, "/home/test");
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pane_id"));
     }
@@ -821,8 +1159,15 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join(".time-tracker");
 
-        let result =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "", None, "/home/test");
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_name"));
     }
@@ -839,6 +1184,88 @@ mod tests {
             "dev".to_string(),
             Some(1),
             "/home/user/project".to_string(),
+            None,
+            timestamp,
+        );
+
+        let json = serde_json::to_string_pretty(&event).unwrap();
+        insta::assert_snapshot!(json);
+    }
+
+    /// A resolved pane session is stamped onto the event and survives the round
+    /// trip through the events file, which is what puts it on `events.session_id`
+    /// and lets the session→stream path claim the event later.
+    #[test]
+    fn a_resolved_pane_session_is_stamped_on_the_event() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%8",
+            "main",
+            Some(0),
+            "/home/test",
+            Some("ses_0210f2ed2ffedhF4".to_string()),
+        )
+        .unwrap();
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].session_id,
+            Some("ses_0210f2ed2ffedhF4".to_string())
+        );
+    }
+
+    /// Every way the lookup can fail arrives here as `None`, and a `None` must
+    /// leave the event exactly as it was before this mechanism existed — a focus
+    /// event is never lost or altered because a pane could not be resolved.
+    #[test]
+    fn an_unresolved_pane_records_the_event_unchanged() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join(".time-tracker");
+
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%8",
+            "main",
+            Some(0),
+            "/home/test",
+            None,
+        )
+        .unwrap();
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, None);
+        assert_eq!(events[0].pane_id, "%8");
+        assert_eq!(events[0].tmux_session, "main");
+        assert_eq!(events[0].event_type, "tmux_pane_focus");
+
+        // The wire form carries no session_id key at all, so an unresolved event is
+        // byte-identical to one written before this field existed.
+        let raw = fs::read_to_string(events_path(&data_dir)).unwrap();
+        assert!(!raw.contains("session_id"), "unexpected key in {raw}");
+    }
+
+    /// A stamped event adds the session id and changes nothing else about the
+    /// wire form.
+    #[test]
+    fn a_stamped_event_serialization_matches_spec() {
+        let timestamp = DateTime::parse_from_rfc3339("2025-01-29T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let event = IngestEvent::pane_focus(
+            TEST_MACHINE_ID,
+            "%3".to_string(),
+            "dev".to_string(),
+            Some(2),
+            "/home/user/project".to_string(),
+            Some("ses_0210f2ed2ffedhF4".to_string()),
             timestamp,
         );
 
@@ -858,6 +1285,7 @@ mod tests {
             "dev".to_string(),
             None,
             "/home/user".to_string(),
+            None,
             timestamp,
         );
 
@@ -867,6 +1295,7 @@ mod tests {
             "dev".to_string(),
             None,
             "/home/user".to_string(),
+            None,
             timestamp,
         );
 
@@ -885,6 +1314,7 @@ mod tests {
             "dev".to_string(),
             None,
             "/home/user".to_string(),
+            None,
             timestamp,
         );
 
@@ -894,6 +1324,7 @@ mod tests {
             "dev".to_string(),
             None,
             "/home/user".to_string(),
+            None,
             timestamp,
         );
 
@@ -912,6 +1343,7 @@ mod tests {
             "main",
             Some(0),
             "/home/test",
+            None,
         );
 
         assert!(result.is_ok());
@@ -954,13 +1386,27 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event should be written
-        let result1 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result1.unwrap());
 
         // Immediate second event for same pane should be debounced
-        let result2 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(!result2.unwrap()); // Debounced
 
         let events = read_events_from(&data_dir).unwrap();
@@ -973,13 +1419,27 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First pane
-        let result1 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result1.unwrap());
 
         // Different pane should not be debounced
-        let result2 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%2",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -992,16 +1452,30 @@ mod tests {
         let data_dir = temp_dir.path().join(".time-tracker");
 
         // First event
-        let result1 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+        let result1 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result1.unwrap());
 
         // Wait for debounce window to expire
         thread::sleep(Duration::from_millis(550));
 
         // Second event should be written
-        let result2 =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+        let result2 = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        );
         assert!(result2.unwrap());
 
         let events = read_events_from(&data_dir).unwrap();
@@ -1020,6 +1494,7 @@ mod tests {
             "session1",
             Some(0),
             "/path/a",
+            None,
         )
         .unwrap();
 
@@ -1030,6 +1505,7 @@ mod tests {
             "session2",
             None,
             "/path/b",
+            None,
         )
         .unwrap();
 
@@ -1064,8 +1540,16 @@ mod tests {
         fs::write(&events_file, &large_content).unwrap();
 
         // Ingest should rotate the file
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
-            .unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        )
+        .unwrap();
 
         // Old file should be rotated
         let rotated = rotated_events_path(&data_dir);
@@ -1092,8 +1576,16 @@ mod tests {
         fs::write(&events_file, "small content").unwrap();
 
         // Ingest should not rotate
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test")
-            .unwrap();
+        ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            "/home/test",
+            None,
+        )
+        .unwrap();
 
         // No rotated file should exist
         let rotated = rotated_events_path(&data_dir);
@@ -1208,6 +1700,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test exercises the core algorithm directly"
+    )]
     fn test_create_session_events_delegated_time_allocated() {
         use chrono::TimeZone;
         use tt_core::session::{AgentSession, SessionSource};
@@ -1315,6 +1811,7 @@ mod tests {
             "main",
             Some(0),
             "/home/test",
+            None,
         )
         .unwrap();
 
@@ -1363,6 +1860,7 @@ fn test_concurrent_ingests_during_rotation() {
                 "main",
                 None,
                 "/home/test",
+                None,
             )
         });
         handles.push(handle);
@@ -1401,8 +1899,15 @@ fn test_debounce_file_corruption_recovery() {
     fs::write(&debounce_file, "corrupted:data:too:many:colons\ninvalid").unwrap();
 
     // Should handle gracefully and not panic
-    let result =
-        ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test");
+    let result = ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        "/home/test",
+        None,
+    );
     assert!(
         result.is_ok(),
         "Should recover from corrupted debounce file"
@@ -1430,6 +1935,7 @@ fn test_git_identity_extraction_from_jj_directory() {
         "main",
         None,
         cwd_with_jj.to_str().unwrap(),
+        None,
     );
 
     // Should succeed
@@ -1458,6 +1964,7 @@ fn test_no_jj_directory_returns_no_identity() {
         "main",
         None,
         cwd_no_jj.to_str().unwrap(),
+        None,
     );
 
     assert!(result.is_ok(), "Ingest should succeed");
@@ -1520,11 +2027,29 @@ fn test_lock_file_cleanup() {
     let data_dir = temp_dir.path().join(".time-tracker");
 
     // First ingest
-    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        "/home/test",
+        None,
+    )
+    .unwrap();
 
     // Lock should be released, second ingest should succeed immediately
     let start = std::time::Instant::now();
-    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%2", "main", None, "/home/test").unwrap();
+    ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%2",
+        "main",
+        None,
+        "/home/test",
+        None,
+    )
+    .unwrap();
     let duration = start.elapsed();
 
     // Should complete quickly (not waiting on lock)
@@ -1547,8 +2072,15 @@ fn test_debounce_with_special_pane_ids() {
     ];
 
     for pane_id in special_panes {
-        let result =
-            ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, pane_id, "main", None, "/test");
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            pane_id,
+            "main",
+            None,
+            "/test",
+            None,
+        );
         assert!(result.is_ok(), "Should handle special pane ID: {pane_id}");
     }
 
@@ -1572,7 +2104,16 @@ fn test_rotation_preserves_old_content() {
     fs::write(&events_file, &large_content).unwrap();
 
     // Ingest should rotate
-    ingest_pane_focus_impl(&data_dir, TEST_MACHINE_ID, "%1", "main", None, "/test").unwrap();
+    ingest_pane_focus_impl(
+        &data_dir,
+        TEST_MACHINE_ID,
+        "%1",
+        "main",
+        None,
+        "/test",
+        None,
+    )
+    .unwrap();
 
     // Verify old content is in rotated file
     let rotated = rotated_events_path(&data_dir);
@@ -1758,4 +2299,343 @@ fn test_import_local_events_is_idempotent() {
 
     assert_eq!(first, 1);
     assert_eq!(second, 0, "re-import should not duplicate events");
+}
+
+#[test]
+fn ingest_report_counts_new_session_and_local_events() {
+    // Given
+    let report = IngestReport {
+        claude: 2,
+        opencode: 3,
+        indexed_events: 7,
+        imported_events: 5,
+        drained_events: 0,
+        stale_events_cleaned: 0,
+        injected_events_pruned: 0,
+        session_membership_assigned: 0,
+        terminal_focus_assigned: 0,
+        artifact_focus_assigned: 0,
+        projects: Vec::new(),
+        scanned_claude: true,
+        scanned_opencode: true,
+    };
+
+    // When
+    let imported = report.imported_events();
+
+    // Then
+    assert_eq!(report.claude, 2);
+    assert_eq!(report.opencode, 3);
+    assert_eq!(imported, 5);
+}
+
+#[cfg(test)]
+fn test_stream(id: &str) -> tt_db::Stream {
+    let now = Utc::now();
+    tt_db::Stream {
+        id: id.to_string(),
+        name: Some(id.to_string()),
+        slug: None,
+        description: None,
+        color: None,
+        created_at: now,
+        updated_at: now,
+        time_direct_ms: 0,
+        time_delegated_ms: 0,
+        first_event_at: None,
+        last_event_at: None,
+        needs_recompute: false,
+    }
+}
+
+#[cfg(test)]
+fn test_window_focus(id: &str, timestamp: DateTime<Utc>, app_id: &str, title: &str) -> StoredEvent {
+    StoredEvent {
+        id: id.to_string(),
+        timestamp,
+        event_type: tt_core::EventType::WindowFocus,
+        source: "local.cosmic".to_string(),
+        machine_id: None,
+        schema_version: 1,
+        pane_id: None,
+        tmux_session: None,
+        window_index: None,
+        git_project: None,
+        git_workspace: None,
+        status: None,
+        idle_duration_ms: None,
+        window_app_id: Some(app_id.to_string()),
+        window_title: Some(title.to_string()),
+        action: None,
+        cwd: None,
+        session_id: None,
+        stream_id: None,
+        assignment_source: None,
+        data: serde_json::Value::Null,
+    }
+}
+
+#[test]
+fn assign_terminal_focus_attributes_a_terminal_window_to_concurrent_remote_work() {
+    use chrono::TimeZone;
+
+    // Given: remote work in a known stream, an unassigned terminal focus during
+    // it, a terminal focus the user already assigned elsewhere, and a browser
+    // focus that this pass has no business resolving.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&test_stream("eval")).unwrap();
+    db.insert_stream(&test_stream("mine")).unwrap();
+
+    let base = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+    let mut remote = StoredEvent {
+        stream_id: Some("eval".to_string()),
+        cwd: Some("/home/ubuntu/xmodel-eval".to_string()),
+        event_type: tt_core::EventType::AgentToolUse,
+        ..test_window_focus("tool-1", base, "", "")
+    };
+    remote.window_app_id = None;
+    remote.window_title = None;
+    db.insert_event(&remote).unwrap();
+
+    db.insert_event(&test_window_focus(
+        "focus-terminal",
+        base + chrono::Duration::seconds(20),
+        "com.mitchellh.ghostty",
+        "mosh devbox",
+    ))
+    .unwrap();
+
+    let mut already_mine = test_window_focus(
+        "focus-mine",
+        base + chrono::Duration::seconds(25),
+        "com.mitchellh.ghostty",
+        "mosh devbox",
+    );
+    already_mine.stream_id = Some("mine".to_string());
+    already_mine.assignment_source = Some("user".to_string());
+    db.insert_event(&already_mine).unwrap();
+
+    db.insert_event(&test_window_focus(
+        "focus-browser",
+        base + chrono::Duration::seconds(30),
+        "brave-browser",
+        "Work · Pull requests - Brave",
+    ))
+    .unwrap();
+
+    // When: the terminal-focus pass runs.
+    let assigned = assign_terminal_focus(&db).unwrap();
+
+    // Then: only the unassigned terminal focus moves, tagged terminal_focus.
+    assert_eq!(assigned, 1);
+    let resolved = db.get_events_by_stream("eval").unwrap();
+    let focus = resolved
+        .iter()
+        .find(|event| event.id == "focus-terminal")
+        .expect("terminal focus should land on the concurrent stream");
+    assert_eq!(focus.assignment_source.as_deref(), Some("terminal_focus"));
+
+    // and the user's own assignment is left exactly as it was.
+    let untouched = db.get_events_by_stream("mine").unwrap();
+    let ids: Vec<&str> = untouched.iter().map(|event| event.id.as_str()).collect();
+    assert_eq!(ids, vec!["focus-mine"]);
+    assert_eq!(untouched[0].assignment_source.as_deref(), Some("user"));
+
+    // and the browser focus stays unassigned rather than being invented into a stream.
+    let unassigned = db.unassigned_event_ids().unwrap();
+    assert_eq!(unassigned, vec!["focus-browser".to_string()]);
+}
+
+#[cfg(test)]
+fn test_cwd_event(id: &str, timestamp: DateTime<Utc>, cwd: &str) -> StoredEvent {
+    StoredEvent {
+        cwd: Some(cwd.to_string()),
+        event_type: tt_core::EventType::TmuxPaneFocus,
+        window_app_id: None,
+        window_title: None,
+        ..test_window_focus(id, timestamp, "", "")
+    }
+}
+
+#[test]
+fn attribution_leaves_an_unambiguous_working_directory_unassigned() {
+    use chrono::TimeZone;
+
+    // Given: a stream whose only classified event sits in one working directory,
+    // so that directory maps to exactly one stream — precisely the input the
+    // removed cwd pass treated as unambiguous evidence.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&test_stream("tracker")).unwrap();
+
+    let base = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+    let classified = StoredEvent {
+        stream_id: Some("tracker".to_string()),
+        assignment_source: Some("inferred".to_string()),
+        event_type: tt_core::EventType::AgentToolUse,
+        ..test_cwd_event("classified", base, "/home/sami/Code/time-tracker/default")
+    };
+    db.insert_event(&classified).unwrap();
+
+    // and an unassigned event in that same directory,
+    db.insert_event(&test_cwd_event(
+        "same-cwd",
+        base + chrono::Duration::seconds(10),
+        "/home/sami/Code/time-tracker/default",
+    ))
+    .unwrap();
+
+    // and one in the same directory under a different home, which the removed
+    // pass also claimed by stripping `/home/<user>/` and matching the suffix.
+    db.insert_event(&test_cwd_event(
+        "same-suffix",
+        base + chrono::Duration::seconds(20),
+        "/home/ubuntu/Code/time-tracker/default",
+    ))
+    .unwrap();
+
+    // When: every attribution pass ingest runs has run.
+    let counts = attribute_unassigned_events(&db).unwrap();
+
+    // Then: a working directory is not evidence of a stream, so both stay
+    // unassigned, where they read as classification lag.
+    let mut unassigned = db.unassigned_event_ids().unwrap();
+    unassigned.sort();
+    assert_eq!(
+        unassigned,
+        vec!["same-cwd".to_string(), "same-suffix".to_string()],
+        "ingest must not infer a stream from a working directory"
+    );
+    assert_eq!(counts, AttributionCounts::default());
+
+    // and the classified event keeps the verdict it already had.
+    let tracker = db.get_events_by_stream("tracker").unwrap();
+    let ids: Vec<&str> = tracker.iter().map(|event| event.id.as_str()).collect();
+    assert_eq!(ids, vec!["classified"]);
+}
+
+#[test]
+fn assign_artifact_focus_binds_a_pull_request_title_to_the_work_that_did_it() {
+    use chrono::TimeZone;
+
+    // Given: a classified session that referenced one pull request by URL,
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&test_stream("tracker")).unwrap();
+    let base = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+
+    let session = tt_core::session::AgentSession {
+        session_id: "s-pr".to_string(),
+        source: tt_core::session::SessionSource::Claude,
+        parent_session_id: None,
+        session_type: tt_core::session::SessionType::User,
+        project_path: "/home/sami/Code/time-tracker".to_string(),
+        project_name: "time-tracker".to_string(),
+        start_time: base,
+        end_time: Some(base + chrono::Duration::minutes(5)),
+        message_count: 1,
+        summary: Some("shipped https://github.com/sjawhar/time-tracker/pull/46".to_string()),
+        user_prompts: Vec::new(),
+        starting_prompt: None,
+        assistant_message_count: 0,
+        tool_call_count: 1,
+        user_message_timestamps: Vec::new(),
+        tool_call_timestamps: Vec::new(),
+    };
+    db.upsert_agent_session(&session, None).unwrap();
+
+    // whose own events put it squarely in one stream,
+    let mut worked = test_cwd_event("worked", base, "/home/sami/Code/time-tracker");
+    worked.event_type = tt_core::EventType::AgentToolUse;
+    worked.session_id = Some("s-pr".to_string());
+    worked.stream_id = Some("tracker".to_string());
+    worked.assignment_source = Some("inferred".to_string());
+    db.insert_event(&worked).unwrap();
+
+    // a browser window displaying that same pull request,
+    db.insert_event(&test_window_focus(
+        "focus-pr",
+        base + chrono::Duration::hours(3),
+        "brave-browser",
+        "Add a cwd guard by sjawhar · Pull Request #46 · sjawhar/time-tracker",
+    ))
+    .unwrap();
+
+    // and a browser window that reaches no further than the repository.
+    db.insert_event(&test_window_focus(
+        "focus-listing",
+        base + chrono::Duration::hours(3) + chrono::Duration::seconds(30),
+        "brave-browser",
+        "Pull requests · sjawhar/time-tracker",
+    ))
+    .unwrap();
+
+    // When
+    let assigned = assign_artifact_focus(&db).unwrap();
+
+    // Then: the artifact binds to the work that did it,
+    assert_eq!(assigned, 1);
+    let tracker = db.get_events_by_stream("tracker").unwrap();
+    let focus = tracker
+        .iter()
+        .find(|event| event.id == "focus-pr")
+        .expect("the pull request title should bind to the stream that did it");
+    assert_eq!(
+        focus.assignment_source.as_deref(),
+        Some("artifact_reference")
+    );
+
+    // and the repository-wide listing identifies no work, so it stays unassigned.
+    assert_eq!(
+        db.unassigned_event_ids().unwrap(),
+        vec!["focus-listing".to_string()]
+    );
+}
+
+/// The pane-focus stamp was inert until something claimed it: `attribute_unassigned_events`
+/// held only the two focus passes, and neither reads `session_id`. This pins the wiring,
+/// because a working `claim_unassigned_events_for_classified_sessions` that no pass calls
+/// is exactly the defect that shipped.
+#[test]
+fn attribution_claims_a_pane_stamped_after_its_session_was_classified() {
+    use chrono::TimeZone;
+
+    // Given: a session the classifier already placed on one stream,
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&test_stream("tracker")).unwrap();
+
+    let base = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+    let mut classified = StoredEvent {
+        event_type: tt_core::EventType::AgentToolUse,
+        stream_id: Some("tracker".to_string()),
+        assignment_source: Some("inferred".to_string()),
+        ..test_cwd_event("tool-1", base, "/home/sami/Code/time-tracker/default")
+    };
+    classified.session_id = Some("ses-a".to_string());
+    db.insert_event(&classified).unwrap();
+    db.record_classification("ses-a", 1).unwrap();
+
+    // and a pane focus stamped with that session id afterwards, which the classifier's
+    // own claim ran too early to see.
+    let mut stamped = test_cwd_event(
+        "pane-late",
+        base + chrono::Duration::seconds(30),
+        "/home/sami/Code/time-tracker/default",
+    );
+    stamped.session_id = Some("ses-a".to_string());
+    db.insert_event(&stamped).unwrap();
+
+    // When: every attribution pass ingest runs has run.
+    let counts = attribute_unassigned_events(&db).unwrap();
+
+    // Then: the pass ran and the pane carries its own session's verdict.
+    assert_eq!(counts.session_membership, 1);
+    let tracker = db.get_events_by_stream("tracker").unwrap();
+    let pane = tracker
+        .iter()
+        .find(|event| event.id == "pane-late")
+        .expect("a stamped pane must take the stream of the session running in it");
+    assert_eq!(
+        pane.assignment_source.as_deref(),
+        Some("session_membership")
+    );
+    assert!(db.unassigned_event_ids().unwrap().is_empty());
 }

@@ -10,6 +10,7 @@ fn store_dir_returns_configured_todo_store_path() {
     let config = Config {
         database_path: PathBuf::from("/tmp/tt.db"),
         todo_store_path: PathBuf::from("/tmp/todos"),
+        ..Config::default()
     };
 
     assert_eq!(store_dir(&config), Path::new("/tmp/todos"));

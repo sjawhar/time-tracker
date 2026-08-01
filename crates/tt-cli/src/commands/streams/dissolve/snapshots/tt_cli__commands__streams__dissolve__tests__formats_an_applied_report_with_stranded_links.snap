@@ -1,0 +1,18 @@
+---
+source: crates/tt-cli/src/commands/streams/dissolve/tests.rs
+expression: "format_dissolved(&sample_report(), &sample_stranded(),\nDissolveMode::Apply).unwrap()"
+---
+DISSOLVE
+
+Name                            ID        Released  Retained  Outcome
+──────────────────────────────  ────────  ────────  ────────  ────────────────
+misc: stragglers                0f3a91c2      4812         0  retired
+other: dev-env (dotfiles/se...  a1b2c3d4       120         7  kept
+
+Total: 4932 events released, 7 retained, 1 of 2 streams retired.
+
+Priority links now dangling:
+  streams.md line 25: 'misc: stragglers' → priority 'ops'
+Drift skips a dangling link and names it, so the verdict still computes.
+Nothing was removed from streams.md — that mapping is yours to edit.
+Released events await re-attribution. Run 'tt recompute' to refresh stream totals.

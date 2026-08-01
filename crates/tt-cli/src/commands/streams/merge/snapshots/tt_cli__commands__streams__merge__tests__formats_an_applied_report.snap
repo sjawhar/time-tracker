@@ -1,0 +1,18 @@
+---
+source: crates/tt-cli/src/commands/streams/merge/tests.rs
+expression: "format_merged(\"workorder-5: IPI envs + wo-005 (9c7e5511)\", &sample_report(),\nMergeMode::Apply).unwrap()"
+---
+MERGE
+
+Into: workorder-5: IPI envs + wo-005 (9c7e5511)
+
+Source                                      ID         Events  Human   Tags  Outcome
+──────────────────────────────────────────  ────────  ───────  ─────  ─────  ────────────────
+workorder-5: IPI envs + wo-005 (Jun14-20)   0f3a91c2     4347     12      1  retired
+workorder-5: IPI envs + wo-005 (Jun21-27)   a1b2c3d4        0      0      0  kept
+
+Total: 4347 events moved (12 assigned by hand), 1 tag, 1 of 2 streams retired.
+
+3 pending proposals re-pointed at the target, so accepting one lands its events there.
+Proposals a human already decided are historical records and are left alone.
+The target's totals are now stale. Run 'tt recompute' to refresh them.

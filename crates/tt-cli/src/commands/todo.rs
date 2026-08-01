@@ -1,9 +1,13 @@
-use anyhow::Result;
-use chrono::Local;
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use chrono::{Local, NaiveDate};
+use tt_core::todos::{Priority, StreamPriorityLink, Todo, TodoFileItem};
 use tt_db::Database;
 
 use crate::Config;
 use crate::commands::report::Period;
+use crate::drift::TopTodo;
 use crate::todo_store::load_read_only;
 
 mod check;
@@ -15,6 +19,7 @@ mod mutate;
 mod order_edit;
 mod raw;
 mod render;
+mod stream_links;
 mod view;
 
 pub use link::{run_link, run_unlink};
@@ -51,6 +56,96 @@ pub struct RankOptions {
     pub below: Option<String>,
 }
 
+pub struct TopTodoView {
+    pub top: Option<TopTodo>,
+    pub priorities: Vec<Priority>,
+    pub stream_links: Vec<StreamPriorityLink>,
+    pub ranked_todos: Vec<RankedTodo>,
+    pub linked_todo_texts_by_session: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RankedTodo {
+    pub todo: Todo,
+    pub section: TodoNextSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoNextSection {
+    Due,
+    Main,
+    Blocked,
+}
+
+impl TodoNextSection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Due => "due",
+            Self::Main => "main",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+pub fn top_todo_view(config: &Config, today: NaiveDate) -> Result<TopTodoView> {
+    let loaded = load_read_only(config).context("failed to load todo store")?;
+    let view = view::TodoView::from_loaded(
+        &loaded,
+        today,
+        NextOptions {
+            top: None,
+            quick: false,
+            json: false,
+            by_priority: false,
+            later: false,
+        },
+    );
+    let top = view.main.first().map(|todo| TopTodo {
+        id: todo.id.clone(),
+        text: todo.text.clone(),
+        stream_slug: todo.stream.clone(),
+    });
+    let ranked_todos = view
+        .due
+        .iter()
+        .cloned()
+        .map(|todo| RankedTodo {
+            todo,
+            section: TodoNextSection::Due,
+        })
+        .chain(view.main.iter().cloned().map(|todo| RankedTodo {
+            todo,
+            section: TodoNextSection::Main,
+        }))
+        .chain(view.blocked.iter().cloned().map(|todo| RankedTodo {
+            todo,
+            section: TodoNextSection::Blocked,
+        }))
+        .collect();
+    let mut linked_todo_texts_by_session = HashMap::new();
+    for line in &view.loaded.store.todos.items {
+        let TodoFileItem::Todo(todo) = &line.item else {
+            continue;
+        };
+        if todo.done {
+            continue;
+        }
+        for session_id in &todo.sessions {
+            linked_todo_texts_by_session
+                .entry(session_id.clone())
+                .or_insert_with(|| todo.text.clone());
+        }
+    }
+    Ok(TopTodoView {
+        top,
+        priorities: view.priorities,
+        stream_links: view.stream_links,
+        ranked_todos,
+        linked_todo_texts_by_session,
+    })
+}
+
 pub fn run_next(config: &Config, options: NextOptions) -> Result<()> {
     let loaded = load_read_only(config)?;
     let today = Local::now().date_naive();
@@ -72,6 +167,15 @@ pub fn run_ls(config: &Config) -> Result<()> {
 
 pub fn run_add(config: &Config, db: Option<&Database>, options: AddOptions) -> Result<()> {
     mutate::run_add(config, db, options)
+}
+
+pub fn run_set_stream(
+    config: &Config,
+    db: Option<&Database>,
+    id: &str,
+    stream: Option<&str>,
+) -> Result<()> {
+    mutate::run_set_stream(config, db, id, stream)
 }
 
 pub fn run_done(config: &Config, id: &str) -> Result<()> {

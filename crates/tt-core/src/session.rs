@@ -129,6 +129,22 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    /// The session's storage was never written to.
+    ///
+    /// An agent session that is aborted before its first message leaves an
+    /// empty file (Claude) or a shard holding no `message` table
+    /// (`OpenCode`). Nothing was lost and nothing can be parsed, so this is an
+    /// expected condition rather than a failure: `scan_claude_sessions` and
+    /// `scan_opencode_sessions` log it at `debug` while every other variant
+    /// still warns.
+    #[error("session is empty (never written to)")]
+    EmptySession,
+    /// The file holds records, none of which is a message — a session that only
+    /// ever fired a `SessionStart` hook is the common case. Every line parsed;
+    /// there is simply nothing to index. Expected, so it is logged at `debug`
+    /// alongside [`SessionError::EmptySession`].
+    #[error("session holds no message records")]
+    NoMessageRecords,
     #[error("no messages found in session")]
     NoMessages,
     #[error("no project path found in session")]
@@ -271,9 +287,17 @@ pub fn parse_session_file(
     let mut starting_prompt: Option<String> = None;
     let mut user_message_timestamps: Vec<DateTime<Utc>> = Vec::new();
     let mut tool_call_timestamps: Vec<DateTime<Utc>> = Vec::new();
+    // Three states, not two. An aborted session leaves an empty file; a session
+    // that only ever fired hooks leaves `progress` records that are correctly
+    // skipped as irrelevant; a session whose lines fail to parse is a genuine
+    // defect. Only the last warrants a warning — the first two are expected and
+    // recur on every ~30s ingest, so warning about them fills the daemon log.
+    let mut saw_content = false;
+    let mut saw_parse_failure = false;
 
     for line in reader.lines() {
         let line = line?;
+        saw_content |= !line.is_empty();
 
         if line.len() < 10 || !might_be_relevant(&line) {
             continue;
@@ -282,6 +306,7 @@ pub fn parse_session_file(
         let header: MessageHeader = match serde_json::from_str(&line) {
             Ok(h) => h,
             Err(e) => {
+                saw_parse_failure = true;
                 tracing::trace!(error = %e, "skipping malformed JSON line");
                 continue;
             }
@@ -298,14 +323,23 @@ pub fn parse_session_file(
                 summary = header.summary;
             }
             Some("user") => {
-                message_count = message_count.saturating_add(1);
                 let parsed_ts =
                     update_timestamps(&header, &mut first_timestamp, &mut last_timestamp);
-                // Extract user prompt content (up to MAX_USER_PROMPTS)
-                // Only extract from string content (actual user prompts), not array content (tool results)
-                if let Some(MessageContentValue::Text(text)) =
-                    header.message.as_ref().and_then(|m| m.content.as_ref())
-                {
+                // Only string content is an actual user prompt; array content
+                // carries tool results.
+                let text = match header.message.as_ref().and_then(|m| m.content.as_ref()) {
+                    Some(MessageContentValue::Text(text)) => Some(text.as_str()),
+                    Some(MessageContentValue::Blocks(_)) | None => None,
+                };
+                if text.is_some_and(crate::injection::is_injected) {
+                    // Injected text is the harness talking to the agent, not a
+                    // person: it must not count as a message, a prompt, or a
+                    // moment of attention. The timestamps above still advanced —
+                    // the session was alive, just unattended.
+                    continue;
+                }
+                message_count = message_count.saturating_add(1);
+                if let Some(text) = text {
                     if !text.is_empty() {
                         if starting_prompt.is_none() {
                             starting_prompt = Some(truncate_prompt(text));
@@ -313,7 +347,7 @@ pub fn parse_session_file(
                         if user_prompts.len() < MAX_USER_PROMPTS {
                             user_prompts.push(truncate_prompt(text));
                         }
-                        // Capture timestamp for user message events (bounded to prevent unbounded growth)
+                        // Bounded to prevent unbounded growth on long sessions.
                         if let Some(ts) = parsed_ts {
                             if user_message_timestamps.len() < MAX_USER_MESSAGE_TIMESTAMPS {
                                 user_message_timestamps.push(ts);
@@ -348,7 +382,11 @@ pub fn parse_session_file(
         }
     }
 
-    let start_time = first_timestamp.ok_or(SessionError::NoMessages)?;
+    let start_time = first_timestamp.ok_or(match (saw_content, saw_parse_failure) {
+        (_, true) => SessionError::NoMessages,
+        (true, false) => SessionError::NoMessageRecords,
+        (false, false) => SessionError::EmptySession,
+    })?;
     let project_path = project_path.ok_or(SessionError::NoProjectPath)?;
 
     Ok(AgentSession {
@@ -402,12 +440,106 @@ struct SessionFile {
     parent_session_id: Option<String>,
 }
 
+/// One transcript file's contribution to a scan.
+///
+/// `clean` is false only for a *defective* file. A file that simply held nothing to
+/// index is clean: that is an expected state, and treating it as a defect would hold
+/// the scan cursor still forever.
+struct ParsedFile {
+    session: Option<AgentSession>,
+    clean: bool,
+}
+
+impl ParsedFile {
+    const NOTHING_TO_INDEX: Self = Self {
+        session: None,
+        clean: true,
+    };
+    const DEFECTIVE: Self = Self {
+        session: None,
+        clean: false,
+    };
+
+    const fn yielded(session: AgentSession) -> Self {
+        Self {
+            session: Some(session),
+            clean: true,
+        }
+    }
+}
+
+/// Whether a transcript file may be skipped because it has not changed since `since`.
+///
+/// Reads mtime off the directory entry the walk already holds, so a skipped file is
+/// never opened. A metadata read that fails answers `false`: when the filter cannot
+/// be evaluated, parse the file.
+fn unchanged_since(entry: &std::fs::DirEntry, since: Option<DateTime<Utc>>) -> bool {
+    let Some(since) = since else {
+        return false;
+    };
+    entry
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|modified| DateTime::<Utc>::from(modified) <= since)
+}
+
+/// What one scan of a transcript store found, and whether it read the whole store.
+///
+/// `complete` exists so an incremental caller can tell "nothing changed" apart from
+/// "I could not read it". Both look like an empty session list, but only the first
+/// permits advancing a scan cursor: advancing on the second skips that window of
+/// sessions permanently, because the next pass would ask for a later `since`.
+///
+/// A scan is incomplete when the store was present but some part of it could not be
+/// read — an unopenable database, a failed query, or a session file the parser
+/// rejected as defective. An **absent** store is complete (most machines run only one
+/// harness), and so is a session skipped as empty, which is an expected state rather
+/// than a defect.
+#[derive(Debug)]
+pub struct ScanOutcome {
+    pub sessions: Vec<AgentSession>,
+    pub complete: bool,
+}
+
+impl ScanOutcome {
+    /// A scan that read everything it was asked to read.
+    #[must_use]
+    pub const fn complete(sessions: Vec<AgentSession>) -> Self {
+        Self {
+            sessions,
+            complete: true,
+        }
+    }
+}
+
 /// Scan Claude Code projects directory and build session index.
+///
+/// Reads every session file. Callers on the ~30s ingest path want
+/// [`scan_claude_sessions_incremental`] instead.
 pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<AgentSession>, SessionError> {
+    Ok(scan_claude_sessions_incremental(projects_dir, None)?.sessions)
+}
+
+/// Scan Claude Code sessions, optionally skipping files unmodified since `since`.
+///
+/// The filter is the file's **mtime**, taken from the directory entry, so a skipped
+/// file is never opened or parsed. That is sound for the same reason the byte-offset
+/// manifest in `tt export` is: a transcript is written by appending, and every write
+/// on this platform advances mtime. It is deliberately paired with a safety overlap
+/// and a force-full flag at the call site rather than trusted on its own — see
+/// `tt_cli::commands::ingest`.
+///
+/// A file whose mtime cannot be read is parsed rather than skipped: the cheap answer
+/// when the filter cannot be evaluated is to do the work.
+pub fn scan_claude_sessions_incremental(
+    projects_dir: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<ScanOutcome, SessionError> {
     if !projects_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(ScanOutcome::complete(Vec::new()));
     }
 
+    let mut complete = true;
     let mut session_files: Vec<SessionFile> = Vec::new();
 
     for project_entry in std::fs::read_dir(projects_dir)? {
@@ -432,6 +564,10 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<AgentSession>, Se
                 // Skip files with empty session IDs to prevent invalid event ID generation
                 if session_id.is_empty() {
                     tracing::warn!(path = ?session_path, "skipping session file with empty session ID");
+                    continue;
+                }
+
+                if unchanged_since(&session_entry, since) {
                     continue;
                 }
 
@@ -467,6 +603,10 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<AgentSession>, Se
                                     continue;
                                 }
 
+                                if unchanged_since(&subagent_entry, since) {
+                                    continue;
+                                }
+
                                 session_files.push(SessionFile {
                                     path: subagent_path,
                                     session_id,
@@ -480,21 +620,31 @@ pub fn scan_claude_sessions(projects_dir: &Path) -> Result<Vec<AgentSession>, Se
         }
     }
 
-    let mut entries: Vec<AgentSession> = session_files
+    let parsed: Vec<ParsedFile> = session_files
         .par_iter()
-        .filter_map(|sf| {
+        .map(|sf| {
             match parse_session_file(&sf.path, &sf.session_id, sf.parent_session_id.as_deref()) {
-                Ok(entry) => Some(entry),
+                Ok(entry) => ParsedFile::yielded(entry),
+                Err(e @ (SessionError::EmptySession | SessionError::NoMessageRecords)) => {
+                    tracing::debug!(path = ?sf.path, error = %e, "skipping session with nothing to index");
+                    ParsedFile::NOTHING_TO_INDEX
+                }
                 Err(e) => {
                     tracing::warn!(path = ?sf.path, error = %e, "skipping invalid session");
-                    None
+                    ParsedFile::DEFECTIVE
                 }
             }
         })
         .collect();
 
+    complete &= parsed.iter().all(|file| file.clean);
+    let mut entries: Vec<AgentSession> = parsed.into_iter().filter_map(|f| f.session).collect();
+
     entries.sort_by_key(|e| e.start_time);
-    Ok(entries)
+    Ok(ScanOutcome {
+        sessions: entries,
+        complete,
+    })
 }
 
 #[cfg(test)]
@@ -502,6 +652,120 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    use chrono::TimeZone;
+    use std::time::{Duration as StdDuration, SystemTime};
+
+    /// Writes a minimal but parseable Claude session file and stamps its mtime.
+    fn plant_claude_session(projects_dir: &Path, session_id: &str, modified: SystemTime) {
+        let project = projects_dir.join("-home-sami-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{session_id}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"role":"user","content":"hello"}},"timestamp":"2026-01-29T10:58:45.000Z","cwd":"/home/sami/proj"}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    /// Given a session file older than the cursor, When an incremental scan runs,
+    /// Then it is not re-derived — that skip is the whole performance fix.
+    #[test]
+    fn claude_incremental_skips_files_older_than_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let long_ago = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        plant_claude_session(&projects, "stale-session", long_ago);
+        let since = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+
+        let outcome = scan_claude_sessions_incremental(&projects, Some(since)).unwrap();
+
+        assert!(
+            outcome.sessions.is_empty(),
+            "stale file must not be re-parsed"
+        );
+        assert!(outcome.complete, "skipping a stale file is a complete scan");
+    }
+
+    /// Given a session file newer than the cursor, When an incremental scan runs,
+    /// Then it is re-derived.
+    #[test]
+    fn claude_incremental_reparses_files_newer_than_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let recent = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_900_000_000);
+        plant_claude_session(&projects, "fresh-session", recent);
+        let since = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+
+        let outcome = scan_claude_sessions_incremental(&projects, Some(since)).unwrap();
+
+        assert_eq!(outcome.sessions.len(), 1);
+        assert_eq!(outcome.sessions[0].session_id, "fresh-session");
+    }
+
+    /// Given no cursor, When a scan runs, Then every file is derived regardless of
+    /// age — this is the force-full and first-run path.
+    #[test]
+    fn claude_incremental_without_since_reads_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let long_ago = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        plant_claude_session(&projects, "stale-session", long_ago);
+
+        let outcome = scan_claude_sessions_incremental(&projects, None).unwrap();
+
+        assert_eq!(outcome.sessions.len(), 1);
+        assert!(outcome.complete);
+    }
+
+    /// Given a store that is simply absent, When a scan runs, Then it is complete.
+    ///
+    /// Most machines run only one of the two harnesses; an absent store is not a
+    /// failure and must not freeze the cursor forever.
+    #[test]
+    fn claude_absent_store_is_a_complete_scan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let outcome = scan_claude_sessions_incremental(&dir.path().join("nope"), None).unwrap();
+
+        assert!(outcome.sessions.is_empty());
+        assert!(outcome.complete);
+    }
+
+    /// Given a file the parser rejects as defective, When a scan runs, Then the scan
+    /// reports itself incomplete.
+    ///
+    /// The session is skipped either way, but the cursor must not advance past it:
+    /// under a full scan every tick retried it, and an incremental scan that advanced
+    /// would strand it forever.
+    #[test]
+    fn claude_unparseable_session_marks_scan_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let project = projects.join("-home-sami-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut file = std::fs::File::create(project.join("broken.jsonl")).unwrap();
+        // Message-shaped enough to reach the deserializer, malformed enough to fail.
+        writeln!(file, r#"{{"type":"user","cwd":"/x","message":{{"#).unwrap();
+        drop(file);
+
+        let outcome = scan_claude_sessions_incremental(&projects, None).unwrap();
+
+        assert!(outcome.sessions.is_empty());
+        assert!(
+            !outcome.complete,
+            "a defective session must hold the cursor back"
+        );
+    }
 
     #[test]
     fn test_parse_session_extracts_cwd_and_summary() {
@@ -736,13 +1000,63 @@ mod tests {
         assert_eq!(entry.user_prompts.len(), 1);
     }
 
+    /// Given an aborted session (a zero-byte JSONL), When it is parsed, Then it
+    /// reports `EmptySession` so the caller can stay silent about it.
     #[test]
     fn test_parse_session_empty_file() {
         let file = NamedTempFile::new().unwrap();
-        // Empty file should error (no messages)
         let result = parse_session_file(file.path(), "test-session", None);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SessionError::NoMessages));
+        assert!(matches!(result.unwrap_err(), SessionError::EmptySession));
+    }
+
+    /// Given a JSONL holding records none of which is a message — a session that
+    /// only fired a `SessionStart` hook — When it is parsed, Then it reports
+    /// `NoMessageRecords` so the caller stays silent. Every line parsed; there is
+    /// simply nothing to index, and this recurs on every ~30s ingest.
+    #[test]
+    fn test_parse_session_hook_only_reports_no_message_records() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"parentUuid":null,"sessionId":"s","type":"progress","data":{{"hookEvent":"SessionStart"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let result = parse_session_file(file.path(), "test-session", None);
+        assert!(matches!(
+            result.unwrap_err(),
+            SessionError::NoMessageRecords
+        ));
+    }
+
+    /// Given a JSONL whose content is not message-shaped at all, When it is
+    /// parsed, Then it is also `NoMessageRecords` — the line never reaches the
+    /// deserializer, so calling it a parse failure would warn about noise.
+    #[test]
+    fn test_parse_session_irrelevant_content_reports_no_message_records() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "this is not JSON at all, but it is content").unwrap();
+        file.flush().unwrap();
+
+        let result = parse_session_file(file.path(), "test-session", None);
+        assert!(matches!(
+            result.unwrap_err(),
+            SessionError::NoMessageRecords
+        ));
+    }
+
+    /// Given a JSONL holding only blank lines, When it is parsed, Then it counts
+    /// as empty rather than as a parse failure.
+    #[test]
+    fn test_parse_session_blank_lines_only_is_empty_session() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file).unwrap();
+        writeln!(file).unwrap();
+        file.flush().unwrap();
+
+        let result = parse_session_file(file.path(), "test-session", None);
+        assert!(matches!(result.unwrap_err(), SessionError::EmptySession));
     }
 
     #[test]
@@ -1015,5 +1329,106 @@ mod tests {
     fn test_session_source_invalid() {
         let result = "invalid".parse::<SessionSource>();
         assert!(result.is_err());
+    }
+
+    /// Parses a Claude session whose user messages are exactly `texts`.
+    fn claude_session_with_user_texts(texts: &[&str]) -> AgentSession {
+        let mut file = NamedTempFile::new().unwrap();
+        for (i, text) in texts.iter().enumerate() {
+            let line = serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": text },
+                "timestamp": format!("2026-01-29T10:{i:02}:00.000Z"),
+                "cwd": "/home/sami/project",
+            });
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        parse_session_file(file.path(), "test-session", None).unwrap()
+    }
+
+    #[test]
+    fn test_claude_system_reminder_produces_no_user_message_timestamp() {
+        let entry = claude_session_with_user_texts(&[
+            "<system-reminder>\n[BACKGROUND TASK COMPLETED]\n**ID:** `bg_f60bcb1c`",
+        ]);
+
+        assert!(entry.user_message_timestamps.is_empty());
+        assert!(entry.user_prompts.is_empty());
+        assert!(entry.starting_prompt.is_none());
+        assert_eq!(entry.message_count, 0);
+    }
+
+    #[test]
+    fn test_claude_boulder_continuation_produces_no_user_message_timestamp() {
+        let entry = claude_session_with_user_texts(&[
+            "[SYSTEM DIRECTIVE: OH-MY-OPENCODE - BOULDER CONTINUATION]\n\nContinue the plan.",
+        ]);
+
+        assert!(entry.user_message_timestamps.is_empty());
+        assert!(entry.user_prompts.is_empty());
+        assert_eq!(entry.message_count, 0);
+    }
+
+    #[test]
+    fn test_claude_skill_instruction_produces_a_user_message_timestamp() {
+        let entry = claude_session_with_user_texts(&[
+            "<skill-instruction>\nUse the using-jj skill for version control.",
+        ]);
+
+        assert_eq!(entry.user_message_timestamps.len(), 1);
+        assert_eq!(entry.user_prompts.len(), 1);
+        assert!(entry.starting_prompt.is_some());
+    }
+
+    #[test]
+    fn test_claude_mode_banner_messages_produce_user_message_timestamps() {
+        let entry = claude_session_with_user_texts(&[
+            "[analyze-mode]\nANALYSIS MODE. Gather context before diving deep.",
+            "[CONTEXT]\nWe are mid-refactor of the allocation algorithm.",
+            "[search-mode]\nMAXIMIZE SEARCH EFFORT.",
+        ]);
+
+        assert_eq!(entry.user_message_timestamps.len(), 3);
+        assert_eq!(entry.user_prompts.len(), 3);
+        assert_eq!(entry.message_count, 3);
+    }
+
+    #[test]
+    fn test_claude_session_of_only_injected_messages_has_no_user_message_timestamps() {
+        let entry = claude_session_with_user_texts(&[
+            "<system-reminder>\nbackground task finished",
+            "---\n\n[SYSTEM DIRECTIVE: OH-MY-OPENCODE - SINGLE TASK ONLY]\n\nProceed.",
+            "[NOTIFICATION from agent (reply-to: ses_abc)]\nstatus update",
+            "<local-command-caveat>Caveat: the messages below were generated",
+            "This session is being continued from a previous conversation.",
+        ]);
+
+        assert!(entry.user_message_timestamps.is_empty());
+        assert!(entry.user_prompts.is_empty());
+        assert!(entry.starting_prompt.is_none());
+        assert_eq!(entry.message_count, 0);
+    }
+
+    #[test]
+    fn test_claude_injected_first_message_still_anchors_session_start() {
+        // The session began when the harness spoke, even though nobody was
+        // watching; only the attention signal is dropped.
+        let entry = claude_session_with_user_texts(&[
+            "<system-reminder>\nbackground task finished",
+            "actually fix the allocation bug",
+        ]);
+
+        assert_eq!(
+            entry.start_time,
+            DateTime::parse_from_rfc3339("2026-01-29T10:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(entry.user_message_timestamps.len(), 1);
+        assert_eq!(
+            entry.starting_prompt.as_deref(),
+            Some("actually fix the allocation bug")
+        );
     }
 }

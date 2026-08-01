@@ -1,0 +1,39 @@
+---
+source: crates/tt-server/src/api/tests.rs
+expression: rendered
+---
+{
+  "proposals": [
+    {
+      "confidence": 0.91,
+      "created_at": "2025-01-15T09:00:00Z",
+      "id": "proposal-existing",
+      "reasoning": "Recent work belongs with the alpha stream.",
+      "scope": {
+        "count": 1,
+        "kind": "session"
+      },
+      "target": {
+        "kind": "existing",
+        "name": "alpha stream",
+        "slug": "alpha",
+        "stream_id": "alpha"
+      }
+    },
+    {
+      "confidence": 0.78,
+      "created_at": "2025-01-15T09:01:00Z",
+      "id": "proposal-new",
+      "reasoning": "The events form a distinct support handoff thread.",
+      "scope": {
+        "count": 2,
+        "kind": "events"
+      },
+      "target": {
+        "description": "Coordinate the customer support handoff.",
+        "kind": "new",
+        "name": "Support handoff"
+      }
+    }
+  ]
+}

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use tt_cli::logging;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,12 +45,11 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filter = if args.verbose > 0 {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::from_default_env()
-    };
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    // Warnings are on by default; `RUST_LOG` and `-v` widen from there. This daemon
+    // also runs under systemd with no `RUST_LOG` set.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(logging::filter(args.verbose))
+        .try_init();
 
     tt_watcher::run(
         args.config.as_deref(),

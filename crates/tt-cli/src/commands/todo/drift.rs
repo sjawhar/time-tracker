@@ -27,6 +27,11 @@ pub fn run(db: &Database, config: &Config, period: Period, json: bool) -> Result
     let stream_times = stream_times_with_idle_named_streams(db, &report_data.streams)?;
     let drift =
         compute_drift(&priorities, &links, &stream_times).context("failed to compute drift")?;
+    // A link naming a dissolved stream is skipped rather than fatal, so it has to be said
+    // out loud here or the report quietly omits a priority's only link.
+    warnings.extend(drift.dangling_stream_links.iter().map(|stream| {
+        format!("streams.md reference '{stream}' names no stream; skipped (remove the line if it is stale)")
+    }));
     if json {
         for warning in &warnings {
             eprintln!("{}", warning_line(warning));
@@ -43,37 +48,72 @@ fn render_human(drift: &DriftReport, warnings: &[String]) -> Result<String> {
     writeln!(output, "TODO DRIFT").context("failed to format drift header")?;
     output.push_str(&render_warnings(warnings)?);
     writeln!(output).context("failed to format drift spacer")?;
+    // No percentage of `direct + delegated`. Direct is wall-clock hours and delegated is
+    // machine-hours summed across parallel agents, so their sum has no denominator and a
+    // share of it silently equates one human hour with one agent hour. This table used to
+    // print `Direct+Del` and `All time` columns doing exactly that -- `wo-005` read 6.0% of
+    // attention and 0.5% of "all time", two numbers that cannot both be a proportion of
+    // effort. `tt report`'s SUMMARY already reports the two separately plus the ratio;
+    // Delegated and Leverage carry the same information here without the false sum.
     writeln!(
         output,
-        "{:<18} {:>10} {:>12} {:>12} {:>12} {:>12}",
-        "Priority", "Importance", "Direct", "Direct+Del", "Direct time", "All time"
+        "{:<18} {:>10} {:>10} {:>12} {:>12} {:>10}",
+        "Priority", "Importance", "Direct", "Direct time", "Delegated", "Leverage"
     )
     .context("failed to format drift table header")?;
     for priority in &drift.priorities {
         writeln!(
             output,
-            "{:<18} {:>9.1}% {:>11.1}% {:>11.1}% {:>12} {:>12}",
+            "{:<18} {:>9.1}% {:>9.1}% {:>12} {:>12} {:>10}",
             priority.priority_slug,
             percentage(priority.importance_share),
             percentage(priority.direct_share),
-            percentage(priority.direct_plus_delegated_share),
             report::format_duration(priority.direct_ms),
-            report::format_duration(priority.direct_plus_delegated_ms)
+            report::format_duration(delegated_ms(
+                priority.direct_ms,
+                priority.direct_plus_delegated_ms
+            )),
+            leverage(priority.direct_ms, priority.direct_plus_delegated_ms)
         )
         .context("failed to format priority drift row")?;
     }
     writeln!(
         output,
-        "{:<18} {:>10} {:>11.1}% {:>11.1}% {:>12} {:>12}",
+        "{:<18} {:>10} {:>9.1}% {:>12} {:>12} {:>10}",
         "unattributed",
         "-",
         percentage(drift.unattributed.direct_share),
-        percentage(drift.unattributed.direct_plus_delegated_share),
         report::format_duration(drift.unattributed.direct_ms),
-        report::format_duration(drift.unattributed.direct_plus_delegated_ms)
+        report::format_duration(delegated_ms(
+            drift.unattributed.direct_ms,
+            drift.unattributed.direct_plus_delegated_ms
+        )),
+        leverage(
+            drift.unattributed.direct_ms,
+            drift.unattributed.direct_plus_delegated_ms
+        )
     )
     .context("failed to format unattributed drift row")?;
     Ok(output)
+}
+
+/// Recovers delegated time from the stored sum, which is what the report carries.
+fn delegated_ms(direct_ms: i64, direct_plus_delegated_ms: i64) -> i64 {
+    (direct_plus_delegated_ms - direct_ms).max(0)
+}
+
+/// Delegated over direct, the only honest way to relate the two.
+///
+/// Defers to `report::format_leverage`, which `tt report`'s SUMMARY already uses, so the
+/// two surfaces cannot drift on how the ratio is computed or how the undefined case reads.
+/// A priority with neither figure shows `-` rather than `n/a`: nothing happened at all,
+/// which is different from agent time the user never attended.
+fn leverage(direct_ms: i64, direct_plus_delegated_ms: i64) -> String {
+    let delegated = delegated_ms(direct_ms, direct_plus_delegated_ms);
+    if direct_ms <= 0 && delegated == 0 {
+        return "-".to_string();
+    }
+    report::format_leverage(direct_ms, delegated)
 }
 
 fn render_warnings(warnings: &[String]) -> Result<String> {

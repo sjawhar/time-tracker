@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use tt_core::todos::TodoFileItem;
 
 use super::mutate::unique_todo_line_index;
+use super::stream_links::apply_todo_stream_links;
 use crate::Config;
 use crate::todo_store::{load_mutating, write_todos};
 
@@ -29,7 +30,16 @@ fn session_from_env(explicit: Option<String>) -> Result<String> {
     )
 }
 
-pub fn run_link(config: &Config, id: &str, session: Option<String>) -> Result<()> {
+/// Links an agent session to a todo, then applies the todo's stream to it.
+///
+/// The link is the mapping; applying it is what makes the mapping visible in the
+/// timesheet. Doing both here is why no read command needs to write.
+pub fn run_link(
+    db: Option<&tt_db::Database>,
+    config: &Config,
+    id: &str,
+    session: Option<String>,
+) -> Result<()> {
     let session_id = session_from_env(session)?;
     let mut loaded = load_mutating(config)?;
     let index = unique_todo_line_index(&loaded, id)?;
@@ -44,6 +54,12 @@ pub fn run_link(config: &Config, id: &str, session: Option<String>) -> Result<()
     let text = todo.text.clone();
     write_todos(config, &loaded.store.todos)?;
     println!("Linked {session_id} → {id} \"{text}\"");
+
+    if let Some(db) = db {
+        for note in apply_todo_stream_links(db, &loaded)? {
+            eprintln!("{note}");
+        }
+    }
     Ok(())
 }
 
@@ -81,6 +97,7 @@ mod tests {
         let config = Config {
             database_path: temp.path().join("tt.db"),
             todo_store_path: store,
+            ..Config::default()
         };
         (temp, config)
     }
@@ -125,8 +142,8 @@ mod tests {
             "- [ ] Link task <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[],\"stream\":null,\"when\":null,\"due\":null,\"pin\":false,\"quick\":false} -->\n",
         );
 
-        run_link(&config, "td_1", Some("ses_abc".into())).unwrap();
-        run_link(&config, "td_1", Some("ses_abc".into())).unwrap();
+        run_link(None, &config, "td_1", Some("ses_abc".into())).unwrap();
+        run_link(None, &config, "td_1", Some("ses_abc".into())).unwrap();
 
         assert_eq!(sessions(&config), ["ses_abc"]);
     }

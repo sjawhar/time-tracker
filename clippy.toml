@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tt_core::allocation::allocate_time", reason = "call tt_db::allocate_for_period instead" },
+]

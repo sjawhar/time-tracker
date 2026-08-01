@@ -1,0 +1,31 @@
+---
+source: crates/tt-server/src/api/tests.rs
+expression: rendered
+---
+{
+  "sessions": [
+    {
+      "duration_ms": 123456,
+      "harness": "claude",
+      "last_activity": "[timestamp]",
+      "linked_todo_text": "Ship the rail",
+      "machine_label": "buildbox",
+      "session_id": "active-session",
+      "start_time": "[timestamp]",
+      "stream": {
+        "name": "alpha stream",
+        "slug": "alpha"
+      }
+    },
+    {
+      "duration_ms": 123456,
+      "harness": "opencode",
+      "last_activity": "[timestamp]",
+      "linked_todo_text": "Ship the rail",
+      "machine_label": null,
+      "session_id": "quiet-session",
+      "start_time": "[timestamp]",
+      "stream": null
+    }
+  ]
+}

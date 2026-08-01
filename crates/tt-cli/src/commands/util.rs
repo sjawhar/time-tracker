@@ -51,3 +51,58 @@ pub fn parse_datetime(s: &str) -> anyhow::Result<DateTime<Utc>> {
     let duration = Duration::minutes(n * minutes_per_unit);
     Ok(Utc::now() - duration)
 }
+
+/// Format how long ago `earlier` happened, relative to `now`.
+///
+/// Granularity steps up with magnitude: `"45m"`, `"2h"`, `"3d"`. Future
+/// timestamps clamp to `"0m"`.
+pub fn format_age(earlier: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let minutes = (now - earlier).num_minutes().max(0);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 1_440 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}d", minutes / 1_440)
+    }
+}
+
+/// `1 tag` / `2 tags` — a human reads these reports, and `1 tags` is a wart.
+pub fn plural(count: u64, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use super::{format_age, plural};
+
+    fn at(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 3, day, hour, minute, 0).unwrap()
+    }
+
+    #[test]
+    fn format_age_steps_up_granularity_with_magnitude() {
+        let now = at(10, 12, 0);
+        assert_eq!(format_age(at(10, 11, 15), now), "45m");
+        assert_eq!(format_age(at(10, 10, 0), now), "2h");
+        assert_eq!(format_age(at(7, 12, 0), now), "3d");
+    }
+
+    #[test]
+    fn format_age_clamps_future_timestamps_to_zero() {
+        assert_eq!(format_age(at(10, 13, 0), at(10, 12, 0)), "0m");
+    }
+
+    #[test]
+    fn plural_keeps_a_count_of_one_singular() {
+        assert_eq!(plural(0, "event"), "0 events");
+        assert_eq!(plural(1, "event"), "1 event");
+        assert_eq!(plural(2, "event"), "2 events");
+    }
+}

@@ -1,5 +1,5 @@
 ---
-source: crates/tt-cli/src/commands/todo/render.rs
+source: crates/tt-cli/src/commands/todo/render/tests.rs
 expression: render_ls(&view).unwrap()
 ---
 TODOS

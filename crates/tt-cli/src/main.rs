@@ -1,17 +1,17 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use tt_cli::logging;
 
 mod todo_dispatch;
 
 use todo_dispatch::{run_priority_action, run_todo_action};
 use tt_cli::commands::{
-    classify, context, export, import, ingest, init, machines, recompute, report, status, streams,
-    sync, tag,
+    classify_auto, export, import, ingest, init, machines, proposals, recompute, report, status,
+    streams, sync, tag,
 };
-use tt_cli::{Cli, Commands, Config, IngestEvent, StreamsAction, TodoAction};
+use tt_cli::{Cli, Commands, Config, IngestEvent, ProposalsAction, StreamsAction, TodoAction};
 
 /// Load config and open database, ensuring the parent directory exists.
 fn open_database(config_path: Option<&Path>) -> Result<(tt_db::Database, Config)> {
@@ -39,14 +39,11 @@ fn load_config(config_path: Option<&Path>) -> Result<Config> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing with verbose flag support
-    let filter = if cli.verbose > 0 {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::from_default_env()
-    };
+    // Warnings are on by default; `RUST_LOG` and `-v` widen from there.
     // Use try_init to avoid panic if tracing is already initialized (e.g., in tests)
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(logging::filter(cli.verbose))
+        .try_init();
 
     match &cli.command {
         Some(Commands::Ingest { event }) => match event {
@@ -55,8 +52,10 @@ fn main() -> Result<()> {
                 cwd,
                 session,
                 window,
+                pane_pid,
             } => {
-                let written = ingest::ingest_pane_focus(pane, session, *window, cwd)?;
+                let written =
+                    ingest::ingest_pane_focus(pane, session, *window, cwd, pane_pid.as_deref())?;
                 if written {
                     tracing::debug!("event ingested");
                 } else {
@@ -76,9 +75,14 @@ fn main() -> Result<()> {
                     tracing::debug!("scroll event debounced");
                 }
             }
-            IngestEvent::Sessions => {
+            IngestEvent::Sessions { full } => {
                 let (db, _config) = open_database(cli.config.as_deref())?;
-                ingest::index_sessions(&db)?;
+                let mode = if *full {
+                    ingest::ScanMode::Full
+                } else {
+                    ingest::ScanMode::Incremental
+                };
+                ingest::index_sessions(&db, mode)?;
             }
         },
         Some(Commands::Export { after, since }) => {
@@ -91,7 +95,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Status) => {
             let (db, config) = open_database(cli.config.as_deref())?;
-            status::run(&db, &config.database_path)?;
+            status::run(&db, &config)?;
         }
         Some(Commands::Recompute { force }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
@@ -145,7 +149,13 @@ fn main() -> Result<()> {
         Some(Commands::Streams(action)) => {
             let (db, config) = open_database(cli.config.as_deref())?;
             match action {
-                StreamsAction::List { json } => streams::run(&db, *json)?,
+                StreamsAction::List { json, misnamed } => {
+                    if *misnamed {
+                        streams::misnamed_report(&db, *json)?;
+                    } else {
+                        streams::run(&db, *json)?;
+                    }
+                }
                 StreamsAction::Create { name } => streams::create(&db, name.clone())?,
                 StreamsAction::Link { stream, priority } => {
                     streams::link(
@@ -158,13 +168,80 @@ fn main() -> Result<()> {
                     )?;
                 }
                 StreamsAction::Slug { stream, slug } => streams::set_slug(&db, stream, slug)?,
+                StreamsAction::Describe {
+                    stream,
+                    description,
+                    backfill,
+                    apply,
+                } => match (*backfill, stream.as_deref(), description.as_deref()) {
+                    (true, None, None) => {
+                        let classifier = tt_llm::RigClassifier::from_config(
+                            &config.classifier.model,
+                            &config.classifier.api_key_env,
+                        )
+                        .context("initialize stream description classifier")?;
+                        streams::backfill(&db, &classifier, *apply)?;
+                    }
+                    (true, _, _) => bail!(
+                        "--backfill cannot be combined with a stream reference or description"
+                    ),
+                    (false, Some(stream), Some(description)) => {
+                        streams::describe(&db, stream, description)?;
+                    }
+                    (false, _, _) => {
+                        bail!("provide a stream reference and description, or use --backfill");
+                    }
+                },
+                StreamsAction::Dissolve {
+                    streams: stream_refs,
+                    dry_run,
+                } => {
+                    let mode = if *dry_run {
+                        tt_db::DissolveMode::DryRun
+                    } else {
+                        tt_db::DissolveMode::Apply
+                    };
+                    streams::dissolve(&db, &config, stream_refs, mode)?;
+                }
+                StreamsAction::ReleasePaneFocus { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::ReleaseMode::DryRun
+                    } else {
+                        tt_db::ReleaseMode::Apply
+                    };
+                    streams::release_pane_focus(&db, mode)?;
+                }
+                StreamsAction::Merge {
+                    streams: from_refs,
+                    into,
+                    dry_run,
+                } => {
+                    let mode = if *dry_run {
+                        tt_db::MergeMode::DryRun
+                    } else {
+                        tt_db::MergeMode::Apply
+                    };
+                    streams::merge(&db, from_refs, into, mode)?;
+                }
+                StreamsAction::Rename { stream, name } => streams::rename(&db, stream, name)?,
+                StreamsAction::Assign {
+                    stream,
+                    session,
+                    event,
+                } => streams::assign(&db, &config, stream, session, event)?,
             }
         }
         Some(Commands::Todo(action)) => {
-            if matches!(action, TodoAction::Drift { .. })
+            // `link` needs the database because creating a todo→session link is what
+            // applies that todo's stream to the session's events. Naming a stream needs
+            // it because the stream has to exist before it is written to the store.
+            if matches!(action, TodoAction::Drift { .. } | TodoAction::Link { .. })
                 || matches!(
                     action,
                     TodoAction::Add {
+                        stream: Some(_),
+                        ..
+                    } | TodoAction::Stream {
                         stream: Some(_),
                         ..
                     }
@@ -188,60 +265,42 @@ fn main() -> Result<()> {
             let (db, _config) = open_database(cli.config.as_deref())?;
             machines::run(&db)?;
         }
-        Some(Commands::Sync { remotes }) => {
-            let (db, _config) = open_database(cli.config.as_deref())?;
-            sync::run(&db, remotes)?;
-        }
-        Some(Commands::Context {
-            events,
-            agents,
-            streams,
-            gaps,
-            gap_threshold,
-            start,
-            end,
-            unclassified,
-            summary,
+        Some(Commands::Sync {
+            remotes,
+            reconcile,
+            since,
         }) => {
             let (db, _config) = open_database(cli.config.as_deref())?;
-            context::run(
-                &db,
-                *events,
-                *agents,
-                *streams,
-                *gaps,
-                *gap_threshold,
-                start.clone(),
-                end.clone(),
-                *unclassified,
-                *summary,
-            )?;
-        }
-        Some(Commands::Classify {
-            apply,
-            unclassified,
-            summary,
-            json,
-            start,
-            end,
-            gaps,
-            gap_threshold,
-        }) => {
-            let (db, config) = open_database(cli.config.as_deref())?;
-            if let Some(input_path) = apply {
-                classify::run_apply(&db, &config, input_path)?;
+            let mode = if *reconcile {
+                sync::SyncMode::Reconcile {
+                    since: since.clone(),
+                }
             } else {
-                classify::run_show(
-                    &db,
-                    &config,
-                    *unclassified,
-                    *summary,
-                    *json,
-                    start.clone(),
-                    end.clone(),
-                    *gaps,
-                    *gap_threshold,
-                )?;
+                sync::SyncMode::Incremental
+            };
+            sync::run(&db, remotes, &mode)?;
+        }
+        Some(Commands::Classify { auto: _ }) => {
+            let (db, config) = open_database(cli.config.as_deref())?;
+            let classifier = tt_llm::RigClassifier::from_config(
+                &config.classifier.model,
+                &config.classifier.api_key_env,
+            )
+            .context("initialize automatic classifier")?
+            .with_session_detail(
+                classify_auto::session_detail::session_tools(&config.database_path)
+                    .context("open the classifier's session access")?,
+            );
+            classify_auto::run_auto(&db, &config, &classifier)?;
+        }
+        Some(Commands::Proposals(action)) => {
+            let (db, _config) = open_database(cli.config.as_deref())?;
+            match action {
+                ProposalsAction::Ls => proposals::list(&db)?,
+                ProposalsAction::Accept { id } => proposals::accept(&db, id)?,
+                ProposalsAction::Reject { id, stream } => {
+                    proposals::reject(&db, id, stream.as_deref())?;
+                }
             }
         }
         None => {

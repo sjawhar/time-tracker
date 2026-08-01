@@ -2,6 +2,13 @@
 source: crates/tt-cli/src/commands/status.rs
 expression: output
 ---
+NOW   no active stream
+TOP   no top todo
+WIP   0/4
+      0 proposals pending
+      classifier has not run yet
+      ⚠ tmux_pane_focus stale — tmux hook (config/tmux-hook.conf) last reported 556d ago (2025-01-29T11:45:00Z)
+
 Database: /path/to/events.db
 
 Sources:

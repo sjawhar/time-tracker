@@ -1,0 +1,27 @@
+[Unit]
+Description=tt background daemon and local API
+After=network.target
+
+[Service]
+Type=simple
+# The classify loop is the only thing that attributes work to a stream, and it
+# reads its key from this process's environment ([classifier] api_key_env,
+# default ANTHROPIC_API_KEY). Started without it the daemon comes up perfectly
+# healthy -- it serves the API, ingests and syncs -- while classifying nothing at
+# all, because a missing key records ClassifierHealthState::Unconfigured and
+# disables that loop. This unit shipped with no key provision, so every install
+# landed in exactly that state.
+#
+# secrets (secretsd) puts the value in the child's environment without it ever
+# reaching disk, a log, or this file. ANTHROPIC_API_KEY is agent-tier, so it
+# resolves with no human touch and no tty -- verified under systemd-run --user.
+#
+# On a machine without secretsd, drop the wrapper and supply the key another way:
+#   ExecStart=%h/.local/bin/tt-serve
+#   EnvironmentFile=%h/.config/time-tracker/env
+ExecStart=/usr/bin/env secrets ANTHROPIC_API_KEY -- %h/.local/bin/tt-serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

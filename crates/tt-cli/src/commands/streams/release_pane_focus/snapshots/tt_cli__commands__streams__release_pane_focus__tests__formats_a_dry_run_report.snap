@@ -1,0 +1,14 @@
+---
+source: crates/tt-cli/src/commands/streams/release_pane_focus/tests.rs
+expression: "format_release(sample(), ReleaseMode::DryRun).unwrap()"
+---
+RELEASE PANE FOCUS (dry run — nothing written)
+
+Sessionless tmux pane focus, which no writer in this tree could have attributed.
+
+Would release        47082
+Retained                 0  (assigned by a human — never touched)
+Streams affected       312
+
+No event row was deleted.
+Nothing was written. Re-run without --dry-run to apply.

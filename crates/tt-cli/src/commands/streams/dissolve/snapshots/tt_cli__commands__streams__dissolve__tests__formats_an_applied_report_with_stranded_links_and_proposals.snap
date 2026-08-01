@@ -1,0 +1,24 @@
+---
+source: crates/tt-cli/src/commands/streams/dissolve/tests.rs
+expression: "format_dissolved(&sample_report(), &sample_stranded(),\n&sample_stranded_proposals(), DissolveMode::Apply).unwrap()"
+---
+DISSOLVE
+
+Name                            ID        Released  Retained  Outcome
+──────────────────────────────  ────────  ────────  ────────  ────────────────
+misc: stragglers                0f3a91c2      4812         0  retired
+other: dev-env (dotfiles/se...  a1b2c3d4       120         7  kept
+
+Total: 4932 events released, 7 retained, 1 of 2 streams retired.
+
+Priority links now dangling:
+  streams.md line 25: 'misc: stragglers' → priority 'ops'
+Drift skips a dangling link and names it, so the verdict still computes.
+Nothing was removed from streams.md — that mapping is yours to edit.
+
+Proposals now stranded:
+  proposal 3542bdf0 → stream 0f3a91c2 (12 events)
+  proposal 7b19e4aa → stream a1b2c3d4 (1 event)
+'tt proposals ls' marks these (gone): they suppress nothing, and no reviewer can accept one.
+Nothing about them was changed — a dissolution has no stream to re-point a proposal to.
+Released events await re-attribution. Run 'tt recompute' to refresh stream totals.

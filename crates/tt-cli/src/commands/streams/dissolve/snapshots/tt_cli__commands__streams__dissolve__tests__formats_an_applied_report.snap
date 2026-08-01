@@ -1,0 +1,13 @@
+---
+source: crates/tt-cli/src/commands/streams/dissolve/tests.rs
+expression: "format_dissolved(&sample_report(), &[], DissolveMode::Apply).unwrap()"
+---
+DISSOLVE
+
+Name                            ID        Released  Retained  Outcome
+──────────────────────────────  ────────  ────────  ────────  ────────────────
+misc: stragglers                0f3a91c2      4812         0  retired
+other: dev-env (dotfiles/se...  a1b2c3d4       120         7  kept
+
+Total: 4932 events released, 7 retained, 1 of 2 streams retired.
+Released events await re-attribution. Run 'tt recompute' to refresh stream totals.

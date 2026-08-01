@@ -1,0 +1,38 @@
+---
+source: crates/tt-server/src/api/tests.rs
+expression: rendered
+---
+{
+  "todos": [
+    {
+      "due": null,
+      "id": "td_rail",
+      "linked_agent_count": 2,
+      "priorities": [
+        {
+          "slug": "customer",
+          "value": 9
+        }
+      ],
+      "section": "main",
+      "stream_slug": "alpha",
+      "text": "Ship the rail",
+      "when": null
+    },
+    {
+      "due": null,
+      "id": "td_ops",
+      "linked_agent_count": 0,
+      "priorities": [
+        {
+          "slug": "operations",
+          "value": 2
+        }
+      ],
+      "section": "main",
+      "stream_slug": null,
+      "text": "Operations follow-up",
+      "when": null
+    }
+  ]
+}

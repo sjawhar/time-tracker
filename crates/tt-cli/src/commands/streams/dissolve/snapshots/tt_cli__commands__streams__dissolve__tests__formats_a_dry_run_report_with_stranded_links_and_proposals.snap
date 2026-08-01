@@ -1,0 +1,24 @@
+---
+source: crates/tt-cli/src/commands/streams/dissolve/tests.rs
+expression: "format_dissolved(&sample_report(), &sample_stranded(),\n&sample_stranded_proposals(), DissolveMode::DryRun).unwrap()"
+---
+DISSOLVE (dry run — nothing written)
+
+Name                            ID        Released  Retained  Outcome
+──────────────────────────────  ────────  ────────  ────────  ────────────────
+misc: stragglers                0f3a91c2      4812         0  would be retired
+other: dev-env (dotfiles/se...  a1b2c3d4       120         7  would be kept
+
+Total: 4932 events would be released, 7 retained, 1 of 2 streams would be retired.
+
+Priority links that would dangle:
+  streams.md line 25: 'misc: stragglers' → priority 'ops'
+Drift skips a dangling link and names it, so the verdict still computes.
+Nothing was removed from streams.md — that mapping is yours to edit.
+
+Proposals that would be stranded:
+  proposal 3542bdf0 → stream 0f3a91c2 (12 events)
+  proposal 7b19e4aa → stream a1b2c3d4 (1 event)
+'tt proposals ls' marks these (gone): they suppress nothing, and no reviewer can accept one.
+Nothing about them was changed — a dissolution has no stream to re-point a proposal to.
+Nothing was written. Re-run without --dry-run to apply.

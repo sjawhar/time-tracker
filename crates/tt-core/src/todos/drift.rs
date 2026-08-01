@@ -18,6 +18,14 @@ pub struct DriftReport {
     pub unattributed: UnattributedDrift,
     pub total_direct_ms: i64,
     pub total_direct_plus_delegated_ms: i64,
+    /// Links naming a stream that no longer exists, in the order the file lists them.
+    ///
+    /// A dissolved or merged stream leaves its `streams.md` line behind, so this is an
+    /// expected condition rather than a failure. It is reported instead of dropped so
+    /// `tt status` and the dashboard can say the mapping has fallen behind. Reported as
+    /// data rather than logged from here: `tt todo drift --json` writes its report to
+    /// stdout, which a log line from this crate would corrupt. Callers warn.
+    pub dangling_stream_links: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -41,8 +49,6 @@ pub struct UnattributedDrift {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DriftError {
-    #[error("stream link references unknown stream: {stream}")]
-    UnresolvedStream { stream: String },
     #[error("stream link references unknown priority: {priority}")]
     UnresolvedPriority { priority: String },
     #[error("stream has multiple priority links: {stream}")]
@@ -59,7 +65,10 @@ pub fn compute_drift(
     let active_priorities = active_priorities(priorities);
     let time_by_stream = aggregate_stream_times(stream_times)?;
     let priority_statuses = priority_statuses(priorities);
-    let linked_streams = validate_links(stream_links, &time_by_stream, &priority_statuses)?;
+    let ValidatedLinks {
+        active: linked_streams,
+        dangling: dangling_stream_links,
+    } = validate_links(stream_links, &time_by_stream, &priority_statuses)?;
     let totals = total_time(&time_by_stream);
     let priority_totals = totals_by_priority(&linked_streams);
     let importance_total: i32 = active_priorities
@@ -77,6 +86,7 @@ pub fn compute_drift(
         unattributed,
         total_direct_ms: totals.direct_ms,
         total_direct_plus_delegated_ms: totals.direct_plus_delegated_ms,
+        dangling_stream_links,
     })
 }
 
@@ -125,12 +135,32 @@ fn aggregate_stream_times(
     Ok(time_by_stream)
 }
 
+/// What the `streams.md` links resolved to.
+struct ValidatedLinks<'a> {
+    active: HashMap<&'a str, ActiveStreamLink<'a>>,
+    dangling: Vec<String>,
+}
+
+/// Resolves each link against the streams that exist, degrading on the ones that do not.
+///
+/// A link naming a stream no longer in the roster is **skipped, not fatal**: `tt streams
+/// dissolve` and `tt streams merge` retire streams while `streams.md` is hand-edited, so one
+/// stale line must not take the whole verdict down with it. The skipped link contributes no
+/// time to its priority, because a link resolving to no stream owns no time to contribute —
+/// there is nothing to count, and inventing a zero-time entry would only make an absent
+/// stream look like an idle one. Its time does not move to `unattributed` either, for the
+/// same reason: no stream, no time.
+///
+/// A skipped link's priority is deliberately left unchecked. The line is inert, and aborting
+/// the verdict over the priority slug of a link that contributes nothing would reintroduce
+/// exactly the failure this degradation exists to remove.
 fn validate_links<'a>(
     stream_links: &'a [StreamPriorityLink],
     time_by_stream: &HashMap<&str, TimeTotals>,
     priority_statuses: &HashMap<&str, PriorityStatus>,
-) -> Result<HashMap<&'a str, ActiveStreamLink<'a>>, DriftError> {
-    let mut linked_streams = HashMap::new();
+) -> Result<ValidatedLinks<'a>, DriftError> {
+    let mut active = HashMap::new();
+    let mut dangling = Vec::new();
     let mut seen_streams = HashSet::new();
     for link in stream_links {
         if !seen_streams.insert(link.stream.as_str()) {
@@ -139,13 +169,12 @@ fn validate_links<'a>(
             });
         }
         let Some(stream_time) = time_by_stream.get(link.stream.as_str()).copied() else {
-            return Err(DriftError::UnresolvedStream {
-                stream: link.stream.clone(),
-            });
+            dangling.push(link.stream.clone());
+            continue;
         };
         match priority_status(link, priority_statuses)? {
             PriorityStatus::Active => {
-                linked_streams.insert(
+                active.insert(
                     link.stream.as_str(),
                     ActiveStreamLink {
                         priority: link.priority.as_str(),
@@ -156,7 +185,7 @@ fn validate_links<'a>(
             PriorityStatus::Done | PriorityStatus::Dropped => {}
         }
     }
-    Ok(linked_streams)
+    Ok(ValidatedLinks { active, dangling })
 }
 
 fn priority_status(

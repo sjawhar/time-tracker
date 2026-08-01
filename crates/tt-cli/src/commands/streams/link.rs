@@ -108,6 +108,7 @@ mod tests {
         let config = Config {
             database_path: temp.path().join("tt.db"),
             todo_store_path: store,
+            ..Config::default()
         };
         let db = Database::open_in_memory().unwrap();
         (temp, db, config)
@@ -119,6 +120,8 @@ mod tests {
             id: id.to_string(),
             name: Some(name.to_string()),
             slug: slug.map(String::from),
+            description: None,
+            color: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,

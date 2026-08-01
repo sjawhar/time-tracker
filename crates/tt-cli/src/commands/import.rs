@@ -3,9 +3,11 @@
 //! This module reads JSONL events from stdin and inserts them into the local
 //! `SQLite` database. Duplicate events (same ID) are silently ignored.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use tt_db::{Database, StoredEvent};
 
@@ -29,6 +31,13 @@ pub struct ImportResult {
     pub sessions_imported: usize,
     /// Machine ID extracted from events or session metadata.
     pub machine_id: Option<String>,
+    /// Every user message the stream's producer derived, keyed by session.
+    ///
+    /// Only populated by [`import_from_reader_reconciling`]. Sessions the export
+    /// covered but for which it derived no user message appear with an empty
+    /// set — that is the signal that the producer looked and found none, and it
+    /// is what lets a reconciling caller retire stale replicas.
+    pub derived_user_messages: HashMap<String, HashSet<DateTime<Utc>>>,
 }
 
 /// Imports events from a reader into the database.
@@ -37,6 +46,21 @@ pub struct ImportResult {
 /// Malformed lines are skipped with a warning.
 /// Duplicate events (same ID) are silently ignored.
 pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportResult> {
+    import_impl(db, reader, false)
+}
+
+/// Imports events and records which user messages the producer derived.
+///
+/// Use when the local rows for these sessions are a replica that must converge
+/// on the producer's current derivation: pass
+/// [`ImportResult::derived_user_messages`] to
+/// `Database::prune_user_message_events` to retire rows the producer no longer
+/// emits. Ordinary syncs use [`import_from_reader`] and skip the bookkeeping.
+pub fn import_from_reader_reconciling<R: Read>(db: &Database, reader: R) -> Result<ImportResult> {
+    import_impl(db, reader, true)
+}
+
+fn import_impl<R: Read>(db: &Database, reader: R, reconciling: bool) -> Result<ImportResult> {
     let buf_reader = BufReader::new(reader);
     let mut batch: Vec<StoredEvent> = Vec::with_capacity(BATCH_SIZE);
     let mut result = ImportResult {
@@ -46,6 +70,7 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
         malformed: 0,
         sessions_imported: 0,
         machine_id: None,
+        derived_user_messages: HashMap::new(),
     };
 
     for (line_num, line_result) in buf_reader.lines().enumerate() {
@@ -104,6 +129,10 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
                     result.machine_id.clone_from(&event.machine_id);
                 }
 
+                if reconciling {
+                    record_derived_user_message(&mut result.derived_user_messages, &event);
+                }
+
                 result.total_read += 1;
                 batch.push(event);
 
@@ -131,6 +160,33 @@ pub fn import_from_reader<R: Read>(db: &Database, reader: R) -> Result<ImportRes
     }
 
     Ok(result)
+}
+
+/// Notes what `event` says about its session's user messages.
+///
+/// An `agent_session` event registers the session as covered by this export,
+/// even if the producer derived no user message for it — without that, a
+/// session whose messages were all injected would keep its stale replicas.
+/// A `user_message` event contributes its timestamp to the keep-set.
+fn record_derived_user_message(
+    derived: &mut HashMap<String, HashSet<DateTime<Utc>>>,
+    event: &StoredEvent,
+) {
+    let Some(session_id) = event.session_id.as_deref() else {
+        return;
+    };
+    match event.event_type {
+        tt_core::EventType::AgentSession => {
+            derived.entry(session_id.to_string()).or_default();
+        }
+        tt_core::EventType::UserMessage => {
+            derived
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(event.timestamp);
+        }
+        _ => {}
+    }
 }
 
 fn rewrite_legacy_session_types(line: &str, line_num: usize) -> Result<String> {

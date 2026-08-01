@@ -1,5 +1,5 @@
 ---
-source: crates/tt-cli/src/commands/streams.rs
+source: crates/tt-cli/src/commands/streams/tests.rs
 expression: output
 ---
 STREAMS (last 7 days)

@@ -1,13 +1,13 @@
 //! CLI subcommand implementations.
 
-pub mod classify;
-pub mod context;
+pub mod classify_auto;
 pub mod export;
 pub mod import;
 pub mod ingest;
 pub mod init;
 pub mod machines;
 pub mod priority;
+pub mod proposals;
 pub mod recompute;
 pub mod report;
 pub mod status;

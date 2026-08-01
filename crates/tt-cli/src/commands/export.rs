@@ -784,7 +784,8 @@ fn emit_session_start(
     Ok(())
 }
 
-/// Emits a `user_message` event if the entry is not a tool result.
+/// Emits a `user_message` event unless the entry is a tool result or text the
+/// agent harness injected on the user's behalf.
 fn emit_user_message(
     entry: &Value,
     session_id: &str,
@@ -800,6 +801,14 @@ fn emit_user_message(
 
     // Extract message content
     let message = entry.get("message").and_then(|m| m.get("content"));
+
+    // Injected text is the harness talking to the agent, not a person. Emitting
+    // it as a user_message would open an attention window on the importing
+    // machine for work nobody was watching.
+    if tt_core::is_injected(&message_text(message)) {
+        return Ok(());
+    }
+
     let (length, has_image) = extract_message_info(message);
 
     let event = ExportEvent {
@@ -887,6 +896,23 @@ fn is_tool_result(entry: &Value) -> bool {
         }
     }
     false
+}
+
+/// Reconstructs a Claude message's plain text so it can be tested for injection.
+///
+/// Content is either a bare string or an array of blocks; text blocks are joined
+/// in order, matching how `tt_core::opencode` assembles a message's parts.
+fn message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Extracts message length and `has_image` from message content.
@@ -1276,6 +1302,85 @@ not valid json
         assert_eq!(user_event["type"], "user_message");
         assert_eq!(user_event["length"], 11); // "hello world".len()
         assert_eq!(user_event["has_image"], false);
+    }
+
+    /// Exports one Claude session file containing `entries` and returns the
+    /// emitted event types in order.
+    fn claude_export_event_types(entries: &[Value]) -> Vec<String> {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let project_dir = claude_dir.join("test-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let jsonl: String = entries
+            .iter()
+            .map(|entry| entry.to_string() + "\n")
+            .collect();
+        fs::write(project_dir.join("session.jsonl"), jsonl).unwrap();
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        String::from_utf8(output.into_inner())
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn claude_user_entry(content: &Value) -> Value {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "sess123",
+            "timestamp": "2025-01-29T12:00:00Z",
+            "uuid": "msg-uuid-123",
+            "message": { "content": content },
+        })
+    }
+
+    #[test]
+    fn test_claude_injected_user_message_is_not_exported() {
+        // The remote export path parses Claude JSONL itself, so it needs the
+        // same injection gate as the session parser — otherwise injections keep
+        // arriving on the machine that syncs from this one.
+        let types = claude_export_event_types(&[claude_user_entry(&serde_json::json!(
+            "<system-reminder>\n[BACKGROUND TASK COMPLETED]"
+        ))]);
+
+        assert_eq!(types, vec!["agent_session"]);
+    }
+
+    #[test]
+    fn test_claude_injected_text_block_is_not_exported() {
+        let types = claude_export_event_types(&[claude_user_entry(&serde_json::json!([{
+            "type": "text",
+            "text": "---\n\n[SYSTEM DIRECTIVE: OH-MY-OPENCODE - BOULDER CONTINUATION]",
+        }]))]);
+
+        assert_eq!(types, vec!["agent_session"]);
+    }
+
+    #[test]
+    fn test_claude_human_message_with_skill_marker_is_still_exported() {
+        let types = claude_export_event_types(&[claude_user_entry(&serde_json::json!(
+            "<skill-instruction>\nUse the using-jj skill."
+        ))]);
+
+        assert_eq!(types, vec!["agent_session", "user_message"]);
     }
 
     #[test]

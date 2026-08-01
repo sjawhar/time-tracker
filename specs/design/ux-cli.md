@@ -198,7 +198,7 @@ Commands for generating time reports.
 Generate time reports for various periods.
 
 ```
-tt report [--week | --last-week | --day | --last-day] [--json]
+tt report [--week | --last-week | --day | --last-day | --weeks <n> | --start <d> [--end <d>]] [--json]
 ```
 
 **Options:**
@@ -206,37 +206,44 @@ tt report [--week | --last-week | --day | --last-day] [--json]
 - `--last-week` — previous week
 - `--day` — today
 - `--last-day` — yesterday
+- `--weeks <n>` — the `n` most recent weeks, newest first
+- `--start <YYYY-MM-DD> [--end <YYYY-MM-DD>]` — custom local-date range; `--end` is exclusive
 - `--json` — output as JSON
 
 Default: `--week`
 
-**Output (human-readable):**
+**Output (human-readable):** Direct time leads every section, ordered and bar-scaled by it, with delegated time trailing as a `+` figure.
+
 ```
 TIME REPORT: Week of Jan 27, 2025
 
+BY STREAM
+─────────
+                                                Direct               Delegated
+abc123  acme-webapp: auth rewrite               2h 45m  ██████████     +4h 0m
+def456  internal: hiring + planning             1h 30m  █████░░░░░     +1h 0m
+  (+ 3 streams with no direct time, 22h 14m delegated)
+
+  Tip: Run 'tt streams list' to see all
+
 BY TAG
 ──────
-acme-webapp                               6h 45m  ████████░░
-  Direct:    2h 45m
-  Delegated: 4h 00m
-
-internal                                  2h 30m  ███░░░░░░░
-  Direct:    1h 30m
-  Delegated: 1h 00m
-
-(untagged)                                1h 15m  █░░░░░░░░░
-  Direct:    45m
-  Delegated: 30m
-  Sessions: tmux/dev/session-2, tmux/staging/session-1
+                                                Direct               Delegated
+acme-webapp                                     2h 45m  ██████████     +4h 0m
+internal                                        1h 30m  █████░░░░░     +1h 0m
+(untagged)                                         45m  ███░░░░░░░       +30m
 
 SUMMARY
 ───────
-Total tracked:  10h 30m
-Direct time:    5h 00m (48%)
-Delegated time: 5h 30m (52%)
+Wall clock:      10h 30m
+Direct time:     5h 0m
+Delegated time:  27h 30m
+Leverage:        5.5x
 ```
 
-**Note:** Reports work without tagging by grouping by session. The `(untagged)` section shows which sessions need tagging and encourages organization.
+`specs/design/ux-reports.md` is the authoritative reference for report structure, column layout, and JSON schema.
+
+**Note:** Reports work without tagging — BY STREAM lists streams regardless, and the `(untagged)` row in BY TAG shows how much time still needs organising.
 
 #### `tt week`
 
