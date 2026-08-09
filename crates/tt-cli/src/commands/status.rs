@@ -18,7 +18,18 @@ use crate::drift::{MachineFreshness, Verdict, compute_verdict};
 ///
 /// Returns the formatted output string (for testing).
 pub fn format_status(db: &Database, config: &Config) -> Result<String> {
-    let now = Utc::now();
+    format_status_at(db, config, Utc::now())
+}
+
+/// Formats the status output as of `now`.
+///
+/// The clock is a parameter because this output renders *ages* (`last reported 556d ago`),
+/// so a snapshot taken against `Utc::now()` is only true on the day it was accepted. This
+/// function reading the wall clock is what turned `main` red: green on the pull request,
+/// red seventeen hours later at `556d ago` -> `557d ago`. Re-accepting the snapshot fixes
+/// it until tomorrow; pinning the clock fixes it. `format_age` and `format_machines`
+/// already take a `now` — this was the renderer that swallowed it.
+pub fn format_status_at(db: &Database, config: &Config, now: DateTime<Utc>) -> Result<String> {
     let verdict = compute_verdict(db, config, now).context("failed to compute status verdict")?;
     let statuses = db.get_last_event_per_source()?;
 
@@ -225,6 +236,14 @@ mod tests {
         }
     }
 
+    /// The instant every snapshot in this module is rendered against.
+    ///
+    /// Chosen to reproduce the ages these snapshots were originally accepted with, so
+    /// pinning the clock changed no expected output — it only stopped it drifting.
+    fn snapshot_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 8, 12, 0, 0).unwrap()
+    }
+
     #[test]
     fn test_status_empty_database() {
         let temp = TempDir::new().unwrap();
@@ -232,7 +251,7 @@ mod tests {
         let db_path = PathBuf::from("/path/to/events.db");
         let config = test_config(&temp, db_path);
 
-        let output = format_status(&db, &config).unwrap();
+        let output = format_status_at(&db, &config, snapshot_now()).unwrap();
 
         assert_snapshot!(output);
     }
@@ -253,7 +272,7 @@ mod tests {
         db.insert_event(&make_event("e2", ts_agent, "remote.agent"))
             .unwrap();
 
-        let output = format_status(&db, &config).unwrap();
+        let output = format_status_at(&db, &config, snapshot_now()).unwrap();
 
         assert_snapshot!(output);
     }
