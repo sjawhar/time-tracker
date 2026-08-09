@@ -1,8 +1,11 @@
 ---
-source: crates/tt-cli/src/commands/machines.rs
-assertion_line: 74
+source: crates/tt-cli/src/commands/machines/tests.rs
 expression: output
 ---
-MACHINE ID                             LABEL                LAST SYNC
-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee   devbox               2025-01-01T00:00:00.000Z
-11111111-2222-3333-4444-555555555555   gpu-server           2025-01-01T00:00:00.000Z
+MACHINE ID                             LABEL                LAST SYNC                  LAST EVENT  STATUS
+devbox-uuid                            devbox               2026-08-01T11:00:00.000Z   3d ago      ok
+ghost-wispr-uuid                       ghost-wispr          2026-08-01T11:00:00.000Z   50d ago     ⚠ DARK
+never-seen-uuid                        never-seen           2026-08-01T11:00:00.000Z   never       ⚠ DARK
+
+⚠ ghost-wispr has sent no events for 50d — check that tt is still running there.
+⚠ never-seen has never sent any events — check that tt is still running there.

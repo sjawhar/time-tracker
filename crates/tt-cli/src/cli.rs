@@ -149,86 +149,59 @@ pub enum Commands {
         /// Remote host(s) to sync from (SSH alias or user@host).
         #[arg(required = true)]
         remotes: Vec<String>,
+
+        /// Re-derive the remote's events from scratch and drop local
+        /// `user_message` copies the remote no longer produces.
+        ///
+        /// Ordinary syncs only add events, so a correction to what counts as a
+        /// user message never removes the rows an older remote wrote. Use this
+        /// after upgrading a remote to reconcile the replica.
+        #[arg(long)]
+        reconcile: bool,
+
+        /// Limit `--reconcile` to sessions updated at or after this RFC3339 time.
+        ///
+        /// Reconciling the full history re-scans every session on the remote.
+        /// Sessions outside the window are left exactly as they are.
+        #[arg(long, requires = "reconcile")]
+        since: Option<String>,
     },
 
-    /// [DEPRECATED] Output context for stream inference (JSON).
+    /// Classify unassigned activity into streams using the configured LLM.
     ///
-    /// Use `tt classify` instead, which provides the same data plus
-    /// stream proposals and `--apply` for assignments.
-    Context {
-        /// Include chronological events.
-        #[arg(long)]
-        events: bool,
-
-        /// Include Claude session metadata.
-        #[arg(long)]
-        agents: bool,
-
-        /// Include existing streams.
-        #[arg(long)]
-        streams: bool,
-
-        /// Include gaps between user input events.
-        #[arg(long)]
-        gaps: bool,
-
-        /// Minimum gap duration to include (minutes).
-        #[arg(long, default_value = "5")]
-        gap_threshold: u32,
-
-        /// Start of time range (ISO 8601 or relative like "4 hours ago").
-        #[arg(long)]
-        start: Option<String>,
-
-        /// End of time range (ISO 8601, defaults to now).
-        #[arg(long)]
-        end: Option<String>,
-
-        /// Only show events/sessions without a `stream_id`.
-        #[arg(long)]
-        unclassified: bool,
-
-        /// Compact summary output (one line per session/cluster).
-        #[arg(long)]
-        summary: bool,
-    },
-
-    /// Classify events into streams.
+    /// The one machine-inference path. It selects its own candidates newest-first,
+    /// refuses to invent a container for work it cannot place, and leaves anything it
+    /// cannot resolve unassigned. The `tt-serve` daemon runs it continuously; this
+    /// runs one bounded pass on demand.
     ///
-    /// Show unclassified sessions and events, or apply LLM-proposed
-    /// stream assignments.
+    /// To correct a verdict, use `tt streams assign`.
     Classify {
-        /// Apply assignments from JSON file or stdin ("-").
-        #[arg(long, value_name = "FILE")]
-        apply: Option<String>,
+        /// Required, because a pass spends real LLM calls.
+        #[arg(long, required = true)]
+        auto: bool,
+    },
 
-        /// Only show unclassified events (no `stream_id`).
+    /// Review classifier stream proposals.
+    #[command(subcommand)]
+    Proposals(ProposalsAction),
+}
+
+/// Proposal review actions.
+#[derive(Debug, Subcommand)]
+pub enum ProposalsAction {
+    /// List pending proposals.
+    Ls,
+
+    /// Accept a proposal and confirm its assignments.
+    Accept { id: String },
+
+    /// Reject a proposal, optionally assigning its events to another stream.
+    Reject {
+        id: String,
+
+        /// Stream ID, slug, or exact name to assign instead.
         #[arg(long)]
-        unclassified: bool,
-
-        /// Compact summary (one line per session/cluster).
-        #[arg(long)]
-        summary: bool,
-
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-
-        /// Start of time range (ISO 8601 or relative like "2 days ago").
-        #[arg(long)]
-        start: Option<String>,
-
-        /// End of time range (ISO 8601, defaults to now).
-        #[arg(long)]
-        end: Option<String>,
-
-        /// Include gaps between user input events.
-        #[arg(long)]
-        gaps: bool,
-
-        /// Minimum gap duration to include (minutes).
-        #[arg(long, default_value = "5")]
-        gap_threshold: u32,
+        stream: Option<String>,
     },
 }
 
@@ -243,6 +216,17 @@ pub enum StreamsAction {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Instead list existing streams whose name does not describe work.
+        ///
+        /// The guard judges names as they are proposed, so containers minted
+        /// before it existed are still standing and still receiving
+        /// assignments. This reports them across all time with their event
+        /// counts, direct time, and what each name describes instead.
+        ///
+        /// A report, never an action: nothing is renamed, merged, or dissolved.
+        #[arg(long)]
+        misnamed: bool,
     },
 
     /// Create a new stream (prints ID to stdout).
@@ -267,6 +251,122 @@ pub enum StreamsAction {
 
         /// New slug: lowercase kebab-case, max 32 chars.
         slug: String,
+    },
+
+    Describe {
+        #[arg(required_unless_present = "backfill")]
+        stream: Option<String>,
+
+        description: Option<String>,
+
+        #[arg(long)]
+        backfill: bool,
+
+        #[arg(long, requires = "backfill")]
+        apply: bool,
+    },
+
+    /// Release a stream's events back to unassigned and retire the stream.
+    ///
+    /// The undo for a container that should never have been minted — an
+    /// activity type, a date range, a catch-all. Released events return to the
+    /// unassigned pool, where the terminal-focus pass and the classifier can
+    /// reach them. No event is ever deleted.
+    ///
+    /// Events a human assigned are never touched, and a stream still holding
+    /// one is left in place. Start with --dry-run.
+    Dissolve {
+        /// Stream references: ID, slug, or exact display name.
+        #[arg(required = true)]
+        streams: Vec<String>,
+
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Release attribution from pane focus that could never have earned it.
+    ///
+    /// A tmux pane focus carries no window title, no app id and — unless the
+    /// process-tree stamp caught an agent running in it — no session. Nothing in
+    /// this tree can attribute one: every session-keyed writer filters on the
+    /// session id, and the classifier's window-run phase reads `window_focus` only.
+    ///
+    /// A stream on such a row was put there by the deleted cwd propagator, which
+    /// wrote the classifier's own assignment source, so the cleanup that released
+    /// 777,583 of its rows could not find these. They still inflate the direct
+    /// time reported for the containers they name.
+    ///
+    /// Events a human assigned are never touched and no event is ever deleted.
+    /// No stream is retired — judging a stream stays 'tt streams dissolve'.
+    /// Start with --dry-run.
+    ReleasePaneFocus {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Collapse streams onto one row, moving their events and tags.
+    ///
+    /// The counterpart to dissolve: dissolving says this was never work, merging
+    /// says this was work, in a stream that already exists. It is what repairs a
+    /// real initiative that was minted once per week.
+    ///
+    /// Events a human assigned MOVE TOO, keeping their assignment source: a merge
+    /// corrects which row holds the work, not the human's judgement about what the
+    /// work was. Tags move without duplicating. Emptied sources are retired. No
+    /// event is ever deleted. Start with --dry-run.
+    ///
+    /// The target's time totals go stale — run 'tt recompute' afterwards.
+    Merge {
+        /// Source stream references: ID, slug, or exact display name.
+        #[arg(required = true)]
+        streams: Vec<String>,
+
+        /// Target stream reference: ID, slug, or exact display name.
+        #[arg(long, value_name = "STREAM")]
+        into: String,
+
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Set a stream's display name.
+    ///
+    /// The first half of repairing a real initiative that was minted once per
+    /// week: strip the '(Jun14-20)' suffix here, then collapse the rows that now
+    /// share a name with 'tt streams merge'. Names are not unique, so that
+    /// intermediate state is legal — and reported, because a shared name no longer
+    /// identifies one row.
+    Rename {
+        /// Stream reference: ID, slug, or exact display name.
+        stream: String,
+
+        /// New display name.
+        name: String,
+    },
+
+    /// Record that specific sessions or events belong to a stream.
+    ///
+    /// The human-correction surface, and the only one that writes
+    /// `assignment_source = "user"` outside proposal review. Every machine writer
+    /// refuses to overwrite what this records.
+    ///
+    /// Deliberately narrow: it moves only sessions and events named explicitly on the
+    /// command line, and never creates the target stream. There is no pattern, time
+    /// range, or file-input form — machine inference belongs to `tt classify --auto`.
+    Assign {
+        /// Stream reference: ID, slug, or exact display name. Must already exist.
+        stream: String,
+
+        /// Agent session ID; all of its events move. Repeatable.
+        #[arg(long, value_name = "ID", required_unless_present = "event")]
+        session: Vec<String>,
+
+        /// Explicit event ID. Repeatable.
+        #[arg(long, value_name = "ID", required_unless_present = "session")]
+        event: Vec<String>,
     },
 }
 
@@ -361,6 +461,26 @@ pub enum TodoAction {
 
     /// Clear a todo's blocked state.
     Unblock { id: String },
+
+    /// Set or clear the stream a todo serves.
+    ///
+    /// Alignment reads todo → stream → priority, so a todo with no stream cannot
+    /// answer whether you are working on the right thing. `tt todo add --stream`
+    /// only covers todos that do not exist yet; this sets the field on one that does.
+    ///
+    /// The stream must already exist — a reference matching nothing is reported, never
+    /// created — and nothing here guesses which stream a todo belongs to.
+    Stream {
+        id: String,
+
+        /// Stream reference: ID, slug, or exact display name. Must already exist.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        stream: Option<String>,
+
+        /// Remove the todo's stream instead of setting one.
+        #[arg(long)]
+        clear: bool,
+    },
 
     /// Move a todo relative to other todo lines.
     Rank {
@@ -478,6 +598,16 @@ pub enum IngestEvent {
         /// The tmux window index (optional).
         #[arg(long)]
         window: Option<u32>,
+
+        /// The pane's process id, used to identify the agent session running in it.
+        ///
+        /// Optional, and absent on any install whose `~/.tmux.conf` has not
+        /// re-sourced `config/tmux-hook.conf` since this was added — tmux is asked
+        /// directly in that case. Taken as text rather than a number on purpose:
+        /// the value comes from a shell hook, and a focus event must never be lost
+        /// to a value clap would reject.
+        #[arg(long)]
+        pane_pid: Option<String>,
     },
 
     /// Record a tmux scroll (copy-mode) event.
@@ -502,7 +632,17 @@ pub enum IngestEvent {
     /// Index coding assistant sessions.
     ///
     /// Scans Claude Code (~/.claude/projects/) and `OpenCode`
-    /// (~/.local/share/opencode/storage/) session files and stores
-    /// metadata in the database.
-    Sessions,
+    /// (~/.local/share/opencode/) session stores and stores metadata in the
+    /// database.
+    ///
+    /// Only sessions touched since the last successful scan are re-derived.
+    Sessions {
+        /// Re-derive every session, ignoring the incremental scan cursor.
+        ///
+        /// Needed after a change to what the extractor derives (corrected rows only
+        /// appear for sessions actually re-read), or if the cursor is suspected of
+        /// having drifted. Costs a full pass over both transcript stores.
+        #[arg(long)]
+        full: bool,
+    },
 }

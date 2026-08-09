@@ -53,6 +53,12 @@ pub struct StreamTime {
 
     /// Total agent execution time in milliseconds.
     pub time_delegated_ms: i64,
+
+    /// Direct-attention intervals used to compute `time_direct_ms`.
+    pub focus_intervals: Vec<Interval>,
+
+    /// Agent-execution intervals used to compute `time_delegated_ms`.
+    pub delegated_intervals: Vec<Interval>,
 }
 
 /// Result of time allocation calculation.
@@ -141,16 +147,28 @@ struct AgentSession {
 }
 
 /// An activity interval for tracking total time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Interval {
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Interval {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
 }
 
 impl Interval {
     fn duration_ms(&self) -> i64 {
         (self.end - self.start).num_milliseconds()
     }
+}
+
+/// Per-stream accumulator.
+///
+/// Direct time is derived from `focus_intervals` as a union (attention cannot be in two
+/// places at once), so there is no running direct total. Delegated time is a running sum:
+/// parallel agents legitimately exceed wall clock (`specs/design/core-concepts.md:113`).
+#[derive(Default)]
+struct StreamAllocation {
+    delegated_ms: i64,
+    focus_intervals: Vec<Interval>,
+    delegated_intervals: Vec<Interval>,
 }
 
 /// Calculate time allocation for a time range.
@@ -186,21 +204,22 @@ pub fn allocate_time<E: AllocatableEvent>(
     let mut browser_focus_state = BrowserFocusState::default();
     let mut tmux_focus_stream_id: Option<String> = None;
     let mut agent_sessions: HashMap<String, AgentSession> = HashMap::new();
-    let mut stream_times: HashMap<String, (i64, i64)> = HashMap::new(); // (direct_ms, delegated_ms)
+    let mut stream_times: HashMap<String, StreamAllocation> = HashMap::new();
     let mut activity_intervals: Vec<Interval> = Vec::new();
     let mut last_event_time: Option<DateTime<Utc>> = None;
 
-    // Helper to add direct time
+    // Helper to add direct time. Only the interval is recorded; the total is unioned at
+    // the end so overlapping observations (e.g. two machines) are not double-counted.
     let add_direct = |stream_id: &str,
                       start: DateTime<Utc>,
                       end: DateTime<Utc>,
                       intervals: &mut Vec<Interval>,
-                      times: &mut HashMap<String, (i64, i64)>| {
+                      times: &mut HashMap<String, StreamAllocation>| {
         if end > start {
-            let duration_ms = (end - start).num_milliseconds();
-            let (direct, _) = times.entry(stream_id.to_string()).or_insert((0, 0));
-            *direct += duration_ms;
-            intervals.push(Interval { start, end });
+            let interval = Interval { start, end };
+            let allocation = times.entry(stream_id.to_string()).or_default();
+            allocation.focus_intervals.push(interval);
+            intervals.push(interval);
         }
     };
 
@@ -209,12 +228,14 @@ pub fn allocate_time<E: AllocatableEvent>(
                          start: DateTime<Utc>,
                          end: DateTime<Utc>,
                          intervals: &mut Vec<Interval>,
-                         times: &mut HashMap<String, (i64, i64)>| {
+                         times: &mut HashMap<String, StreamAllocation>| {
         if end > start {
             let duration_ms = (end - start).num_milliseconds();
-            let (_, delegated) = times.entry(stream_id.to_string()).or_insert((0, 0));
-            *delegated += duration_ms;
-            intervals.push(Interval { start, end });
+            let interval = Interval { start, end };
+            let allocation = times.entry(stream_id.to_string()).or_default();
+            allocation.delegated_ms += duration_ms;
+            allocation.delegated_intervals.push(interval);
+            intervals.push(interval);
         }
     };
 
@@ -447,7 +468,29 @@ pub fn allocate_time<E: AllocatableEvent>(
                 match action {
                     "started" => {
                         let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
-                        {
+                        // One agent session is recorded several times: the machine holding
+                        // the transcript derives it (`source = opencode`, carrying the
+                        // stream once classified), and every machine that syncs it in adds
+                        // its own copy (`source = remote.agent`, carrying no stream, because
+                        // attribution happens locally after the sync). Their ids differ in
+                        // shape, so `INSERT OR IGNORE` cannot collapse them, and all of them
+                        // share the session's start timestamp.
+                        //
+                        // Re-inserting on the later copy therefore discarded the attribution
+                        // the earlier one carried, and the session's whole delegated span
+                        // fell to unassigned. Live, 12,474 sessions are shadowed this way,
+                        // leaving 287 streams reporting zero delegated time while holding
+                        // 295,361 agent_tool_use events between them.
+                        //
+                        // A duplicate must not take information away. An unassigned copy
+                        // never overwrites a stream already known for the session; anything
+                        // that does name a stream still updates it, so a genuine
+                        // re-attribution is unaffected.
+                        let shadows_known_stream = stream_id == UNASSIGNED_STREAM_ID
+                            && agent_sessions
+                                .get(session_id)
+                                .is_some_and(|tracked| tracked.stream_id != UNASSIGNED_STREAM_ID);
+                        if !shadows_known_stream {
                             agent_sessions.insert(
                                 session_id.to_string(),
                                 AgentSession {
@@ -650,30 +693,33 @@ pub fn allocate_time<E: AllocatableEvent>(
     }
 
     // Calculate total tracked time from interval union
-    let total_tracked_ms = calculate_total_tracked(&activity_intervals);
+    let total_tracked_ms = union_duration_ms(&activity_intervals);
 
-    let (unassigned_direct_ms, unassigned_delegated_ms) =
-        stream_times.remove(UNASSIGNED_STREAM_ID).unwrap_or((0, 0));
+    let unassigned = stream_times
+        .remove(UNASSIGNED_STREAM_ID)
+        .unwrap_or_default();
 
     let stream_times_vec = stream_times
         .into_iter()
-        .map(|(stream_id, (direct, delegated))| StreamTime {
+        .map(|(stream_id, allocation)| StreamTime {
             stream_id,
-            time_direct_ms: direct,
-            time_delegated_ms: delegated,
+            time_direct_ms: union_duration_ms(&allocation.focus_intervals),
+            time_delegated_ms: allocation.delegated_ms,
+            focus_intervals: allocation.focus_intervals,
+            delegated_intervals: allocation.delegated_intervals,
         })
         .collect();
 
     AllocationResult {
         stream_times: stream_times_vec,
         total_tracked_ms,
-        unassigned_direct_ms,
-        unassigned_delegated_ms,
+        unassigned_direct_ms: union_duration_ms(&unassigned.focus_intervals),
+        unassigned_delegated_ms: unassigned.delegated_ms,
     }
 }
 
-/// Calculate total tracked time from interval union.
-fn calculate_total_tracked(intervals: &[Interval]) -> i64 {
+/// Total duration covered by the union of `intervals`, merging any overlap.
+fn union_duration_ms(intervals: &[Interval]) -> i64 {
     if intervals.is_empty() {
         return 0;
     }
@@ -762,6 +808,10 @@ fn resolve_focus_stream(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tt-core tests exercise the core algorithm directly"
+)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -790,6 +840,17 @@ mod tests {
                 timestamp: ts,
                 event_type: EventType::TmuxPaneFocus,
                 stream_id: Some(stream_id.to_string()),
+                session_id: None,
+                action: None,
+                data: json!({"pane_id": "%1", "cwd": "/test"}),
+            }
+        }
+
+        fn tmux_focus_unassigned(ts: DateTime<Utc>) -> Self {
+            Self {
+                timestamp: ts,
+                event_type: EventType::TmuxPaneFocus,
+                stream_id: None,
                 session_id: None,
                 action: None,
                 data: json!({"pane_id": "%1", "cwd": "/test"}),
@@ -2024,6 +2085,170 @@ mod tests {
     }
 
     #[test]
+    fn an_assigned_agent_session_credits_delegated_time_to_its_stream() {
+        // Reproduces the exact shape of a live stream that reports zero delegated time
+        // while holding 76 agent_tool_use events: a session started, tool uses, ended, with
+        // every event carrying the same stream_id. 287 streams and 295,361 tool-use events
+        // sit in this state on the live corpus, so if the allocator drops them here the
+        // leverage figure is understated at scale.
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("stream-a")),
+            TestEvent::agent_tool_use(ts(1), "sess1", "stream-a"),
+            TestEvent::agent_tool_use(ts(2), "sess1", "stream-a"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", Some("stream-a")),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Delegated runs first tool use (1) to end (3) = 2 min, credited to the stream.
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|time| time.stream_id == "stream-a")
+            .expect("an assigned session must credit its stream, not vanish");
+        assert_eq!(
+            stream.time_delegated_ms,
+            2 * 60_000,
+            "delegated time must land on the stream the session's events name"
+        );
+        assert_eq!(
+            result.unassigned_delegated_ms, 0,
+            "an assigned session must not be credited to the unassigned bucket"
+        );
+    }
+
+    #[test]
+    fn a_synced_duplicate_session_start_does_not_erase_the_stream() {
+        // The exact live shape: the machine that holds the transcript derives the session
+        // with its stream, and two machines that synced it in each add an unassigned copy at
+        // the identical timestamp. Their ids differ, so INSERT OR IGNORE keeps all three.
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("stream-a")),
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_tool_use(ts(1), "sess1", "stream-a"),
+            TestEvent::agent_tool_use(ts(2), "sess1", "stream-a"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", Some("stream-a")),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|time| time.stream_id == "stream-a")
+            .expect("an unassigned duplicate must not take the stream away");
+        assert_eq!(stream.time_delegated_ms, 2 * 60_000);
+        assert_eq!(
+            result.unassigned_delegated_ms, 0,
+            "the session's span must not fall to unassigned because a copy lacked a stream"
+        );
+    }
+
+    #[test]
+    fn a_later_start_naming_a_stream_still_updates_an_unassigned_session() {
+        // The guard is one-directional: it stops an unassigned copy from erasing a known
+        // stream, and must not stop a copy that actually carries one from supplying it.
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("stream-a")),
+            TestEvent::agent_tool_use(ts(1), "sess1", "stream-a"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", Some("stream-a")),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|time| time.stream_id == "stream-a")
+            .expect("a copy naming a stream must supply it");
+        assert_eq!(stream.time_delegated_ms, 2 * 60_000);
+    }
+
+    #[test]
+    fn a_genuinely_unassigned_session_still_accrues_to_unassigned() {
+        // With no copy naming a stream, nothing is invented: the span stays unassigned.
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_session(ts(0), "started", "sess1", None),
+            TestEvent::agent_tool_use(ts(1), "sess1", "ignored"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", None),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(5)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(result.unassigned_delegated_ms, 2 * 60_000);
+        assert!(result.stream_times.is_empty());
+    }
+
+    #[test]
+    fn a_sessions_delegated_span_never_outruns_the_end_event_that_closed_it() {
+        // Guards against inflating delegated time, which is easy to ship unnoticed because
+        // direct time is unaffected and only direct time gets checked by habit.
+        //
+        // Deferring to `agent_sessions.end_time` when an `ended` event looks premature was
+        // tried and reverted: sessions stay open for months (one spans 2,189 hours against
+        // 55 hours of tool use), so running the interval to the authoritative end took the
+        // corpus from 14,648h to 80,161h of delegated time and a single week from 428h to
+        // 2,116h. A correct version must cap at `min(end, last_tool + agent_timeout_ms)`;
+        // see the AGENTS.md entry before attempting it again.
+        let mut ends = HashMap::new();
+        // The authoritative record claims the session ran for hours after the work stopped.
+        ends.insert("sess1".to_string(), ts(600));
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("stream-a")),
+            TestEvent::agent_tool_use(ts(1), "sess1", "stream-a"),
+            TestEvent::agent_tool_use(ts(2), "sess1", "stream-a"),
+            TestEvent::agent_session(ts(3), "ended", "sess1", Some("stream-a")),
+        ];
+
+        let config = test_config();
+        let result = allocate_time(&events, &config, Some(ts(700)), &ends, &HashMap::new());
+
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|time| time.stream_id == "stream-a")
+            .expect("the stream accrues its span");
+        assert_eq!(
+            stream.time_delegated_ms,
+            2 * 60_000,
+            "delegated must run first tool use to the closing event, not to a far-off \
+             authoritative end: got {}ms",
+            stream.time_delegated_ms
+        );
+    }
+
+    #[test]
     fn test_unassigned_focus_accrues_direct_time() {
         let events = vec![TestEvent {
             timestamp: ts(0),
@@ -2089,5 +2314,177 @@ mod tests {
         // Then: the active GUI time accrues to the unassigned bucket, not zero.
         assert_eq!(result.unassigned_direct_ms, 60_000);
         assert!(result.stream_times.is_empty());
+    }
+
+    // Two machines observing the same work overlap their focus intervals. Direct
+    // attention is a union, never a sum — see `specs/design/core-concepts.md:112`.
+    #[test]
+    fn test_direct_time_is_union_of_overlapping_focus_intervals() {
+        // Given: one stream watched by two machines. The laptop reports GUI focus at
+        // 09:10 while the devbox reports tmux focus stamped 09:02 — clock skew between
+        // the two machines puts the devbox event out of monotonic order in the merged
+        // stream, so the attention window reopens over ground already credited.
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "A"),
+            TestEvent::window_focus(ts(10), "ghostty", None),
+            TestEvent::tmux_focus(ts(2), "A"),
+            TestEvent::window_focus(ts(10), "ghostty", None),
+        ];
+
+        // When: time is allocated with the production 5-minute attention window.
+        let config = AllocationConfig::default();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(10)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Then: stream A holds two overlapping focus intervals, [09:00, 09:05) and
+        // [09:02, 09:07), and its direct time is their union (7 min) — not their sum
+        // (10 min), which would double-count the contended 09:02-09:05 stretch.
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let naive_sum: i64 = stream_a
+            .focus_intervals
+            .iter()
+            .map(Interval::duration_ms)
+            .sum();
+        assert_eq!(naive_sum, 10 * 60 * 1000, "fixture must produce an overlap");
+        assert_eq!(stream_a.time_direct_ms, 7 * 60 * 1000);
+    }
+
+    // Invariant from `specs/design/core-concepts.md:112`: "Total direct time across all
+    // streams <= wall clock time (no double-counting attention)".
+    #[test]
+    fn test_total_direct_time_never_exceeds_wall_clock() {
+        // Given: contended focus on the unassigned bucket (two machines reporting the
+        // same unclassified attention) followed by focus on a real stream, over a
+        // 7-minute period.
+        let events = vec![
+            TestEvent::tmux_focus_unassigned(ts(0)),
+            TestEvent::tmux_focus_unassigned(ts(6)),
+            TestEvent::tmux_focus_unassigned(ts(2)),
+            TestEvent::tmux_focus(ts(6), "A"),
+        ];
+
+        // When: time is allocated with the production 5-minute attention window.
+        let config = AllocationConfig::default();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(7)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Then: every direct bucket — real streams and unassigned alike — sums to no
+        // more than the wall-clock span of the period.
+        let wall_clock_ms = (ts(7) - ts(0)).num_milliseconds();
+        let total_direct_ms: i64 = result
+            .stream_times
+            .iter()
+            .map(|s| s.time_direct_ms)
+            .sum::<i64>()
+            + result.unassigned_direct_ms;
+        assert!(
+            total_direct_ms <= wall_clock_ms,
+            "total direct {total_direct_ms}ms exceeds wall clock {wall_clock_ms}ms"
+        );
+        // Unassigned attention is still attention: [09:00, 09:06) unioned, not 9 min summed.
+        assert_eq!(result.unassigned_direct_ms, 6 * 60 * 1000);
+    }
+
+    // Invariant from `specs/design/core-concepts.md:113`: "Total delegated time can
+    // exceed wall clock time (parallel execution)". Delegated time measures leverage,
+    // so parallel agents MUST sum — do not "fix" this into a union.
+    #[test]
+    fn test_parallel_agent_sessions_sum_delegated_beyond_wall_clock() {
+        // Given: two agent sessions running concurrently on the same stream for the
+        // whole 31-minute period.
+        let events = vec![
+            TestEvent::agent_session(ts(0), "started", "sess1", Some("A")),
+            TestEvent::agent_session(ts(0), "started", "sess2", Some("A")),
+            TestEvent::agent_tool_use(ts(1), "sess1", "A"),
+            TestEvent::agent_tool_use(ts(1), "sess2", "A"),
+            TestEvent::agent_session(ts(31), "ended", "sess1", Some("A")),
+            TestEvent::agent_session(ts(31), "ended", "sess2", Some("A")),
+        ];
+
+        // When: time is allocated over that period.
+        let config = AllocationConfig::default();
+        let result = allocate_time(
+            &events,
+            &config,
+            Some(ts(31)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Then: both sessions are credited in full — 2 x 30 min of machine time against
+        // 31 min of wall clock.
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        let wall_clock_ms = (ts(31) - ts(0)).num_milliseconds();
+        assert_eq!(stream_a.time_delegated_ms, 60 * 60 * 1000);
+        assert!(
+            stream_a.time_delegated_ms > wall_clock_ms,
+            "parallel delegation must be able to exceed wall clock"
+        );
+    }
+
+    // Injected text must not manufacture human attention.
+    //
+    // Composition test: extraction drops injected messages, so allocation never
+    // sees them and they cannot open an attention window. Real messages still do.
+    // This is the regression guard for a day that reported 18h of direct time
+    // because overnight harness injections kept re-opening the window.
+    #[test]
+    fn test_injected_user_messages_do_not_extend_the_attention_window() {
+        let config = test_config(); // 60s attention window
+        let transcript = [
+            (0, "start the refactor"),
+            (10, "<system-reminder>\n[BACKGROUND TASK COMPLETED]"),
+            (20, "[analyze-mode]\nkeep going"),
+        ];
+
+        let to_events = |texts: &[(i64, &str)]| -> Vec<TestEvent> {
+            texts
+                .iter()
+                .map(|(minute, _)| TestEvent::user_message(ts(*minute), "sess1", "A"))
+                .collect()
+        };
+
+        let human: Vec<(i64, &str)> = transcript
+            .iter()
+            .filter(|(_, text)| !crate::injection::is_injected(text))
+            .copied()
+            .collect();
+        let result = allocate_time(
+            &to_events(&human),
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let stream_a = get_stream_time(&result, "A").expect("Stream A should exist");
+        // Two human messages, each opening one 60s window. The injection at
+        // minute 10 contributes nothing.
+        assert_eq!(stream_a.time_direct_ms, 2 * 60 * 1000);
+
+        // Control: treating the injection as human input manufactures a third
+        // window out of nothing. This is the bug being fixed.
+        let unfiltered = allocate_time(
+            &to_events(&transcript),
+            &config,
+            Some(ts(30)),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let unfiltered_a = get_stream_time(&unfiltered, "A").expect("Stream A should exist");
+        assert_eq!(
+            unfiltered_a.time_direct_ms,
+            3 * 60 * 1000,
+            "control: an unfiltered injection fabricates an extra attention window"
+        );
     }
 }

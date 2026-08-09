@@ -1,0 +1,30 @@
+---
+source: crates/tt-cli/src/commands/report/render/tests.rs
+expression: output
+---
+TIME REPORT: Week of Jan 27, 2025
+
+BY STREAM
+─────────
+                                                Direct               Delegated
+abc123  tmux/dev/session-1                       2h 0m  ██████████     +1h 15m
+def456  tmux/dev/session-2                         45m  ████░░░░░░        +30m
+
+  Tip: Run 'tt tag abc123 <project>' to assign
+
+BY TAG
+──────
+(no tagged streams)
+                                                Direct               Delegated
+(untagged)                                      2h 45m  ██████████     +1h 45m
+
+AGENT SESSIONS
+──────────────
+No agent sessions recorded.
+
+SUMMARY
+───────
+Wall clock:      3h 0m
+Direct time:     2h 45m
+Delegated time:  1h 45m
+Leverage:        0.6x

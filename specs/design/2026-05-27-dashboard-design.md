@@ -1,3 +1,8 @@
+> **SUPERSEDED** by [`2026-07-24-priority-dashboard-design.md`](2026-07-24-priority-dashboard-design.md),
+> which re-anchors this architecture around live priority alignment and adds the
+> attribution engine. The rendering stack, allocation contract, backend concurrency
+> rules, and edit-op transaction semantics defined here are carried over by reference.
+
 # tt Dashboard
 
 A persistent, live, browser-based interface to the time-tracker. Visualizes where direct/delegated time is allocated per stream over a continuous timeline, with inline edit affordances for stream assignment. Replaces `tt report`'s aggregate-number-only output as the primary human-facing surface for consuming tt data.

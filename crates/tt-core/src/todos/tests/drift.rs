@@ -35,28 +35,93 @@ fn drift_reports_both_lenses_and_unattributed() -> Result<(), DriftError> {
         report.unattributed.direct_plus_delegated_share,
         20.0 / 150.0,
     );
+    assert!(report.dangling_stream_links.is_empty());
     Ok(())
 }
 
 #[test]
-fn drift_errors_on_unresolved_stream_reference() {
-    // Given: a stream-priority link for a stream absent from the report-like input.
-    let priorities = vec![priority("ipi", 9, PriorityStatus::Active)];
-    let links = vec![stream_link("Missing", "ipi")];
-    let stream_times = vec![stream_time("Fable 5 DPI", 60, 0)];
+fn drift_skips_a_dangling_stream_link_and_still_reports() -> Result<(), DriftError> {
+    // Given: a link to a dissolved stream sits between links that still resolve.
+    let priorities = vec![
+        priority("ipi", 9, PriorityStatus::Active),
+        priority("ops", 3, PriorityStatus::Active),
+    ];
+    let links = vec![
+        stream_link("Fable 5 DPI", "ipi"),
+        stream_link("meetings-coord", "ops"),
+        stream_link("Ops", "ops"),
+    ];
+    let stream_times = vec![
+        stream_time("Fable 5 DPI", 60, 40),
+        stream_time("Ops", 30, 0),
+    ];
 
-    // When: drift attempts to resolve stream links against provided stream time records.
-    let Err(error) = compute_drift(&priorities, &links, &stream_times) else {
-        panic!("expected unresolved stream error");
-    };
+    // When: drift resolves the links against the streams that exist.
+    let report = compute_drift(&priorities, &links, &stream_times)?;
 
-    // Then: the unresolved stream is an explicit error, not a silent omission.
+    // Then: the resolvable links still produce a report, and the dangling one is named.
     assert_eq!(
-        error,
-        DriftError::UnresolvedStream {
-            stream: "Missing".to_string()
-        }
+        report.dangling_stream_links,
+        vec!["meetings-coord".to_string()]
     );
+    assert_eq!(report.priorities[0].priority_slug, "ipi");
+    assert_eq!(report.priorities[0].direct_ms, 60);
+    assert_eq!(report.priorities[1].priority_slug, "ops");
+    assert_eq!(report.priorities[1].direct_ms, 30);
+    assert_eq!(report.total_direct_ms, 90);
+    Ok(())
+}
+
+#[test]
+fn a_dangling_stream_link_contributes_no_time_to_its_priority() -> Result<(), DriftError> {
+    // Given: the only link for a priority names a stream that no longer exists.
+    let priorities = vec![priority("ops", 3, PriorityStatus::Active)];
+    let links = vec![stream_link("meetings-coord", "ops")];
+    let stream_times = vec![stream_time("Slack", 10, 5)];
+
+    // When: drift computes shares.
+    let report = compute_drift(&priorities, &links, &stream_times)?;
+
+    // Then: the priority gets nothing, because a link resolving to no stream owns no time,
+    // and the time that does exist stays unattributed rather than moving anywhere.
+    assert_eq!(
+        report.dangling_stream_links,
+        vec!["meetings-coord".to_string()]
+    );
+    assert_eq!(report.priorities[0].direct_ms, 0);
+    assert_eq!(report.priorities[0].direct_plus_delegated_ms, 0);
+    assert_close(report.priorities[0].direct_share, 0.0);
+    assert_close(report.priorities[0].direct_plus_delegated_share, 0.0);
+    assert_eq!(report.total_direct_ms, 10);
+    assert_eq!(report.unattributed.direct_ms, 10);
+    assert_eq!(report.unattributed.direct_plus_delegated_ms, 15);
+    Ok(())
+}
+
+#[test]
+fn drift_names_every_dangling_link_in_file_order() -> Result<(), DriftError> {
+    // Given: two dissolved streams are still linked, as in the live streams.md.
+    let priorities = vec![priority("ops", 6, PriorityStatus::Active)];
+    let links = vec![
+        stream_link("meetings-coord", "ops"),
+        stream_link("Ops", "ops"),
+        stream_link("team-coordination", "ops"),
+    ];
+    let stream_times = vec![stream_time("Ops", 30, 0)];
+
+    // When: drift resolves the links.
+    let report = compute_drift(&priorities, &links, &stream_times)?;
+
+    // Then: both are reported, in the order the file lists them, so the operator can find them.
+    assert_eq!(
+        report.dangling_stream_links,
+        vec![
+            "meetings-coord".to_string(),
+            "team-coordination".to_string()
+        ]
+    );
+    assert_eq!(report.priorities[0].direct_ms, 30);
+    Ok(())
 }
 
 #[test]

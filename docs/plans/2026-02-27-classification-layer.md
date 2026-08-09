@@ -334,6 +334,8 @@ Warning: session ses_abc has events in 2 streams: "stream A", "stream B"
 
 ## Task 12: Conservative auto-assignment in ingest
 
+> **Obsolete (2026-08-06).** This task built cwd-based stream inference, and the pass it describes has since been removed — a folder is not a project. Step 2's test ("CWD matching exactly one stream ... verify they ARE auto-assigned") is now inverted: `attribution_leaves_an_unambiguous_working_directory_unassigned` asserts the opposite. Do not implement this task; see root `AGENTS.md`, "A folder is not a project".
+
 **Files:**
 - Modify: `crates/tt-cli/src/commands/ingest.rs` (function `auto_assign_events_to_streams`)
 

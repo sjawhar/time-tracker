@@ -1,0 +1,15 @@
+---
+source: crates/tt-cli/src/commands/ingest.rs
+expression: json
+---
+{
+  "id": "00000000-0000-0000-0000-000000000000:remote.tmux:tmux_pane_focus:2025-01-29T12:00:00.000Z:%3",
+  "timestamp": "2025-01-29T12:00:00.000Z",
+  "source": "remote.tmux",
+  "type": "tmux_pane_focus",
+  "cwd": "/home/user/project",
+  "session_id": "ses_0210f2ed2ffedhF4",
+  "pane_id": "%3",
+  "tmux_session": "dev",
+  "window_index": 2
+}

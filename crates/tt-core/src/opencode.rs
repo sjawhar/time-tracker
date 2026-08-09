@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags, params};
 
 use crate::session::{
-    AgentSession, MAX_USER_MESSAGE_TIMESTAMPS, MAX_USER_PROMPTS, SessionError, SessionSource,
-    SessionType, extract_project_name, truncate_prompt,
+    AgentSession, MAX_USER_MESSAGE_TIMESTAMPS, MAX_USER_PROMPTS, ScanOutcome, SessionError,
+    SessionSource, SessionType, extract_project_name, truncate_prompt,
 };
 
 const MAX_TOOL_CALL_TIMESTAMPS: usize = 5000;
@@ -18,17 +18,34 @@ fn unix_ms_to_datetime(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
+/// What a lookup for a session's per-session message/part shard found.
+enum SessionShard {
+    /// The shard opened and carries the message schema.
+    Ready(Connection),
+    /// The shard file exists and is a valid `SQLite` database, but holds no
+    /// `message` table: the session was aborted before anything was written to
+    /// it. Two of 321 local shards and 31 of 7,637 on devbox are in this state.
+    /// Falling back to the monolith here would index a phantom zero-message
+    /// session, so the caller skips it instead.
+    Empty,
+    /// No shard on disk, or it could not be read. Use the monolithic connection.
+    Absent,
+}
+
 /// Open a read-only connection to the per-session message/part shard if it exists.
 ///
 /// The user's `OpenCode` fork shards messages and parts out of the monolithic
 /// `opencode.db` into per-session `SQLite` files at `<sessions_dir>/<session_id>.db`.
-/// Returns `None` if `sessions_dir` is unknown, the shard file is missing, the shard
-/// fails to open, or the file isn't a valid `SQLite` database. Callers should fall
-/// back to the monolithic connection.
-fn open_session_shard(sessions_dir: Option<&Path>, session_id: &str) -> Option<Connection> {
-    let path = sessions_dir?.join(format!("{session_id}.db"));
+/// Returns `Absent` if `sessions_dir` is unknown, the shard file is missing, the
+/// shard fails to open, or the file isn't a valid `SQLite` database — callers should
+/// fall back to the monolithic connection.
+fn open_session_shard(sessions_dir: Option<&Path>, session_id: &str) -> SessionShard {
+    let Some(dir) = sessions_dir else {
+        return SessionShard::Absent;
+    };
+    let path = dir.join(format!("{session_id}.db"));
     if !path.exists() {
-        return None;
+        return SessionShard::Absent;
     }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     match Connection::open_with_flags(&path, flags) {
@@ -39,23 +56,29 @@ fn open_session_shard(sessions_dir: Option<&Path>, session_id: &str) -> Option<C
                     error = %err,
                     "failed to set OpenCode shard timeout"
                 );
-                return None;
+                return SessionShard::Absent;
             }
             // SQLite validates the file header lazily — a non-database file opens
-            // successfully but fails on first query. Probe sqlite_master so corrupt
-            // shards fall back to the monolithic connection instead of skipping the
-            // session entirely.
-            if let Err(err) = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
-                row.get::<_, i64>(0)
-            }) {
-                tracing::warn!(
-                    path = ?path,
-                    error = %err,
-                    "OpenCode session shard is not a valid SQLite database"
-                );
-                return None;
+            // successfully but fails on first query. Probing sqlite_master for the
+            // `message` table answers both questions in one read: a corrupt shard
+            // errors here and falls back to the monolithic connection, while a valid
+            // but never-written shard reports no table and is skipped as empty.
+            match conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message')",
+                [],
+                |row| row.get::<_, bool>(0),
+            ) {
+                Ok(true) => SessionShard::Ready(conn),
+                Ok(false) => SessionShard::Empty,
+                Err(err) => {
+                    tracing::warn!(
+                        path = ?path,
+                        error = %err,
+                        "OpenCode session shard is not a valid SQLite database"
+                    );
+                    SessionShard::Absent
+                }
             }
-            Some(conn)
         }
         Err(err) => {
             tracing::warn!(
@@ -63,7 +86,7 @@ fn open_session_shard(sessions_dir: Option<&Path>, session_id: &str) -> Option<C
                 error = %err,
                 "failed to open OpenCode session shard"
             );
-            None
+            SessionShard::Absent
         }
     }
 }
@@ -143,17 +166,38 @@ fn collect_session_rows(
 
 /// Scan `OpenCode` sessions from the monolithic database.
 ///
+/// Reads every session row unless `since` bounds it. Callers on the ~30s ingest path
+/// want [`scan_opencode_sessions_incremental`], which also reports whether the store
+/// could be read in full.
+pub fn scan_opencode_sessions(
+    db_path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<AgentSession>, SessionError> {
+    Ok(scan_opencode_sessions_incremental(db_path, since)?.sessions)
+}
+
+/// Scan `OpenCode` sessions, reporting whether the whole store could be read.
+///
 /// Session rows are read once, then `build_agent_session` runs across a rayon
 /// thread pool — sessions are independent and read-only, so a many-core host
 /// processes them in parallel rather than serially. Each worker reuses one
 /// read-only monolith connection (for sessions without a per-session shard)
 /// via `map_init`.
-pub fn scan_opencode_sessions(
+///
+/// Three conditions make the scan incomplete, and all three previously presented as
+/// an empty store: the monolith would not open, the session query failed, or a
+/// session row would not build. A caller advancing a scan cursor must not do so on
+/// any of them — see [`ScanOutcome`]. A session skipped as *empty* is expected and
+/// leaves the scan complete.
+pub fn scan_opencode_sessions_incremental(
     db_path: &Path,
     since: Option<DateTime<Utc>>,
-) -> Result<Vec<AgentSession>, SessionError> {
+) -> Result<ScanOutcome, SessionError> {
     let Some(conn) = open_monolith_ro(db_path) else {
-        return Ok(Vec::new());
+        return Ok(ScanOutcome {
+            sessions: Vec::new(),
+            complete: false,
+        });
     };
 
     let sessions_dir_buf = db_path.parent().map(|p| p.join("sessions"));
@@ -163,31 +207,84 @@ pub fn scan_opencode_sessions(
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(path = ?db_path, error = %err, "failed to query OpenCode sessions");
-            return Ok(Vec::new());
+            return Ok(ScanOutcome {
+                sessions: Vec::new(),
+                complete: false,
+            });
         }
     };
     drop(conn);
 
-    let mut sessions: Vec<AgentSession> = rows
+    let built: Vec<BuiltSession> = rows
         .into_par_iter()
         .map_init(
             || open_monolith_ro(db_path),
             |thread_conn, row| {
-                let conn = thread_conn.as_ref()?;
+                let Some(conn) = thread_conn.as_ref() else {
+                    // The row was read but never examined, so the scan did not
+                    // cover it.
+                    return BuiltSession::UNREADABLE;
+                };
+                let session_id = row.id.clone();
                 match build_agent_session(conn, sessions_dir, row) {
-                    Ok(session) => Some(session),
+                    Ok(session) => BuiltSession::yielded(session),
+                    Err(SessionError::EmptySession) => {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            "skipping empty OpenCode session"
+                        );
+                        BuiltSession::NOTHING_TO_INDEX
+                    }
                     Err(err) => {
-                        tracing::warn!(error = %err, "skipping invalid OpenCode session");
-                        None
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %err,
+                            "skipping invalid OpenCode session"
+                        );
+                        BuiltSession::DEFECTIVE
                     }
                 }
             },
         )
-        .flatten()
         .collect();
 
+    let complete = built.iter().all(|row| row.clean);
+    let mut sessions: Vec<AgentSession> = built.into_iter().filter_map(|b| b.session).collect();
+
     sessions.sort_by_key(|e| e.start_time);
-    Ok(sessions)
+    Ok(ScanOutcome { sessions, complete })
+}
+
+/// One session row's contribution to a scan.
+///
+/// `clean` is false only when the row could not be examined or would not build. A
+/// row skipped as empty is clean: an aborted session is an expected state, and
+/// treating it as a defect would hold the scan cursor still forever.
+struct BuiltSession {
+    session: Option<AgentSession>,
+    clean: bool,
+}
+
+impl BuiltSession {
+    const NOTHING_TO_INDEX: Self = Self {
+        session: None,
+        clean: true,
+    };
+    const DEFECTIVE: Self = Self {
+        session: None,
+        clean: false,
+    };
+    const UNREADABLE: Self = Self {
+        session: None,
+        clean: false,
+    };
+
+    const fn yielded(session: AgentSession) -> Self {
+        Self {
+            session: Some(session),
+            clean: true,
+        }
+    }
 }
 
 fn build_agent_session(
@@ -199,8 +296,12 @@ fn build_agent_session(
         return Err(SessionError::EmptySessionId);
     }
 
-    let shard_conn = open_session_shard(sessions_dir, &session_row.id);
-    let stats_conn = shard_conn.as_ref().unwrap_or(main_conn);
+    let shard = open_session_shard(sessions_dir, &session_row.id);
+    let stats_conn = match &shard {
+        SessionShard::Ready(conn) => conn,
+        SessionShard::Empty => return Err(SessionError::EmptySession),
+        SessionShard::Absent => main_conn,
+    };
     let message_stats = collect_message_stats(stats_conn, &session_row.id)?;
     let tool_call_timestamps = collect_tool_call_timestamps(stats_conn, &session_row.id)?;
     // Derive the tool-call count from the timestamps we already fetched. Only
@@ -408,7 +509,8 @@ fn collect_message_stats(
 }
 
 /// Fold a single grouped message into the running stats, mirroring the original
-/// per-message logic: messages without a valid role are ignored entirely.
+/// per-message logic: messages without a valid role are ignored entirely, and
+/// harness-injected text is not treated as a user message at all.
 fn flush_message(stats: &mut MessageStats, role: Option<&str>, created_ms: i64, texts: &[String]) {
     let Some(role) = role else {
         return;
@@ -416,8 +518,15 @@ fn flush_message(stats: &mut MessageStats, role: Option<&str>, created_ms: i64, 
     stats.last_message_time = Some(created_ms);
     match role {
         "user" => {
-            stats.user_message_count = stats.user_message_count.saturating_add(1);
             let text = texts.join("\n");
+            if crate::injection::is_injected(&text) {
+                // Injected text is the harness talking to the agent, not a
+                // person: it must not count as a message, a prompt, or a
+                // moment of attention. `last_message_time` still advanced —
+                // the session was alive, just unattended.
+                return;
+            }
+            stats.user_message_count = stats.user_message_count.saturating_add(1);
             if !text.is_empty() {
                 if stats.starting_prompt.is_none() {
                     stats.starting_prompt = Some(truncate_prompt(&text));
@@ -871,6 +980,98 @@ mod tests {
         assert_eq!(session.user_prompts, vec!["from monolithic"]);
     }
 
+    /// Given a shard file that was created but never written to (zero bytes),
+    /// When it is opened, Then it reports `Empty` — an aborted session, not a
+    /// failure worth warning about.
+    #[test]
+    fn test_zero_byte_shard_is_empty_not_absent() {
+        let temp = TempDir::new().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(sessions_dir.join("ses_aborted.db"), b"").unwrap();
+
+        let shard = open_session_shard(Some(&sessions_dir), "ses_aborted");
+        assert!(matches!(shard, SessionShard::Empty));
+    }
+
+    /// Given a shard that is a valid `SQLite` database carrying no tables (the
+    /// header-only shape an aborted session leaves behind), When it is opened,
+    /// Then it reports `Empty`.
+    #[test]
+    fn test_header_only_shard_is_empty_not_absent() {
+        let temp = TempDir::new().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let shard_path = sessions_dir.join("ses_headeronly.db");
+        // Creating and dropping a connection leaves a valid but table-less file.
+        Connection::open(&shard_path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0;")
+            .unwrap();
+
+        let shard = open_session_shard(Some(&sessions_dir), "ses_headeronly");
+        assert!(matches!(shard, SessionShard::Empty));
+    }
+
+    /// Given a shard file holding bytes that are not a `SQLite` database at all,
+    /// When it is opened, Then it reports `Absent` and never `Empty` — a genuine
+    /// failure on a non-empty file must keep warning and fall back.
+    #[test]
+    fn test_corrupt_shard_is_absent_not_empty() {
+        let temp = TempDir::new().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(sessions_dir.join("ses_corrupt.db"), b"not a sqlite db").unwrap();
+
+        let shard = open_session_shard(Some(&sessions_dir), "ses_corrupt");
+        assert!(matches!(shard, SessionShard::Absent));
+    }
+
+    /// Given a session whose shard was never written to, When sessions are
+    /// scanned, Then that session is skipped while its healthy neighbour is still
+    /// returned — an empty shard must not be back-filled from the monolith as a
+    /// phantom zero-message session.
+    #[test]
+    fn test_session_with_empty_shard_is_skipped_not_backfilled() {
+        let (temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_aborted",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_healthy",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_message(&db_path, "msg_u1", "ses_healthy", "user", 1_700_000_001_000);
+        insert_part(
+            &db_path,
+            "prt_u1",
+            "msg_u1",
+            "ses_healthy",
+            "text",
+            Some("real work"),
+            1_700_000_001_000,
+        );
+
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(sessions_dir.join("ses_aborted.db"), b"").unwrap();
+
+        let sessions = scan_opencode_sessions(&db_path, None).unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["ses_healthy"]);
+    }
+
     #[test]
     fn test_tool_call_timestamps_collected() {
         let (_temp, db_path) = create_test_db();
@@ -1183,6 +1384,101 @@ mod tests {
         let sessions = scan_opencode_sessions(&db_path, Some(since)).unwrap();
 
         assert_eq!(sessions.len(), 2);
+    }
+
+    /// Given a healthy store, When an incremental scan runs, Then it reports itself
+    /// complete so the caller may advance its cursor.
+    #[test]
+    fn opencode_incremental_healthy_store_is_complete() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_ok",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+
+        let outcome = scan_opencode_sessions_incremental(&db_path, None).unwrap();
+
+        assert_eq!(outcome.sessions.len(), 1);
+        assert!(outcome.complete);
+    }
+
+    /// Given a store that cannot be opened, When a scan runs, Then it reports itself
+    /// INCOMPLETE rather than empty.
+    ///
+    /// This is the defect a cursor turns into data loss. `scan_opencode_sessions`
+    /// answers an unopenable store with `Ok(vec![])`, which is indistinguishable from
+    /// "nothing changed"; advancing the cursor on it would skip that window of
+    /// sessions permanently.
+    #[test]
+    fn opencode_unreadable_store_is_incomplete_not_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("not-a-database.db");
+        std::fs::write(&db_path, b"this is not sqlite").unwrap();
+
+        let outcome = scan_opencode_sessions_incremental(&db_path, None).unwrap();
+
+        assert!(outcome.sessions.is_empty());
+        assert!(
+            !outcome.complete,
+            "an unreadable store must hold the cursor back"
+        );
+    }
+
+    /// Given a store whose `session` table is missing, When a scan runs, Then the
+    /// failed query is reported as incomplete rather than as an empty store.
+    #[test]
+    fn opencode_failed_query_is_incomplete_not_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("no-session-table.db");
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (id TEXT);")
+            .unwrap();
+
+        let outcome = scan_opencode_sessions_incremental(&db_path, None).unwrap();
+
+        assert!(outcome.sessions.is_empty());
+        assert!(!outcome.complete);
+    }
+
+    /// Given a cursor, When an incremental scan runs, Then only sessions updated
+    /// after it are returned, and the scan is still complete.
+    #[test]
+    fn opencode_incremental_filters_by_since() {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_before",
+            "/home/user/before",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_010_000,
+        );
+        insert_session(
+            &db_path,
+            "ses_after",
+            "/home/user/after",
+            "",
+            None,
+            1_700_000_020_000,
+            1_700_000_030_000,
+        );
+        let since = Utc
+            .timestamp_millis_opt(1_700_000_015_000)
+            .single()
+            .unwrap();
+
+        let outcome = scan_opencode_sessions_incremental(&db_path, Some(since)).unwrap();
+
+        assert_eq!(outcome.sessions.len(), 1);
+        assert_eq!(outcome.sessions[0].session_id, "ses_after");
+        assert!(outcome.complete);
     }
 
     #[test]
@@ -1578,5 +1874,130 @@ mod tests {
 
         let sessions = scan_opencode_sessions(&db_path, None).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    /// Builds a session whose user messages are exactly `texts`, one per minute.
+    fn session_with_user_texts(texts: &[&str]) -> AgentSession {
+        let (_temp, db_path) = create_test_db();
+        insert_session(
+            &db_path,
+            "ses_inject",
+            "/home/user/project",
+            "",
+            None,
+            1_700_000_000_000,
+            1_700_000_600_000,
+        );
+        for (i, text) in texts.iter().enumerate() {
+            let msg_id = format!("msg_u{i}");
+            let part_id = format!("prt_u{i}");
+            let created_ms = 1_700_000_000_000 + i64::try_from(i).unwrap() * 60_000;
+            insert_message(&db_path, &msg_id, "ses_inject", "user", created_ms);
+            insert_part(
+                &db_path,
+                &part_id,
+                &msg_id,
+                "ses_inject",
+                "text",
+                Some(text),
+                created_ms,
+            );
+        }
+        scan_opencode_sessions(&db_path, None)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_id == "ses_inject")
+            .expect("session should be scanned")
+    }
+
+    #[test]
+    fn test_system_reminder_message_produces_no_user_message_timestamp() {
+        let session = session_with_user_texts(&[
+            "<system-reminder>\n[BACKGROUND TASK COMPLETED]\n**ID:** `bg_f60bcb1c`",
+        ]);
+
+        assert!(session.user_message_timestamps.is_empty());
+        assert!(session.user_prompts.is_empty());
+        assert!(session.starting_prompt.is_none());
+        assert_eq!(session.message_count, 0);
+    }
+
+    #[test]
+    fn test_boulder_continuation_directive_produces_no_user_message_timestamp() {
+        let session = session_with_user_texts(&[
+            "[SYSTEM DIRECTIVE: OH-MY-OPENCODE - BOULDER CONTINUATION]\n\nContinue the plan.",
+        ]);
+
+        assert!(session.user_message_timestamps.is_empty());
+        assert!(session.user_prompts.is_empty());
+        assert_eq!(session.message_count, 0);
+    }
+
+    #[test]
+    fn test_skill_instruction_message_produces_a_user_message_timestamp() {
+        // Regression guard: real human intent must survive the denylist.
+        let session = session_with_user_texts(&[
+            "<skill-instruction>\nUse the using-jj skill for version control.",
+        ]);
+
+        assert_eq!(session.user_message_timestamps.len(), 1);
+        assert_eq!(session.user_prompts.len(), 1);
+        assert!(session.starting_prompt.is_some());
+    }
+
+    #[test]
+    fn test_mode_banner_messages_produce_user_message_timestamps() {
+        let session = session_with_user_texts(&[
+            "[analyze-mode]\nANALYSIS MODE. Gather context before diving deep.",
+            "[CONTEXT]\nWe are mid-refactor of the allocation algorithm.",
+            "[search-mode]\nMAXIMIZE SEARCH EFFORT.",
+        ]);
+
+        assert_eq!(session.user_message_timestamps.len(), 3);
+        assert_eq!(session.user_prompts.len(), 3);
+        assert_eq!(session.message_count, 3);
+    }
+
+    #[test]
+    fn test_session_of_only_injected_messages_has_no_user_message_timestamps() {
+        // Such a session carries no human attention at all, which is correct.
+        let session = session_with_user_texts(&[
+            "<system-reminder>\nbackground task finished",
+            "---\n\n[SYSTEM DIRECTIVE: OH-MY-OPENCODE - SINGLE TASK ONLY]\n\nProceed.",
+            "[NOTIFICATION from agent (reply-to: ses_abc)]\nstatus update",
+            "<local-command-caveat>Caveat: the messages below were generated",
+            "This session is being continued from a previous conversation.",
+        ]);
+
+        assert!(session.user_message_timestamps.is_empty());
+        assert!(session.user_prompts.is_empty());
+        assert!(session.starting_prompt.is_none());
+        assert_eq!(session.message_count, 0);
+    }
+
+    #[test]
+    fn test_starting_prompt_is_the_first_human_message_not_the_first_injection() {
+        let session = session_with_user_texts(&[
+            "<system-reminder>\nbackground task finished",
+            "actually fix the allocation bug",
+        ]);
+
+        assert_eq!(
+            session.starting_prompt.as_deref(),
+            Some("actually fix the allocation bug")
+        );
+        assert_eq!(session.user_message_timestamps.len(), 1);
+        assert_eq!(session.message_count, 1);
+    }
+
+    #[test]
+    fn test_injected_message_still_advances_session_end_time() {
+        // An injection proves the session was alive even though nobody was
+        // paying attention, so it must not shorten the session's lifetime.
+        let session =
+            session_with_user_texts(&["real work", "<system-reminder>\nbackground task finished"]);
+
+        assert_eq!(session.user_message_timestamps.len(), 1);
+        assert_eq!(session.end_time, unix_ms_to_datetime(1_700_000_600_000));
     }
 }

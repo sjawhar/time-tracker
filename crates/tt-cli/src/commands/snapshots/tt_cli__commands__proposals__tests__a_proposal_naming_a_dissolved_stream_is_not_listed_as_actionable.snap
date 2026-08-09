@@ -1,0 +1,15 @@
+---
+source: crates/tt-cli/src/commands/proposals.rs
+expression: "format_proposals(&db, timestamp() + chrono::Duration::hours(2)).unwrap()"
+---
+PROPOSALS
+
+Ordered by attention resolved: the user_message and focus events each would attribute.
+
+ID        Age   Attention  Scope       Proposed stream  Confidence  Reasoning
+--------  ----  ---------  ----------  ---------------  ----------  ---------
+12345678    2h          0  1 session   Existing stream         85%  Matches the active project.
+3542bdf0    2h          0  1 session   (gone) 0444082a         85%  The most appropriate existing stream is misc: scratch.
+
+1 marked (gone) name no existing stream id, so accepting one is impossible.
+They block nothing. Reject with a replacement to keep the attribution ('tt proposals reject <id> --stream <ref>'), or bare to leave the events unassigned ('tt proposals reject <id>').

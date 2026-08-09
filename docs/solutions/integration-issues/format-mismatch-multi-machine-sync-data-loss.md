@@ -18,6 +18,8 @@ related:
 
 # Multi-Machine Event Sync Silent Data Loss
 
+> **Partly superseded (2026-08-06).** Root cause 3 below, and its `auto_assign_events_to_streams` / `project_suffix` fix, describe cwd-based stream inference. **That pass has been removed** — a folder is not a project, and the pass had assigned 695,394 events on the assumption that it is. Do not re-add it or its suffix matching to repair cross-machine paths; see root `AGENTS.md`, "A folder is not a project". Root causes 1, 2, and 4–6 stand as written.
+
 ## Symptom
 
 `tt report --last-week` showed 120h total (50h direct). After fixing, it showed 262h total (77h direct). 142 hours of work from the remote machine (ngrok-remote) were silently dropped.
@@ -58,6 +60,8 @@ pub struct ExportEvent {
 Remote machine used `/home/sami/time-tracker/default`, local used `/home/ubuntu/time-tracker/default`. The `auto_assign_events_to_streams` function matched by exact cwd path.
 
 **Fix:** Added `project_suffix()` that strips `/home/<username>/` and matches by the remaining path. Tries exact match first, falls back to suffix match.
+
+> **Removed 2026-08-06.** Both `auto_assign_events_to_streams` and `project_suffix` are gone; the suffix map made a cwd match *more* streams, widening the same unsound rule. Cross-machine terminal activity is now attributed by `assign_terminal_focus`, which correlates against already-classified remote work instead of naming a directory.
 
 ```rust
 fn project_suffix(cwd: &str) -> Option<&str> {

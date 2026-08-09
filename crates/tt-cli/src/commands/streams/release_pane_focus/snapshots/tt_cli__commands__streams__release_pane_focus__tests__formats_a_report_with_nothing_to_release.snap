@@ -1,0 +1,13 @@
+---
+source: crates/tt-cli/src/commands/streams/release_pane_focus/tests.rs
+expression: "format_release(ReleaseOutcome\n{ released: 0, retained: 0, streams_affected: 0, },\nReleaseMode::Apply).unwrap()"
+---
+RELEASE PANE FOCUS
+
+Sessionless tmux pane focus, which no writer in this tree could have attributed.
+
+Released                 0
+Retained                 0  (assigned by a human — never touched)
+Streams affected         0
+
+Nothing to release — every pane focus is unattributed or legitimately placed.

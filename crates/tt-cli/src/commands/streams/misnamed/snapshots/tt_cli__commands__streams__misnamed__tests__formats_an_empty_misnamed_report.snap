@@ -1,0 +1,7 @@
+---
+source: crates/tt-cli/src/commands/streams/misnamed/tests.rs
+expression: "format_misnamed(&[]).unwrap()"
+---
+MISNAMED STREAMS
+
+Every existing stream name describes work.

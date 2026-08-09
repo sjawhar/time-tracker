@@ -117,6 +117,49 @@ fn test_ingest_different_panes_not_debounced() {
     );
 }
 
+/// An unusable `--pane-pid` must not cost the focus event.
+///
+/// The value arrives from tmux through a shell hook, and this lookup may never
+/// lose a focus event, so the argument is taken as text and parsed leniently
+/// rather than typed as a number clap would reject outright.
+#[test]
+fn an_unusable_pane_pid_still_records_the_focus_event() {
+    let temp = TempDir::new().unwrap();
+    init_machine(temp.path());
+    let data_dir = temp.path().join(".local/share/time-tracker");
+
+    // Every value tmux's `#{q:pane_pid}` could substitute that this cannot use: the
+    // format resolving to nothing, junk, and a number too large for a pid.
+    for (pane, pane_pid) in [("%1", ""), ("%2", "not-a-pid"), ("%3", "99999999999999")] {
+        let output = Command::new(tt_binary())
+            .env("HOME", temp.path())
+            .arg("ingest")
+            .arg("pane-focus")
+            .arg("--pane")
+            .arg(pane)
+            .arg("--cwd")
+            .arg("/project")
+            .arg("--session")
+            .arg("main")
+            .arg("--pane-pid")
+            .arg(pane_pid)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pane pid {pane_pid:?} must not fail the ingest: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let content = std::fs::read_to_string(data_dir.join("events.jsonl")).unwrap();
+    assert_eq!(
+        content.lines().count(),
+        3,
+        "every focus event is recorded regardless of the pane pid"
+    );
+}
+
 /// Test export is incremental (doesn't re-emit old events).
 #[test]
 fn test_export_incremental() {
@@ -576,99 +619,11 @@ fn test_readonly_events_file_error_handling() {
     fs::set_permissions(&events_file, perms).unwrap();
 }
 
-/// Test that `git_project` and `git_workspace` fields are preserved through import → context export.
-///
-/// This is a regression test for the case where we added fields to `StoredEvent` but forgot
-/// to add them to `EventExport` in the context command.
 #[test]
-fn test_context_exports_git_project_fields() {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    use tempfile::TempDir;
-
-    let temp = TempDir::new().unwrap();
-    let db_file = temp.path().join("tt.db");
-
-    let config_file = temp.path().join("config.toml");
-    std::fs::write(
-        &config_file,
-        format!(r#"database_path = "{}""#, db_file.display()),
-    )
-    .unwrap();
-
-    // Event with git_project and git_workspace fields
-    let event_with_git_fields = r#"{"id":"event-with-git","timestamp":"2025-01-29T12:00:00Z","source":"remote.tmux","type":"tmux_pane_focus","cwd":"/home/user/my-project/default","git_project":"my-project","git_workspace":"default","pane_id":"%1","tmux_session":"dev","data":{}}
-"#;
-
-    // Import the event
-    let mut child = Command::new(tt_binary())
-        .arg("--config")
-        .arg(&config_file)
-        .arg("import")
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(event_with_git_fields.as_bytes()).unwrap();
-    }
-
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "Import should succeed: {stderr}");
-
-    // Export via context command
-    let context_output = Command::new(tt_binary())
-        .arg("--config")
-        .arg(&config_file)
-        .arg("context")
-        .arg("--events")
-        .arg("--start")
-        .arg("2025-01-29T00:00:00Z")
-        .arg("--end")
-        .arg("2025-01-30T00:00:00Z")
-        .output()
-        .unwrap();
-
-    assert!(
-        context_output.status.success(),
-        "Context command should succeed: {}",
-        String::from_utf8_lossy(&context_output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&context_output.stdout);
-    let context: serde_json::Value =
-        serde_json::from_str(&stdout).expect("Context output should be valid JSON");
-
-    // Verify events array exists and has our event
-    let events = context["events"]
-        .as_array()
-        .expect("events should be an array");
-    assert_eq!(events.len(), 1, "Should have exactly one event");
-
-    let event = &events[0];
-
-    // Verify git_project and git_workspace are present in the export
-    assert_eq!(
-        event["git_project"].as_str(),
-        Some("my-project"),
-        "git_project should be exported in context"
-    );
-    assert_eq!(
-        event["git_workspace"].as_str(),
-        Some("default"),
-        "git_workspace should be exported in context"
-    );
-
-    // Also verify other fields are present
-    assert_eq!(event["cwd"].as_str(), Some("/home/user/my-project/default"));
-    assert_eq!(event["pane_id"].as_str(), Some("%1"));
-    assert_eq!(event["tmux_session"].as_str(), Some("dev"));
-}
-
-#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test exercises the core algorithm directly"
+)]
 fn test_delegated_time_from_agent_session_events() {
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::json;
@@ -681,6 +636,8 @@ fn test_delegated_time_from_agent_session_events() {
         id: "stream-1".to_string(),
         name: Some("test-stream".to_string()),
         slug: None,
+        description: None,
+        color: None,
         created_at: base,
         updated_at: base,
         time_direct_ms: 0,
@@ -766,6 +723,10 @@ fn test_delegated_time_from_agent_session_events() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end flow across six subcommands"
+)]
 fn e2e_todo_session_link_flow() {
     let temp = TempDir::new().unwrap();
     let database_path = temp.path().join("tt.db");
@@ -836,26 +797,46 @@ fn e2e_todo_session_link_flow() {
         String::from_utf8_lossy(&import_output.stderr)
     );
 
-    // When classify applies a session assignment to a slugged stream, it backfills the linked todo.
-    let classify_input = r#"{"streams":[{"name":"Watcher rewrite work","slug":"watcher-rewrite","tags":[]}],"assign_by_session":[{"session_id":"ses_e2e","stream":"watcher-rewrite"}]}"#;
-    let mut classify_child = configured_command(&config_path)
-        .args(["classify", "--apply", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // Given an existing slugged stream — the correction surface never creates one.
+    for args in [
+        vec!["streams", "create", "Watcher rewrite work"],
+        vec!["streams", "slug", "Watcher rewrite work", "watcher-rewrite"],
+    ] {
+        let output = configured_command(&config_path)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?} should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // When a human assigns the linked session to it, the linked todo is backfilled.
+    let assign_output = configured_command(&config_path)
+        .args([
+            "streams",
+            "assign",
+            "watcher-rewrite",
+            "--session",
+            "ses_e2e",
+        ])
+        .output()
         .unwrap();
-    write_stdin(&mut classify_child, classify_input);
-    let classify_output = classify_child.wait_with_output().unwrap();
-    let classify_stdout = String::from_utf8_lossy(&classify_output.stdout);
-    let classify_stderr = String::from_utf8_lossy(&classify_output.stderr);
+    let assign_stdout = String::from_utf8_lossy(&assign_output.stdout);
     assert!(
-        classify_output.status.success(),
-        "classify apply should succeed: {classify_stderr}"
+        assign_output.status.success(),
+        "streams assign should succeed: {}",
+        String::from_utf8_lossy(&assign_output.stderr)
     );
     assert!(
-        classify_stdout.contains(&format!("Backfilled stream 'watcher-rewrite' → {todo_id}")),
-        "classify should report the todo backfill: {classify_stdout}"
+        assign_stdout.contains("as a user assignment"),
+        "a human's correction is recorded as a user assignment: {assign_stdout}"
+    );
+    assert!(
+        assign_stdout.contains(&format!("Backfilled stream 'watcher-rewrite' → {todo_id}")),
+        "streams assign should report the todo backfill: {assign_stdout}"
     );
 
     let todos_after_backfill = std::fs::read_to_string(&todos_path).unwrap();

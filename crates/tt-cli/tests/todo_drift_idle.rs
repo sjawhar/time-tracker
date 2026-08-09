@@ -35,17 +35,20 @@ fn write_alpha_priority(store: &Path) {
 }
 
 #[test]
-fn todo_drift_errors_on_unresolved_stream_link() {
+fn todo_drift_skips_an_unresolved_stream_link_and_names_it() {
+    // Given: streams.md links one stream that exists and one that has been dissolved.
     let temp = TempDir::new().unwrap();
     let (config, db_path, store) = write_config(&temp);
     write_alpha_priority(&store);
     std::fs::write(
         store.join("streams.md"),
-        "- Missing Stream <!-- tt-stream:{\"priority\":\"alpha\"} -->\n",
+        "- Idle Stream <!-- tt-stream:{\"priority\":\"alpha\"} -->\n\
+         - Missing Stream <!-- tt-stream:{\"priority\":\"alpha\"} -->\n",
     )
     .unwrap();
-    let _db = Database::open(&db_path).unwrap();
+    insert_stream(&Database::open(&db_path).unwrap());
 
+    // When: drift is computed over both links.
     let output = Command::new(tt_binary())
         .arg("--config")
         .arg(&config)
@@ -53,8 +56,17 @@ fn todo_drift_errors_on_unresolved_stream_link() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown stream"));
+    // Then: the run succeeds — one stale hand-edited line must not take the report down —
+    // and the dangling link is named on both the report and stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["dangling_stream_links"],
+        json!(["Missing Stream"]),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Missing Stream"), "{stderr}");
 }
 
 #[test]
@@ -102,6 +114,8 @@ fn insert_stream(db: &Database) {
         id: "idle".to_string(),
         name: Some("Idle Stream".to_string()),
         slug: None,
+        description: None,
+        color: None,
         created_at: now,
         updated_at: now,
         time_direct_ms: 0,

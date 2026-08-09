@@ -33,6 +33,7 @@ when the session gets classified.
 tt todo next [--top N --quick --json --by-priority --later]
 tt todo ls
 tt todo add "<text>" [--priority <slug>...] [--stream <slug>] [--due <date>] [--when <date>] [--quick] [--pin]
+tt todo stream <todo-id> <stream-ref>|--clear   # set/clear the stream an EXISTING todo serves
 tt todo link <todo-id> [--session <id>]
 tt todo unlink <todo-id> [--session <id>]
 tt todo done <id>
@@ -57,7 +58,8 @@ tt streams link <stream-slug> <priority-slug>
 - Priorities have a user-set scalar importance `value`.
 - Todos link to priorities directly with `--priority` or indirectly through a stream linked by `tt streams link`.
 - Streams are referenced by SLUG (short kebab-case identity), never by display name. A stream needs a slug (`tt streams slug`) before todos or priority links can reference it. Todo `stream` fields are backfilled automatically when a linked session gets classified.
-- `tt todo drift` compares priority importance against tracked time in two lenses: direct-only and direct+delegated. Unlinked stream time appears as unattributed work.
+- **Setting a todo's stream after it exists is `tt todo stream`.** `tt todo add --stream` only covers a todo that does not exist yet, and `tt todo link` merely *applies* a stream the todo already names to an agent session — neither can change the field, which is why 3% of todos carried a stream and `tt status` printed `(top todo has no stream link)` permanently. That link is the middle term of alignment: without it `/api/status` returns `aligned: null` and the panel answering *am I working on the right thing* stays inert. The reference may be an id, slug, or exact name; the resolved stream's **slug** is what gets stored, since that is what reads it back. A stream with no slug is refused rather than given one, and a reference matching nothing is reported, never minted.
+- `tt todo drift` compares priority importance against **direct** time — the attention share — and reports delegated time and the leverage ratio (`delegated ÷ direct`) beside it. It deliberately does **not** show a share of `direct + delegated`: those have no shared denominator, so a percentage of their sum equates one human hour with one agent hour. Unlinked stream time appears as unattributed work.
 - Dates are system-local calendar days. `when:` hides a todo until that day; `due:` appears in the Due section and overrides `when:`.
 
 ## Conflict Files

@@ -12,11 +12,12 @@ Report output format for the Time Tracker CLI. This document is the authoritativ
 | `tt report --last-week` | Previous week | Most common for timesheets |
 | `tt report --day` | Today | Quick status check |
 | `tt report --last-day` | Yesterday | End-of-day review |
+| `tt report --start <d> --end <d>` | Custom range (local dates, `--end` exclusive) | Arbitrary spans |
+| `tt report --weeks <n>` | The `n` most recent weeks, newest first | Trend review |
 
 ### Post-MVP
 
 - Monthly/quarterly aggregation
-- Custom date ranges (`--from`, `--to`)
 - Daily breakdown within weekly reports (for daily timesheets)
 
 ---
@@ -25,22 +26,39 @@ Report output format for the Time Tracker CLI. This document is the authoritativ
 
 ### Structure
 
+Every human-readable section answers one question: **where did the user's own attention go?** Direct time is therefore the primary axis — sections are ordered by it, bars are scaled to it, and it is the figure on each row. Delegated agent time trails each row as a subordinate `+` figure so leverage stays visible without competing for the eye.
+
 Reports follow a consistent structure:
 
 ```
 TIME REPORT: <period description>
 
+BY STREAM
+─────────
+<column labels>
+<stream rows, most direct time first...>
+<zero-direct tail, if any>
+<(unassigned) row, if any>
+
+  Tip: <one actionable next step>
+
 BY TAG
 ──────
-<tag entries...>
+<column labels>
+<tag rows, most direct time first...>
+<zero-direct tail, if any>
+<(untagged) row, if any>
 
-(untagged)
-<untagged entries...>
+AGENT SESSIONS
+──────────────
+<session roll-up...>
 
 SUMMARY
 ───────
 <totals...>
 ```
+
+BY STREAM comes first because streams are the finest-grained answer to the attention question. BY TAG rolls the same direct time up along the tag dimensions.
 
 ### Duration Formatting
 
@@ -50,106 +68,117 @@ SUMMARY
 | < 1 hour | `Xm` | `45m` |
 | 0 | `0m` | `0m` |
 
-Seconds are dropped (floor to minutes). Sub-minute durations display as `0m`.
+Seconds are dropped (floor to minutes). Sub-minute durations display as `0m` — **except inside a BY STREAM or BY TAG row**, where they display as `<1m`. Flooring them there would print `0m` beside a filled bar cell and read as a rendering bug; `0m` in a row means genuinely no time, and pairs with an empty bar.
 
 **Very long durations**: Use hours regardless of length (e.g., `168h 0m` for a full week). No conversion to days.
 
-### Progress Bars
+### Row Layout
 
-Progress bars visualize relative time spent. Fixed width: 10 characters.
+Every row in BY STREAM and BY TAG uses the same columns, so figures line up vertically across sections:
 
 ```
-████████░░  (80%)
+<label:46><direct:>8>  <bar:10>  <delegated:>10>
+```
+
+That is 78 columns, fitting an 80-column terminal. Each section prints the column labels once, right-aligned over the figures they name:
+
+```
+                                                Direct               Delegated
+43a092  workorder-5: cross-model eval           10h 54m  ██████████   +126h 4m
+```
+
+Stream rows spend their first six columns on the short stream id, which is what other commands take as an argument (`tt tag 43a092 <project>`). Labels longer than their column are truncated with `…`.
+
+Delegated time carries a `+` prefix, reading as "on top of" the direct figure. It is **omitted entirely when zero**: an empty column is the strongest available signal that it is secondary to what the row is about.
+
+### Progress Bars
+
+Progress bars visualize relative **direct** time. Fixed width: 10 characters.
+
+```
+████████░░  (80% of the section's largest direct time)
 █████░░░░░  (50%)
 ██░░░░░░░░  (20%)
 ```
 
-The maximum includes **all entries** (tagged and untagged). The longest total duration gets a full bar; others are proportional.
+The maximum is computed **per section**, over that section's rows plus its leftover bucket (`(unassigned)` for BY STREAM, `(untagged)` for BY TAG). Bars are therefore relative within a section, and the largest direct time in each section gets a full bar.
 
-Tags with <5% of the maximum get a single `█` to remain visible. The 5% threshold is strict (`< 5%`, not `<= 5%`).
+Scaling to `direct + delegated` is a bug, not a nicety: a stream with 6 minutes of attention and 200 hours of agent time would own the chart and answer the wrong question.
 
-**Edge case**: If all entries have 0 time (shouldn't happen, but defensively), skip progress bars entirely.
+Rows with <5% of the maximum get a single `█` to remain visible. The 5% threshold is strict (`< 5%`, not `<= 5%`). Rows with exactly zero direct time get an empty bar — no minimum block.
 
-### Tag Entries
+### Rows Without Direct Time
 
-Each tagged group shows:
-
-```
-<tag>                                     <total>  <bar>
-  Direct:    <direct time>
-  Delegated: <delegated time>
-```
-
-Example:
+Rows whose direct time is zero collapse into a single tail line at the end of their section's row list:
 
 ```
-acme-webapp                               6h 45m  ████████░░
-  Direct:    2h 45m
-  Delegated: 4h 00m
-
-internal                                  2h 30m  ███░░░░░░░
-  Direct:    1h 30m
-  Delegated: 1h 00m
+  (+ 8 streams with no direct time, 143h 2m delegated)
 ```
 
-**Blank lines** separate tag entries for scannability when there are 3+ tags.
+They are summarised rather than deleted, because their delegated time is real work the SUMMARY still counts — dropping it would hide the leverage signal. They are summarised rather than listed, because they answer the attention question with silence and would crowd out the rows that answer it. `tt streams list` shows them individually.
 
-### Untagged Section
+### Leftover Buckets
 
-Untagged streams appear in a special section with stream IDs and a hint:
+Two pseudo-rows carry activity that fits no real row. Each appears only when it has some time, and each uses the ordinary row layout, so its direct time is the headline figure.
 
-```
-(untagged)                                1h 15m  █░░░░░░░░░
-  Direct:    45m
-  Delegated: 30m
-  Sessions:
-    abc123  tmux/dev/session-2        (45m)
-    def789  tmux/staging/session-1    (30m)
-
-  Tip: Run 'tt tag abc123 <project>' to assign
-```
-
-**Truncation**: If there are more than 5 untagged sessions, truncate with a count:
+`(unassigned)` closes BY STREAM: activity attributed to no stream at all. It stays a visible row of its own even when its direct time is zero, because unattributed *direct* time is the signal that classification has fallen behind.
 
 ```
-  Sessions:
-    abc123  tmux/dev/session-2        (45m)
-    def789  tmux/staging/session-1    (30m)
-    ghi012  tmux/dev/session-3        (20m)
-    ... and 12 more
-
-  Tip: Run 'tt streams --untagged' to see all
+(unassigned)                                       30m  ██░░░░░░░░   +19h 50m
+  Not assigned to any stream. Run 'tt classify' to attribute this time.
 ```
+
+`(untagged)` closes BY TAG: streams carrying no tag.
+
+```
+(untagged)                                      2h 45m  ██████████    +1h 45m
+```
+
+### Tip Line
+
+BY STREAM closes with at most one actionable tip:
+
+| Condition | Tip |
+|-----------|-----|
+| Some rows were folded into the zero-direct tail | `Run 'tt streams list' to see all` |
+| Otherwise, some listed stream has no tag | `Run 'tt tag <id> <project>' to assign` |
+| Otherwise | (no tip) |
+
+The tag tip names the highest-direct **untagged** stream: suggesting `tt tag` for an already-tagged stream would be a no-op.
 
 ### Summary Section
 
 ```
 SUMMARY
 ───────
-Total tracked:  10h 30m
-Direct time:    5h 00m (48%)
-Delegated time: 5h 30m (52%)
+Wall clock:      6h 45m
+Direct time:     5h 00m
+Delegated time:  5h 30m
+Leverage:        1.1x
 ```
 
-**Percentages**: Only shown when total time ≥ 30 minutes. Below that threshold, percentages suggest false precision:
+This block is the one place direct and delegated time are meant to be compared side by side, so it reports both plus the ratio. Elsewhere direct time leads.
+
+**Leverage** is the delegation ratio (delegated ÷ direct). It is reported as `n/a` when there is no direct time to divide by — a stretch of pure agent execution has no attention to leverage:
 
 ```
 SUMMARY
 ───────
-Total tracked:  15m
-Direct time:    10m
-Delegated time: 5m
+Wall clock:      15m
+Direct time:     0m
+Delegated time:  15m
+Leverage:        n/a
 ```
 
 ### Multi-Tag Streams
 
-When a stream has multiple tags (e.g., `[acme-webapp, urgent]`), time appears under **both** tags in BY TAG. The SUMMARY totals are de-duplicated—each stream's time is counted once regardless of tag count.
+When a stream has multiple tags (e.g., `[acme-webapp, urgent]`), its time appears under **both** tags in BY TAG. The SUMMARY totals are de-duplicated — each stream's time is counted once regardless of tag count.
 
 Example: A stream with 1h direct time tagged `[acme-webapp, urgent]`:
-- BY TAG: `acme-webapp` shows 1h, `urgent` shows 1h
+- BY TAG: `acme-webapp` shows 1h direct, `urgent` shows 1h direct
 - SUMMARY: Total direct is 1h (not 2h)
 
-**Note for users**: If you add up the BY TAG durations, the sum may exceed the SUMMARY total. This is because multi-tagged streams appear under each tag. The SUMMARY always shows accurate totals.
+**Note for users**: If you add up the BY TAG figures, the sum may exceed the SUMMARY total, because multi-tagged streams appear under each tag. The SUMMARY always shows accurate totals. BY STREAM never double-counts — each stream is one row.
 
 ---
 
@@ -180,24 +209,30 @@ When events exist but no tags are assigned:
 ```
 TIME REPORT: Week of Jan 27, 2025
 
-BY TAG
-──────
-(no tagged streams)
-
-(untagged)                                3h 15m  ██████████
-  Direct:    2h 00m
-  Delegated: 1h 15m
-  Sessions:
-    abc123  tmux/dev/session-1        (2h 00m)
-    def456  tmux/dev/session-2        (1h 15m)
+BY STREAM
+─────────
+                                                Direct               Delegated
+abc123  tmux/dev/session-1                       2h 0m  ██████████     +1h 15m
+def456  tmux/dev/session-2                         45m  ████░░░░░░        +30m
 
   Tip: Run 'tt tag abc123 <project>' to assign
 
+BY TAG
+──────
+(no tagged streams)
+                                                Direct               Delegated
+(untagged)                                      2h 45m  ██████████     +1h 45m
+
+AGENT SESSIONS
+──────────────
+No agent sessions recorded.
+
 SUMMARY
 ───────
-Total tracked:  3h 15m
-Direct time:    2h 00m (62%)
-Delegated time: 1h 15m (38%)
+Wall clock:      3h 0m
+Direct time:     2h 45m
+Delegated time:  1h 45m
+Leverage:        0.6x
 ```
 
 ### Single Stream
@@ -206,7 +241,13 @@ Report displays normally even with a single stream. No special handling needed.
 
 ### Zero-Time Entries
 
-Streams with 0 direct and 0 delegated time are excluded from reports. This can happen if a stream has only agent events that don't count toward time.
+Streams with 0 direct and 0 delegated time are excluded from reports entirely. This can happen if a stream has only agent events that don't count toward time.
+
+Streams with 0 direct but some delegated time are **not** excluded — they collapse into the zero-direct tail line described above, so their delegated time still reconciles with the SUMMARY.
+
+### No Direct Time At All
+
+A period of pure agent execution renders BY STREAM as just its tail line, and SUMMARY reports `Leverage: n/a`. That is the honest answer to "where did my attention go": nowhere.
 
 ---
 
@@ -220,35 +261,26 @@ Streams with 0 direct and 0 delegated time are excluded from reports. This can h
 
 **DST transitions**: During daylight saving transitions, the week may have 167 or 169 hours. Boundaries are based on wall clock time (what the user's clock shows), not duration.
 
-### Stream Attribution (MVP)
+### Stream Attribution
 
-For MVP, streams are attributed to a period based on `last_event_at`:
+Time is computed per period from the events inside it, not from a stream's cumulative totals: `generate_report_data` runs the allocation algorithm over `[period_start, period_end)`. A stream that spans a period boundary therefore contributes only the slice of its time that falls inside the period, and each period's figures stand alone.
 
-- If `last_event_at` falls within the period, the entire stream's time is included
-- This is a simplification; event-level time slicing is deferred to post-MVP
+The `end` bound is exclusive: an event at exactly `period_end` belongs to the next period.
 
-**Limitation**: A stream spanning Sunday-Monday will be attributed entirely to whichever period contains its last event. This means:
-- Users reviewing last week's report on Monday morning may see incomplete data
-- Weekly timesheets filled out on Monday should use `--last-week` after syncing
-
-For streams that span the period boundary, the report shows a note:
-
-```
-Note: 1 stream spans this period boundary. Run 'tt streams --date <date>' for details.
-```
+The cumulative `streams.time_direct_ms` / `time_delegated_ms` columns that `tt streams` prints are a different thing entirely — they are refreshed only by `tt recompute` and are never read by `tt report`.
 
 ---
 
 ## Terminal Width
 
-**Minimum width**: 80 characters
+**Minimum width**: 80 characters. Rows are laid out to 78 columns, so a standard terminal never wraps them.
 
 **Graceful degradation** (< 80 chars):
-1. Truncate tag names with `…` (minimum 10 chars shown)
+1. Truncate labels with `…` (minimum 10 chars shown)
 2. Use narrower progress bars (5 chars) before dropping entirely
 3. Align durations right
 
-**Non-ASCII**: Tag names with emoji or CJK characters may cause alignment issues. Implementation should use Unicode-aware width calculation (wcwidth).
+**Non-ASCII**: labels with emoji or CJK characters may cause alignment issues. Truncation counts characters, not display cells, so a wide-character label can still overflow its column. Fixing this needs a wcwidth dependency the CLI does not currently carry.
 
 Reports are always readable, though less visually polished in narrow terminals.
 
@@ -256,7 +288,7 @@ Reports are always readable, though less visually polished in narrow terminals.
 
 ## JSON Output
 
-Machine-readable output via `--json` flag. Uses a report-centric schema mirroring the human-readable structure.
+Machine-readable output via `--json` flag. This shape is consumed by other tooling, so it is a contract: fields may be added, never renamed or removed. In particular, the JSON is **not** reordered or trimmed to match the human-readable rendering — `streams` is already sorted by `time_direct_ms` descending, and every stream with any time appears, including those with no direct time.
 
 ### Schema
 
@@ -264,6 +296,7 @@ Machine-readable output via `--json` flag. Uses a report-centric schema mirrorin
 {
   "generated_at": "2025-01-29T16:00:00Z",
   "timezone": "America/Los_Angeles",
+  "week_start_day": "monday",
   "period": {
     "start": "2025-01-27",
     "end": "2025-02-02",
@@ -283,15 +316,40 @@ Machine-readable output via `--json` flag. Uses a report-centric schema mirrorin
       "streams": ["def456"]
     }
   ],
+  "streams": [
+    {
+      "id": "abc123",
+      "name": "acme-webapp: auth rewrite",
+      "time_direct_ms": 9900000,
+      "time_delegated_ms": 14400000,
+      "tags": ["acme-webapp"]
+    }
+  ],
   "untagged": {
     "time_direct_ms": 2700000,
     "time_delegated_ms": 1800000,
     "streams": ["jkl012", "mno345"]
   },
+  "agent_sessions": {
+    "total": 2,
+    "by_source": { "claude": 1, "opencode": 1 },
+    "by_type": { "user": 1, "subagent": 1 },
+    "top_sessions": [
+      {
+        "session_id": "session-1",
+        "source": "claude",
+        "type": "user",
+        "duration_ms": 1800000,
+        "starting_prompt": "Fix the auth bug"
+      }
+    ]
+  },
   "totals": {
     "time_direct_ms": 18000000,
     "time_delegated_ms": 19800000,
-    "stream_count": 4
+    "stream_count": 4,
+    "unassigned_direct_ms": 0,
+    "unassigned_delegated_ms": 3600000
   }
 }
 ```
@@ -305,16 +363,26 @@ Machine-readable output via `--json` flag. Uses a report-centric schema mirrorin
 | `period.start` | ISO date | First day of period (inclusive) |
 | `period.end` | ISO date | Last day of period (inclusive) |
 | `period.type` | string | `"week"` or `"day"` |
+| `week_start_day` | string | Day the week boundary falls on (always `"monday"`) |
 | `by_tag[].tag` | string | Tag name |
 | `by_tag[].time_direct_ms` | integer | Direct time in milliseconds |
 | `by_tag[].time_delegated_ms` | integer | Delegated time in milliseconds |
 | `by_tag[].streams` | string[] | Stream IDs with this tag |
+| `streams[]` | object[] | Every stream with any time, sorted by `time_direct_ms` descending |
+| `streams[].id` / `.name` | string / string\|null | Stream id and display name |
+| `streams[].time_direct_ms` / `.time_delegated_ms` | integer | Per-stream time in milliseconds |
+| `streams[].tags` | string[] | Sorted tags on this stream |
 | `untagged.time_direct_ms` | integer | Direct time for untagged streams |
 | `untagged.time_delegated_ms` | integer | Delegated time for untagged streams |
 | `untagged.streams` | string[] | Stream IDs without tags |
+| `agent_sessions.total` | integer | Agent sessions overlapping the period |
+| `agent_sessions.by_source` / `.by_type` | object | Session counts keyed by source / type |
+| `agent_sessions.top_sessions` | object[] | Five longest sessions, prompts truncated to 100 bytes |
 | `totals.time_direct_ms` | integer | De-duplicated total direct time |
 | `totals.time_delegated_ms` | integer | De-duplicated total delegated time |
 | `totals.stream_count` | integer | Number of unique streams in period |
+| `totals.unassigned_direct_ms` | integer | Direct time on activity with no stream (subset of `totals.time_direct_ms`) |
+| `totals.unassigned_delegated_ms` | integer | Delegated time on activity with no stream (subset of `totals.time_delegated_ms`) |
 
 **Important for consumers**: Do not sum `by_tag[].time_direct_ms` to calculate totals. Multi-tagged streams appear under each tag, so the sum will exceed `totals.time_direct_ms`. Always use the `totals` field for accurate aggregates.
 
@@ -324,31 +392,41 @@ Machine-readable output via `--json` flag. Uses a report-centric schema mirrorin
 {
   "generated_at": "2025-01-29T16:00:00Z",
   "timezone": "America/Los_Angeles",
+  "week_start_day": "monday",
   "period": {
     "start": "2025-01-27",
     "end": "2025-02-02",
     "type": "week"
   },
   "by_tag": [],
+  "streams": [],
   "untagged": {
     "time_direct_ms": 0,
     "time_delegated_ms": 0,
     "streams": []
   },
+  "agent_sessions": {
+    "total": 0,
+    "by_source": {},
+    "by_type": {},
+    "top_sessions": []
+  },
   "totals": {
     "time_direct_ms": 0,
     "time_delegated_ms": 0,
-    "stream_count": 0
+    "stream_count": 0,
+    "unassigned_direct_ms": 0,
+    "unassigned_delegated_ms": 0
   }
 }
 ```
 
 ### Null Handling
 
-- `by_tag` is always an array (empty `[]` if no tagged streams)
-- `untagged` is always an object (never null)
+- `by_tag` and `streams` are always arrays (empty `[]` when there is nothing to report)
+- `untagged`, `agent_sessions`, and `totals` are always objects (never null)
 - `untagged.streams` is always an array (empty `[]` if all tagged)
-- Stream IDs are never null or empty strings
+- Stream IDs are never null or empty strings; `streams[].name` may be null for an unnamed stream
 
 ---
 
@@ -359,47 +437,65 @@ Machine-readable output via `--json` flag. Uses a report-centric schema mirrorin
 ```
 TIME REPORT: Week of Jan 27, 2025
 
+BY STREAM
+─────────
+                                                Direct               Delegated
+abc123  acme-webapp: auth rewrite               2h 45m  ██████████     +4h 0m
+def456  internal: hiring + planning             1h 30m  █████░░░░░     +1h 0m
+ghi789  acme-webapp: perf regression hunt          45m  ███░░░░░░░       +30m
+  (+ 3 streams with no direct time, 22h 14m delegated)
+
+  Tip: Run 'tt streams list' to see all
+
 BY TAG
 ──────
-acme-webapp                               6h 45m  ████████░░
-  Direct:    2h 45m
-  Delegated: 4h 00m
+                                                Direct               Delegated
+acme-webapp                                     3h 30m  ██████████    +4h 30m
+internal                                        1h 30m  ████░░░░░░     +1h 0m
 
-internal                                  2h 30m  ███░░░░░░░
-  Direct:    1h 30m
-  Delegated: 1h 00m
-
-(untagged)                                1h 15m  █░░░░░░░░░
-  Direct:    45m
-  Delegated: 30m
-  Sessions:
-    def789  tmux/staging/session-1    (1h 15m)
-
-  Tip: Run 'tt tag def789 <project>' to assign
+AGENT SESSIONS
+──────────────
+Total sessions: 41
+By source: claude=6, opencode=35
+By type: subagent=12, user=29
+Top sessions:
+  4b91c2  opencode/user   6h 12m  Rewrite the auth middleware to use the new session store
 
 SUMMARY
 ───────
-Total tracked:  10h 30m
-Direct time:    5h 00m (48%)
-Delegated time: 5h 30m (52%)
+Wall clock:      6h 45m
+Direct time:     5h 0m
+Delegated time:  27h 44m
+Leverage:        5.5x
 ```
+
+Read top to bottom, that says: five hours of attention went mostly to `acme-webapp`, and it moved roughly 28 machine-hours of work.
 
 ### Daily Report
 
 ```
 TIME REPORT: Wednesday, Jan 29, 2025
 
+BY STREAM
+─────────
+                                                Direct               Delegated
+abc123  acme-webapp: auth rewrite                1h 0m  ██████████    +1h 15m
+
 BY TAG
 ──────
-acme-webapp                               2h 15m  ██████████
-  Direct:    1h 00m
-  Delegated: 1h 15m
+                                                Direct               Delegated
+acme-webapp                                      1h 0m  ██████████    +1h 15m
+
+AGENT SESSIONS
+──────────────
+No agent sessions recorded.
 
 SUMMARY
 ───────
-Total tracked:  2h 15m
-Direct time:    1h 00m (44%)
-Delegated time: 1h 15m (56%)
+Wall clock:      1h 30m
+Direct time:     1h 0m
+Delegated time:  1h 15m
+Leverage:        1.2x
 ```
 
 ---
@@ -419,11 +515,9 @@ user@example.com,2024-01-15,09:00:00,2024-01-15,11:30:00,02:30:00,acme-webapp,Ac
 ### Features
 
 - `tt untag <stream> <tag>` — Remove tag from stream (noted as potentially needed earlier)
-- Custom date ranges (`tt report --from 2025-01-01 --to 2025-01-15`)
 - Monthly/quarterly aggregation
 - Daily breakdown within weekly report (hours per day for timesheet entry)
-- Stream-level detail in report output (which streams contributed to each tag)
-- Event-level time slicing for accurate cross-boundary attribution
+- Per-tag stream grouping in BY TAG (which streams contributed to each tag; BY STREAM lists them flat today)
 - `last_event_at` field in JSON stream objects for debugging attribution
 
 ---

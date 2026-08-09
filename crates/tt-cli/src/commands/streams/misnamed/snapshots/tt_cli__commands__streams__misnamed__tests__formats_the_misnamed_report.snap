@@ -1,0 +1,18 @@
+---
+source: crates/tt-cli/src/commands/streams/misnamed/tests.rs
+expression: format_misnamed(&sample_report()).unwrap()
+---
+MISNAMED STREAMS
+
+These names describe an activity, a date, or a leftover bucket rather than the work.
+
+Name                                          ID        Reason           Events    Direct
+────────────────────────────────────────────  ────────  ─────────────  ────────  ────────
+workorder-5: IPI envs + wo-005 (Jun14-20)     0f3a91c2  date_range         4347   12h 30m
+other: team coordination (Slack, work email)  a1b2c3d4  catch_all          1204    3h 30m
+other: shell / nav / transitional             beef1234  activity_type        88        0m
+
+Total: 3 streams, 5639 events, 16h 0m direct.
+Nothing was written. A date_range name is usually a real initiative bucketed into a week:
+strip the suffix with 'tt streams rename', then collapse the weeks with 'tt streams merge'.
+Only a name that never described work belongs in 'tt streams dissolve'.

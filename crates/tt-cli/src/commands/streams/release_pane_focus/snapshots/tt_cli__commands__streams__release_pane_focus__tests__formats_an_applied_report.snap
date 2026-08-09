@@ -1,0 +1,14 @@
+---
+source: crates/tt-cli/src/commands/streams/release_pane_focus/tests.rs
+expression: "format_release(sample(), ReleaseMode::Apply).unwrap()"
+---
+RELEASE PANE FOCUS
+
+Sessionless tmux pane focus, which no writer in this tree could have attributed.
+
+Released             47082
+Retained                 0  (assigned by a human — never touched)
+Streams affected       312
+
+No event row was deleted.
+Released events await re-attribution. Run 'tt recompute' to refresh stream totals.

@@ -1,6 +1,5 @@
 ---
-source: crates/tt-cli/src/commands/todo/render.rs
-assertion_line: 187
+source: crates/tt-cli/src/commands/todo/render/tests.rs
 expression: "next_output(&due_loaded, options())"
 ---
 TODO NEXT (2026-06-23)

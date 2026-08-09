@@ -48,6 +48,17 @@ dirs = "6.0"
 insta = "1.42"
 tempfile = "3.15"
 
+rig-core = "=0.40.0"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+futures-util = "0.3"
+schemars = "=1.0.4"
+# Only for the HTTP backend rig's client builder accepts: `ClientBuilder::timeout` to
+# bound a request, and `Error::is_timeout` to recognise what that bound produced. Pinned
+# to the same 0.13 rig resolves, so there is one reqwest in the graph and the error rig
+# boxes really is the type this crate downcasts to.
+reqwest = { version = "0.13", default-features = false }
+
 # Internal crates
 tt-core = { path = "crates/tt-core" }
 tt-db = { path = "crates/tt-db" }

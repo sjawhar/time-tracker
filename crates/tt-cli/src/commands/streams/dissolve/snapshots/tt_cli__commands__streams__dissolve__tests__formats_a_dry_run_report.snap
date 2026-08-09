@@ -1,0 +1,13 @@
+---
+source: crates/tt-cli/src/commands/streams/dissolve/tests.rs
+expression: "format_dissolved(&sample_report(), &[], DissolveMode::DryRun).unwrap()"
+---
+DISSOLVE (dry run — nothing written)
+
+Name                            ID        Released  Retained  Outcome
+──────────────────────────────  ────────  ────────  ────────  ────────────────
+misc: stragglers                0f3a91c2      4812         0  would be retired
+other: dev-env (dotfiles/se...  a1b2c3d4       120         7  would be kept
+
+Total: 4932 events would be released, 7 retained, 1 of 2 streams would be retired.
+Nothing was written. Re-run without --dry-run to apply.

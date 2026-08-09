@@ -32,6 +32,8 @@ fn insert_stream(db_path: &Path, fixture: StreamFixture<'_>) {
         id: fixture.id.to_string(),
         name: fixture.name.map(String::from),
         slug: fixture.slug.map(String::from),
+        description: None,
+        color: None,
         created_at: now,
         updated_at: now,
         time_direct_ms: 0,

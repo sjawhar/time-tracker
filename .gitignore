@@ -81,8 +81,13 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root. These come from the Python packaging template, but an
+# unanchored `lib/` matches ANY directory named lib at any depth, which silently
+# excluded crates/tt-server/web/src/lib/ (the whole dashboard frontend) from version
+# control AND made Tailwind's .gitignore-aware content scan skip those components, so
+# every utility class used in them compiled to nothing.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -331,3 +336,11 @@ $RECYCLE.BIN/
 
 ### Agent scratch / OhMyOpenCode tooling
 .omo/
+.superpowers/
+
+# Dashboard visual-QA screenshot outputs (regenerate: scripts/dashboard-screenshots.sh)
+.screenshots/
+
+### Node (web frontend lives in crates/tt-server/web/, which has its own .gitignore;
+### this root entry stops a stray `npm install` in the wrong cwd from staging thousands of files)
+node_modules/

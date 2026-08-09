@@ -95,6 +95,51 @@ pub fn run_unblock(config: &Config, id: &str) -> Result<()> {
     write_todos(config, &loaded.store.todos)
 }
 
+/// Sets or clears the stream a todo serves.
+///
+/// The alignment panel needs todo → stream → priority, and nothing could set the middle
+/// link on a todo that already existed, so it sat at 3% populated and `aligned` stayed
+/// null. This is the surface that sets it: the human names the todo and the stream, and
+/// nothing here infers either.
+///
+/// A reference matching no stream is reported rather than minted, the same discipline as
+/// `tt todo link`. Readers resolve `todo.stream` as a slug, so the resolved stream's slug
+/// is what lands in the file — a stream carrying none is refused rather than given one.
+pub fn run_set_stream(
+    config: &Config,
+    db: Option<&tt_db::Database>,
+    id: &str,
+    stream: Option<&str>,
+) -> Result<()> {
+    // Resolved before the store is loaded so an unresolvable reference never reaches a write.
+    let slug = stream
+        .map(|reference| resolve_stream_slug(db, reference))
+        .transpose()?;
+    let mut loaded = load_mutating(config)?;
+    let index = unique_todo_line_index(&loaded, id)?;
+    let TodoFileItem::Todo(todo) = &mut loaded.store.todos.items[index].item else {
+        bail!("todo '{id}' not found");
+    };
+    todo.stream = slug;
+    write_todos(config, &loaded.store.todos)
+}
+
+fn resolve_stream_slug(db: Option<&tt_db::Database>, reference: &str) -> Result<String> {
+    let db = db.context("setting a todo's stream requires the database")?;
+    let Some(stream) = db
+        .resolve_stream(reference)
+        .context("failed to look up stream")?
+    else {
+        bail!("no stream matching '{reference}'; see: tt streams list");
+    };
+    let Some(slug) = stream.slug else {
+        bail!(
+            "stream '{reference}' has no slug for a todo to reference; set one with: tt streams slug '{reference}' <slug>"
+        );
+    };
+    Ok(slug)
+}
+
 pub fn run_rank(config: &Config, options: &RankOptions) -> Result<()> {
     let mut loaded = load_mutating(config)?;
     validate_rank_target(options)?;
@@ -216,6 +261,8 @@ mod tests {
     use chrono::Utc;
     use tt_db::{Database, Stream};
 
+    use crate::todo_store::load_read_only;
+
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, Config) {
@@ -223,6 +270,7 @@ mod tests {
         let config = Config {
             database_path: temp.path().join("tt.db"),
             todo_store_path: temp.path().join("todo-store"),
+            ..Config::default()
         };
         (temp, config)
     }
@@ -239,12 +287,69 @@ mod tests {
         }
     }
 
+    fn fixture_with_todos(todos: &str) -> (tempfile::TempDir, Config) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = temp.path().join("todo-store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("todos.md"), todos).unwrap();
+        let config = Config {
+            database_path: temp.path().join("tt.db"),
+            todo_store_path: store,
+            ..Config::default()
+        };
+        (temp, config)
+    }
+
+    /// A store holding the todo under test beside content the command must not touch:
+    /// a heading, a second todo already naming a stream, and trailing prose.
+    fn store_fixture() -> String {
+        concat!(
+            "# Todos\n",
+            "\n",
+            "- [ ] Ship the alignment panel <!-- tt-todo:{\"id\":\"td_1\",\"priority\":[\"alignment\"],\"stream\":null,\"when\":\"2026-08-10\",\"due\":\"2026-08-12\",\"pin\":true,\"quick\":true,\"sessions\":[\"ses_a\"]} -->\n",
+            "- [ ] Second task <!-- tt-todo:{\"id\":\"td_2\",\"priority\":[],\"stream\":\"other\",\"when\":null,\"due\":null,\"pin\":false,\"quick\":false} -->\n",
+            "\n",
+            "Notes below the list.\n",
+        )
+        .to_string()
+    }
+
+    /// The same store with `td_1` linked; `td_2` is the only other stream field and
+    /// already carries a value, so the replacement can only reach the todo under test.
+    fn linked_store_fixture() -> String {
+        store_fixture().replace("\"stream\":null", "\"stream\":\"proj-x\"")
+    }
+
+    fn read_todos(config: &Config) -> String {
+        std::fs::read_to_string(config.todo_store_path.join("todos.md")).unwrap()
+    }
+
+    fn stream_of(config: &Config, id: &str) -> Option<String> {
+        let loaded = load_read_only(config).unwrap();
+        loaded
+            .store
+            .todos
+            .items
+            .iter()
+            .find_map(|line| match &line.item {
+                TodoFileItem::Todo(todo) if todo.id == id => Some(todo.stream.clone()),
+                TodoFileItem::Todo(_) | TodoFileItem::Raw(_) => None,
+            })
+            .unwrap()
+    }
+
     fn insert_stream(db: &Database, slug: &str) {
+        insert_stream_row(db, "stream-1", "Project X", Some(slug));
+    }
+
+    fn insert_stream_row(db: &Database, id: &str, name: &str, slug: Option<&str>) {
         let now = Utc::now();
         db.insert_stream(&Stream {
-            id: "stream-1".to_string(),
-            name: Some("Project X".to_string()),
-            slug: Some(slug.to_string()),
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            slug: slug.map(str::to_string),
+            description: None,
+            color: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -268,5 +373,94 @@ mod tests {
         assert!(err.to_string().contains("no stream with slug"));
 
         run_add(&config, None, add_options(None)).unwrap();
+    }
+
+    #[test]
+    fn set_stream_writes_the_slug_and_leaves_every_other_byte_alone() {
+        // Given: an unlinked todo, beside a heading, another todo and prose.
+        let (_temp, config) = fixture_with_todos(&store_fixture());
+        let db = Database::open_in_memory().unwrap();
+        insert_stream(&db, "proj-x");
+
+        // When: the todo is given a stream.
+        run_set_stream(&config, Some(&db), "td_1", Some("proj-x")).unwrap();
+
+        // Then: one field of one line changed and every other byte survived.
+        assert_eq!(read_todos(&config), linked_store_fixture());
+    }
+
+    #[test]
+    fn a_stream_named_by_id_or_display_name_still_writes_its_slug() {
+        // Given: a stream whose id and display name are neither of them what a todo
+        // references — readers resolve `todo.stream` as a slug.
+        for reference in ["stream-1", "Project X"] {
+            let (_temp, config) = fixture_with_todos(&store_fixture());
+            let db = Database::open_in_memory().unwrap();
+            insert_stream(&db, "proj-x");
+
+            // When: the stream is named by that reference.
+            run_set_stream(&config, Some(&db), "td_1", Some(reference)).unwrap();
+
+            // Then: the slug is what lands in the file.
+            assert_eq!(stream_of(&config, "td_1").as_deref(), Some("proj-x"));
+        }
+    }
+
+    #[test]
+    fn a_stream_reference_matching_nothing_errors_and_writes_nothing() {
+        // Given: a store and a reference no stream carries.
+        let (_temp, config) = fixture_with_todos(&store_fixture());
+        let db = Database::open_in_memory().unwrap();
+        insert_stream(&db, "proj-x");
+
+        // When: the todo is pointed at it.
+        let err = run_set_stream(&config, Some(&db), "td_1", Some("typo-slug")).unwrap_err();
+
+        // Then: the reference is named back, no stream is minted, the file is untouched.
+        assert!(err.to_string().contains("no stream matching 'typo-slug'"));
+        assert_eq!(db.get_streams().unwrap().len(), 1);
+        assert_eq!(read_todos(&config), store_fixture());
+    }
+
+    #[test]
+    fn a_stream_with_no_slug_is_refused_rather_than_given_one() {
+        // Given: a stream todos have no way to reference.
+        let (_temp, config) = fixture_with_todos(&store_fixture());
+        let db = Database::open_in_memory().unwrap();
+        insert_stream_row(&db, "stream-2", "Slugless", None);
+
+        // When: the todo is pointed at it.
+        let err = run_set_stream(&config, Some(&db), "td_1", Some("Slugless")).unwrap_err();
+
+        // Then: the command says so rather than inventing a slug.
+        assert!(err.to_string().contains("has no slug"));
+        assert_eq!(read_todos(&config), store_fixture());
+    }
+
+    #[test]
+    fn clearing_removes_the_stream_and_leaves_every_other_byte_alone() {
+        // Given: a linked todo.
+        let (_temp, config) = fixture_with_todos(&linked_store_fixture());
+
+        // When: the link is cleared, which needs no database.
+        run_set_stream(&config, None, "td_1", None).unwrap();
+
+        // Then: the file is back to exactly what it was before the link.
+        assert_eq!(read_todos(&config), store_fixture());
+    }
+
+    #[test]
+    fn an_unknown_todo_id_errors_without_writing() {
+        // Given: a store holding no such todo.
+        let (_temp, config) = fixture_with_todos(&store_fixture());
+        let db = Database::open_in_memory().unwrap();
+        insert_stream(&db, "proj-x");
+
+        // When: that id is named.
+        let err = run_set_stream(&config, Some(&db), "td_missing", Some("proj-x")).unwrap_err();
+
+        // Then: it is a clean error and the file is untouched.
+        assert!(err.to_string().contains("todo 'td_missing' not found"));
+        assert_eq!(read_todos(&config), store_fixture());
     }
 }

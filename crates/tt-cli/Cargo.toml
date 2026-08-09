@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tt-core.workspace = true
 tt-db.workspace = true
+tt-llm = { path = "../tt-llm" }
 
 clap.workspace = true
 serde.workspace = true

@@ -1,0 +1,13 @@
+---
+source: crates/tt-cli/src/commands/streams/release_pane_focus/tests.rs
+expression: "format_release(ReleaseOutcome\n{ released: 0, retained: 4, streams_affected: 0, },\nReleaseMode::DryRun).unwrap()"
+---
+RELEASE PANE FOCUS (dry run — nothing written)
+
+Sessionless tmux pane focus, which no writer in this tree could have attributed.
+
+Would release            0
+Retained                 4  (assigned by a human — never touched)
+Streams affected         0
+
+Nothing to release — every remaining candidate carries a human's assignment.

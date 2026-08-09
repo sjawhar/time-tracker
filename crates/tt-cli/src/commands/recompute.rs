@@ -6,9 +6,43 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use tt_core::{AllocationConfig, SessionType, allocate_time};
-use tt_db::Database;
+use chrono::{Duration, Utc};
+use tt_core::AllocationConfig;
+use tt_db::{Database, allocate_for_period};
+
+/// Zeroed totals for selected streams that produced no time at all.
+///
+/// `stream_times` comes from allocating over `events`, so a stream holding none never
+/// appears in it and was therefore never written — it kept whatever totals it last had.
+/// That is not a stale cache but a wrong one: releasing the cwd propagator's assignments
+/// left **138 event-less streams still asserting 248h of direct and 1,633h of delegated
+/// time** between them, `cybertasks: DPI sprint` alone claiming 28h direct and 203h
+/// delegated while holding zero events. `tt recompute` is the only writer of those two
+/// columns, so making them true is precisely its job.
+///
+/// Zeroing also clears `needs_recompute`, which such a stream could otherwise never shed:
+/// it is marked when its events are released, and nothing afterwards can unmark it. That
+/// left 45 rows permanently claiming they needed a refresh no walk would ever give them.
+fn zeroed_times_for_streams_without_events(
+    selected: &[tt_db::Stream],
+    computed: &[tt_core::StreamTime],
+) -> Vec<tt_core::StreamTime> {
+    let with_time: std::collections::HashSet<&str> = computed
+        .iter()
+        .map(|time| time.stream_id.as_str())
+        .collect();
+    selected
+        .iter()
+        .filter(|stream| !with_time.contains(stream.id.as_str()))
+        .map(|stream| tt_core::StreamTime {
+            stream_id: stream.id.clone(),
+            time_direct_ms: 0,
+            time_delegated_ms: 0,
+            focus_intervals: Vec::new(),
+            delegated_intervals: Vec::new(),
+        })
+        .collect()
+}
 
 /// Run time recomputation for streams.
 ///
@@ -63,38 +97,25 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
                 stream_ids.len(),
                 streams_list,
             );
-            eprintln!("  Use 'tt classify --apply' to fix.");
+            eprintln!(
+                "  Use 'tt streams assign <stream-ref> --session {}' to settle it.",
+                &session_id[..session_id.len().min(30)]
+            );
         }
     }
 
-    // Load session end times for accurate delegated time calculation.
-    // When a session has a known end_time, the algorithm uses it instead of the
-    // timeout heuristic (which undercounts delegated time for gappy sessions).
-    // Also load session_types so allocation can skip subagent user_message events
-    // (the parent agent's delegation, not human attention).
     let earliest = events.first().map_or_else(Utc::now, |e| e.timestamp);
     let latest = events.last().map_or_else(Utc::now, |e| e.timestamp);
-    let agent_sessions = db
-        .agent_sessions_in_range(earliest, latest)
-        .unwrap_or_default();
-    let session_end_times: HashMap<String, DateTime<Utc>> = agent_sessions
-        .iter()
-        .filter_map(|s| s.end_time.map(|end| (s.session_id.clone(), end)))
-        .collect();
-    let session_types: HashMap<String, SessionType> = agent_sessions
-        .iter()
-        .map(|s| (s.session_id.clone(), s.session_type))
-        .collect();
-
-    tracing::debug!(
-        sessions_with_end_time = session_end_times.len(),
-        sessions_with_type = session_types.len(),
-        "loaded session metadata"
-    );
-
-    // Run the allocation algorithm
     let config = AllocationConfig::default();
-    let result = allocate_time(&events, &config, None, &session_end_times, &session_types);
+    // `allocate_for_period` uses an exclusive end, so extend it past the final event.
+    let result = allocate_for_period(
+        db,
+        earliest,
+        latest + Duration::milliseconds(1),
+        None,
+        &config,
+    )
+    .context("failed to allocate time")?;
 
     tracing::debug!(
         stream_count = result.stream_times.len(),
@@ -103,7 +124,7 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
     );
 
     // Filter results to only streams we want to update
-    let times_to_update: Vec<_> = if force {
+    let mut times_to_update: Vec<_> = if force {
         // Update all streams that have time computed
         result.stream_times
     } else {
@@ -117,6 +138,10 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
             .collect()
     };
 
+    let zeroed = zeroed_times_for_streams_without_events(&streams, &times_to_update);
+    let zeroed_count = zeroed.len();
+    times_to_update.extend(zeroed);
+
     if times_to_update.is_empty() {
         println!("No time data computed for the selected streams.");
         return Ok(());
@@ -127,7 +152,13 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
         .update_stream_times(&times_to_update)
         .context("failed to update stream times")?;
 
-    println!("Updated {updated} stream(s).");
+    if zeroed_count > 0 {
+        println!(
+            "Updated {updated} stream(s); {zeroed_count} of them hold no events and were zeroed."
+        );
+    } else {
+        println!("Updated {updated} stream(s).");
+    }
 
     // Print summary
     for time in &times_to_update {
@@ -260,6 +291,8 @@ mod tests {
             id: "stream-1".to_string(),
             name: Some("test-project".to_string()),
             slug: None,
+            description: None,
+            color: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 0,
@@ -315,6 +348,8 @@ mod tests {
             id: "stream-1".to_string(),
             name: Some("test-project".to_string()),
             slug: None,
+            description: None,
+            color: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 100,
@@ -344,6 +379,8 @@ mod tests {
             id: "stream-1".to_string(),
             name: Some("test-project".to_string()),
             slug: None,
+            description: None,
+            color: None,
             created_at: now,
             updated_at: now,
             time_direct_ms: 100,
@@ -375,5 +412,67 @@ mod tests {
         let updated_stream = db.get_stream("stream-1").unwrap().unwrap();
         assert!(updated_stream.time_direct_ms > 0);
         assert_eq!(updated_stream.time_delegated_ms, 25 * 60 * 1000);
+    }
+
+    fn zt_stream(id: &str) -> tt_db::Stream {
+        tt_db::Stream {
+            id: id.to_string(),
+            name: Some(format!("stream {id}")),
+            slug: None,
+            description: None,
+            color: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            time_direct_ms: 99_999,
+            time_delegated_ms: 88_888,
+            first_event_at: None,
+            last_event_at: None,
+            needs_recompute: true,
+        }
+    }
+
+    fn zt_computed(id: &str, direct_ms: i64) -> tt_core::StreamTime {
+        tt_core::StreamTime {
+            stream_id: id.to_string(),
+            time_direct_ms: direct_ms,
+            time_delegated_ms: 0,
+            focus_intervals: Vec::new(),
+            delegated_intervals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_selected_stream_with_no_events_is_zeroed_not_skipped() {
+        // Skipping is what left 138 event-less streams asserting 248h of direct time they
+        // no longer hold: allocation only yields rows for streams that have events, so one
+        // whose events were released is never written and keeps its last totals forever.
+        let selected = vec![zt_stream("has-events"), zt_stream("emptied")];
+        let with_time = vec![zt_computed("has-events", 60_000)];
+
+        let zeroed = zeroed_times_for_streams_without_events(&selected, &with_time);
+
+        assert_eq!(zeroed.len(), 1, "only the event-less stream is zeroed");
+        assert_eq!(zeroed[0].stream_id, "emptied");
+        assert_eq!(zeroed[0].time_direct_ms, 0);
+        assert_eq!(zeroed[0].time_delegated_ms, 0);
+    }
+
+    #[test]
+    fn a_stream_that_produced_time_is_left_to_its_computed_totals() {
+        let selected = vec![zt_stream("busy")];
+        let with_time = vec![zt_computed("busy", 3_600_000)];
+
+        let zeroed = zeroed_times_for_streams_without_events(&selected, &with_time);
+
+        assert!(
+            zeroed.is_empty(),
+            "zeroing a stream that has time would erase the recomputation: {zeroed:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_selected_yields_nothing_to_zero() {
+        let zeroed = zeroed_times_for_streams_without_events(&[], &[zt_computed("x", 1)]);
+        assert!(zeroed.is_empty());
     }
 }

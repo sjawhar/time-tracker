@@ -1,0 +1,21 @@
+[package]
+name = "tt-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LLM-backed stream classification for time tracker"
+
+[dependencies]
+chrono.workspace = true
+reqwest.workspace = true
+rig-core.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

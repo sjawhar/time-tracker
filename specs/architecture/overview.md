@@ -210,18 +210,21 @@ A session that starts but never uses any tools (immediate crash, user killed it,
 
 #### Reporting Implications
 
-**Total time calculation**: Direct and delegated time can overlap, so they should NOT be summed naively. The report's "Total tracked" represents wall-clock time: the duration of the union of all intervals where any stream received either direct or delegated time.
+**Total time calculation**: Direct and delegated time measure different things and must not be summed. Direct time is the union of attention intervals, so it never exceeds wall clock. Delegated time is the *sum* across concurrently running agents, so it routinely exceeds wall clock — that excess is the leverage signal, not an error.
+
+The report therefore states three independent quantities plus the ratio between the two that matter:
 
 **Example report section:**
 ```
 SUMMARY
 ───────
-Total tracked:  2h 30m
-Direct time:    1h 45m (70%)
-Delegated time: 1h 30m (60%)
+Wall clock:      2h 30m
+Direct time:     1h 45m
+Delegated time:  9h 15m
+Leverage:        5.3x
 ```
 
-Note: Percentages can exceed 100% combined because they overlap during supervised agent work.
+`Wall clock` is the duration of the union of all intervals where any stream received either direct or delegated time. `Leverage` is the delegation ratio (delegated ÷ direct). No percentages are reported: direct and delegated do not share a denominator, so any percentage of their sum would be meaningless.
 
 #### Examples
 
@@ -284,5 +287,5 @@ Stream X:
 2. Delegated time is concurrent: multiple streams can accumulate delegated time simultaneously
 3. AFK periods contribute 0 direct time but delegated time continues
 4. Agent sessions without tool use contribute 0 delegated time
-5. Total tracked time equals wall-clock time (union of intervals), not sum of direct + delegated
+5. Wall clock equals the union of intervals, not the sum of direct + delegated; total direct never exceeds it, while total delegated may
 6. User corrections (`assignment_source = 'user'`) are preserved through recomputation

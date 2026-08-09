@@ -171,7 +171,7 @@ Today: 4h 23m (direct: 2h 15m | delegated: 2h 08m) | devserver: 2m | staging: 1h
 ```
 
 **Components:**
-- `Today:` — Total tracked time for today
+- `Today:` — Wall-clock time with any activity today (union of intervals)
 - `direct:` — Time when user was actively focused
 - `delegated:` — Time when agents were working
 - Remote names with time since last sync

@@ -49,7 +49,7 @@ These rules take priority over other instructions:
 
 4. **`tt report` is the single source of truth for time — never re-derive it.** Every time number comes from `tt report`, which already merges ALL focus sources (tmux pane focus, COSMIC window-focus, browser, afk) into one allocation. NEVER compute active/direct time yourself in python or SQL, NEVER pick-and-choose event types (no "watcher-only" vs "terminal-only" — they are one focus timeline), and NEVER hand the user a tight/loose range — the allocator yields one exact number. If a figure looks impossible (a full workday reading ~3h, or direct ≪ a normal day), **suspect the BINARY or the DATA, not the algorithm**: check `tt --version` against the repo's latest release / `Cargo.toml` and rebuild/`mise upgrade` if stale, then run the Phase 1 coverage gate. Hand-rolling time math in python is the exact failure that turns a stale-binary bug into hours of wrong analysis — do not do it.
 
-5. **Classification is part of the review, not a precondition someone else handles.** If you find unassigned time or catch-all streams at ANY phase, you classify them yourself (Phase 1 tells you exactly how) and re-pull the numbers. Presenting, saving, or narrating over unclassified time — or telling the user "there's a bunch of unclassified time" and moving on — is a failed review. The gate is re-checked at Phase 4 (before presenting) and Phase 8 (before saving).
+5. **Coverage is part of the review, not a precondition someone else handles.** If the week's activity is not attributed, the numbers are not worth reading (Phase 1 tells you exactly what to check and what to do). Presenting, saving, or narrating over a large unattributed remainder — or telling the user "there's a bunch of unclassified time" and moving on — is a failed review. You close the gap by getting the classifier caught up and correcting what is demonstrably wrong, never by inventing buckets. The gate is re-checked at Phase 4 (before presenting) and Phase 8 (before saving).
 
 ## Argument Parsing
 
@@ -79,9 +79,11 @@ The JSONL path is passed as the skill's `args` parameter:
 
 **Fallbacks**: If either config is missing, use sensible defaults. The review can proceed without config — it just uses built-in defaults for questions, goals, and ratings.
 
-## Phase 1: Classify Streams — DATA-INTEGRITY GATE (do not skip)
+## Phase 1: Verify Classification Coverage — DATA-INTEGRITY GATE (do not skip)
 
-**This is not prep. It is the gate the entire review depends on.** Tag untagged streams BEFORE collecting any report data, so `tt report`'s `by_tag` and the perceived-vs-actual comparison (Phase 6) reflect reality.
+**This is not prep. It is the gate the entire review depends on.** `tt report`'s `by_tag` and
+the perceived-vs-actual comparison (Phase 6) are only worth reading if the week's activity is
+actually attributed to streams.
 
 ### Why you cannot move on without this
 
@@ -89,59 +91,92 @@ The only reason to pull tt data at all is to give the user an **objective check 
 
 **Flagging the gap is NOT closing it.** Writing "⚠️ coverage caveat — treat as floors" and proceeding is the single most common failure here. It feels responsible and it ships the broken instrument anyway. Do not do it. Either the time is attributed, or you stop.
 
-### Procedure
+### You consume classifications; you do not produce them
 
-Run the classification pipeline directly (the old `classify-streams` skill is gone — `tt
-classify` replaced it):
+The `tt-serve` daemon classifies continuously — it ingests new sessions every ~30s and runs the
+LLM classifier on a short debounce. **There is exactly one machine-inference path, `tt classify
+--auto`, and you are not it.** That path holds every guard that makes inference safe: it picks
+candidates newest-first under a per-pass cap, inherits subagents from their parents, filters
+harness-injected text, refuses to invent a container for work it cannot place, and leaves
+anything ambiguous unassigned on purpose.
+
+So your job here is to check coverage and, if the classifier is behind, let it catch up:
 
 ```bash
-tt classify --json --start "$WEEK_START" --end "$WEEK_END" > /tmp/classify-week.json
+tt classify --auto        # one bounded pass, newest-first; safe to run on demand
+tt report --week --json   # re-read the totals afterwards
 ```
 
-Then **invoke the `infer-streams` skill** via the Skill tool (do NOT launch a subagent) and
-follow it to identify streams, build the `tt classify --apply` JSON (every new stream in
-`"streams"` REQUIRES a `"slug"`; `assign_by_*` refs use slugs), apply it, and tag streams.
-**Wait for the full pipeline — classify, apply, `tt report` — to finish** before Phase 2.
+**Never author stream assignments in bulk** — not from a JSON blob, not by cwd pattern, not by
+time range, and above all not with raw SQL against `tt.db`. Those surfaces are gone because an
+agent using them minted **68 misnamed streams across 55,031 events** (weekly buckets like
+`workorder-5: IPI envs (Jun14-20)`, catch-alls like `agent-c: misc`). The ontology rules that
+were supposed to prevent that lived in prose, and prose is not a guard.
 
-**Discipline (do not shortcut — this is where it goes wrong most):** classify per the ontology + the infer-streams *Classification Discipline*. Project comes from session/window **CONTENT, never cwd/path/folder** (a folder is not a workstream — name streams by the work done). Classify `window_focus` browser/Slack events by **`window_title`**, never by proximity or a catch-all. **Project (WHAT) and activity (HOW) are separate axes** — `meetings`/`messages`/`ops`/`admin` are activity *types*, NOT workstreams; tag the project + the activity. **Overhead is work, NOT `personal`** (which is life only).
+### The two corrections you may make
 
-**Use todo-link evidence first.** Sessions in `tt classify --json` may carry `linked_todo: {id, text, stream_slug}` — the agent linked itself to a todo while working (`tt todo link`). Treat it as the strongest classification signal: sessions sharing a `linked_todo.id` are the same stream, the todo text names the work, and sessions whose todo already has a `stream_slug` were auto-assigned before the output printed.
+Both are narrow and both require you to have actually looked at the work:
+
+```bash
+tt proposals ls                              # classifier suggestions awaiting a human
+tt proposals accept <id>                     # confirm one
+tt proposals reject <id> [--stream <ref>]    # reject, optionally redirecting its events
+
+tt streams assign <stream-ref> --session <id>    # a specific session you know is misfiled
+tt streams assign <stream-ref> --event <id>      # a specific event you know is misfiled
+```
+
+`tt streams assign` writes `assignment_source = "user"`, which no machine writer will ever
+overwrite. That is exactly why it must stay small: name only the sessions and events you have
+actually judged, and never use it to sweep a remainder. It will not create the target stream —
+if the stream should exist, `tt streams create` it deliberately first.
 
 ### Hard gate — do NOT advance to Phase 2 until BOTH hold
 
-1. You actually ran classification (not just read the unassigned count and noted it).
-2. **`tt report` `totals.unassigned_direct_ms` is ~zero** — a rounding remainder (a few minutes), NOT "a small fraction." There is no acceptable percentage of unassigned *direct* time. If the report shows hours (or even a percent or two) of unattributed direct time, that is a **bug to fix**, not a caveat to note. Do not rationalize it, do not present it, do not save it. Drive it to zero.
+1. You checked coverage against `tt report` (not just glanced at a session list).
+2. **`tt report` `totals.unassigned_direct_ms` is small enough that the week's shape is not in
+   question** — minutes, or a residue that cannot move any project's share. Hours of unattributed
+   *direct* time means the instrument is broken; do not rationalize it, present it, or save it.
 
-**Why zero and not "< 15%":** direct time is the human-attention signal the whole review rests on. 8 unattributed hours is an entire workday you cannot see — enough to flip "you barely touched sales" into "sales was a third of your week." A 15% escape hatch is exactly how a broken instrument ships looking grounded. Delegated time may retain a small unattributed tail (boundary agent sessions); **direct must be zero.**
+**Why direct and not delegated:** direct time is the human-attention signal the whole review rests on. 8 unattributed hours is an entire workday you cannot see — enough to flip "you barely touched sales" into "sales was a third of your week." Delegated time may retain a larger unattributed tail (boundary agent sessions) without distorting the review.
 
-### How to actually close it (this is the part people skip)
+### If the remainder is still large
 
-Unassigned direct time is almost never "untagged streams" — `tt report`'s `untagged` block is usually empty while `totals.unassigned_direct_ms` is large. The time is in **loose events not grouped into any stream.** Query the DB directly (`~/.local/share/time-tracker/tt.db`, `events` table, `stream_id IS NULL`, scoped to the window) and route by event type — one tight pass each, then `tt recompute` and re-check the total:
+Work the cause, in this order — and note that each step is a *diagnosis*, not a bulk write:
 
-- **`window_focus`** (browser/Slack/terminal-app focus — has `window_title`, no cwd): assign by `window_title` content to the matching stream (work comms→messages, meetings→meetings, project docs→that project, Disney+/gaming/shopping→personal). Content-free nav (New Tab, Sign in, system settings) is transient — route by workday-vs-context, not a blanket personal dump.
-- **`tmux_pane_focus`** (devbox terminal panes — has `cwd`, no session): route each `cwd` to the stream that **already dominates that cwd in the window** (compute the top assigned `stream_id` per cwd; don't invent a cwd→project table — let the classified sessions decide). This is the biggest direct-time bucket and the one the sync's auto-assign misses.
-- **`agent_session` / `user_message` / `agent_tool_use`** left unassigned (boundary sessions whose first event predates the window): assign by **session-dominant stream** where the session has assigned events elsewhere, else fall back to the same **cwd-dominant** routing. These anchor stray direct minutes between focus events.
-- **`afk_change`** and other cwd-less markers: these do **not** drive direct time — ignore them; they will remain "unassigned" harmlessly and will not move `unassigned_direct_ms`.
+1. **Is the classifier running and healthy?** `tt status` reports the verdict; a missing API key
+   leaves the classifier `Unconfigured` and nothing gets classified at all. Run `tt classify --auto`
+   and see whether the count moves.
+2. **Is the data even present?** `tt machines` flags remotes gone dark; an unsynced machine's
+   events simply are not there. `tt sync <remote>` for each, then re-check.
+3. **Is it work the classifier deliberately refused?** Focus events with no resolvable owner, and
+   sessions whose content names no initiative, stay unassigned **on purpose**. That is the design:
+   an unresolved event registers as classification lag rather than being swept into a container
+   nobody authorized. Report the residual honestly; do not manufacture a home for it.
 
-Re-run `tt recompute` and re-read `totals.unassigned_direct_ms` after each pass. Iterate until it is zero. Only then advance.
+**Slack in particular is genuinely unattributable** — `Threads - … - Slack` names the workspace,
+not the initiative, and tt cannot read thread content. Leave it unassigned rather than guessing.
 
-### MANDATORY: no "nav" / "terminal" / "ops" catch-all — cross-reference connective focus to the live workstream
+### Containers that should not exist
 
-**Assigning every event to a real, content-derived workstream is your job, not optional, and there is no ambiguity about it.** A stream named `terminal nav`, `ops`, `supervision`, `misc`, **`comms`, `messages`, `meetings`**, or any activity-word is **NOT a workstream** and is never acceptable — it is you giving up on the attribution and hiding it behind a label the user never authorized. **A stream tagged `project:other` (an activity tag with no real project) is the same failure** and must not survive into a presented or saved review: every stream needs a REAL project tag, inferred from what the time actually served.
+If the week's report shows an hours-scale stream named after an activity (`nav`, `ops`,
+`terminal`, `misc`, `comms`, `meetings`) or a date range (`… (Jun14-20)`), that is a container
+minted before the name guard existed. Report it:
 
-This applies to **all** connective / activity-only time, not just terminals:
+```bash
+tt streams list --misnamed
+```
 
-- **Terminal/tab nav** — devbox home-dir panes (`/home/ubuntu`, `/home/sami`), laptop terminal focus (`mosh devbox`, `ssh devbox`, `tmux …`), content-free flickers (`New Tab`, `Sign in`).
-- **Comms** — Slack (`Threads …`, channels), work email inbox, Google Messages.
-- **Meetings** — `Meet - …`, standup, team-meeting docs, calendar, 1:1s.
-
-None of these name a project on their own, but **none are unattributable** — each was in service of *some live workstream*. You MUST cross-reference each event to the **agent session active at that timestamp** (the session whose `[start,end]` contains the event; if several overlap, the one with the most tool activity) and assign it to **that session's stream** — i.e. whatever work you were steering/discussing at that moment. Where a title clearly names the project (a doc, a named 1:1, a channel), prefer that; otherwise use the temporal cross-reference.
-
-Do this with a script over the `events` + `agent_sessions` tables (session→dominant-stream map, then a temporal-overlap join), `tt recompute`, and verify the catch-all stream drops to ~zero direct. Only a genuinely session-less flicker with zero concurrent activity may remain, and that is minutes, not hours. **If you are about to present or save a review with an hours-scale `nav`/`ops`/`terminal` line, STOP — you have not finished the classification.**
+Repairing one is an operator decision made deliberately, per stream — `tt streams rename` then
+`tt streams merge` for a real initiative that was bucketed weekly, `tt streams dissolve` for a
+container that never named real work. **Do not bulk-dissolve the list**: most date-suffixed
+streams are real initiatives, and dissolving them would discard tens of thousands of correct
+assignments. If repairing is out of scope for this review, say so in the review rather than
+silently presenting the bad line as if it were a workstream.
 
 ### Fallback — genuine tool failure ONLY
 
-"It's annoying / the unclassified list is junk / I'm short on time" is **not** a valid reason to skip. The only thing that can interrupt classification is the tooling itself failing (`tt classify` crashes, tt unavailable) — and even then you do **NOT** auto-skip. **STOP, tell the user the tool failed and what it means (the review's time data would be unreliable), and ask for express permission to proceed without it.** Continue only if the user explicitly grants it; then run on manual estimates only, note it in the saved entry, and do not present per-project tt numbers as if they're sound. No automatic skipping, ever — a bypass requires the user's express okay.
+"It's annoying / the remainder is junk / I'm short on time" is **not** a valid reason to skip. The only thing that can interrupt this gate is the tooling itself failing (`tt` unavailable, the classifier unconfigured or erroring) — and even then you do **NOT** auto-skip. **STOP, tell the user the tool failed and what it means (the review's time data would be unreliable), and ask for express permission to proceed without it.** Continue only if the user explicitly grants it; then run on manual estimates only, note it in the saved entry, and do not present per-project tt numbers as if they're sound. No automatic skipping, ever — a bypass requires the user's express okay.
 
 ## Phase 2: Trend Analysis
 
@@ -209,16 +244,8 @@ tt machines                    # List known remotes
 tt sync <remote-label>         # For EACH remote machine listed
 ```
 
-Check for unassigned events. If any exist, run stream inference BEFORE generating the report:
-
-```bash
-# Quick check — if unassigned count > 0, you MUST run infer-streams
-tt classify --unclassified --summary --start "$WEEK_START" --end "$WEEK_END"
-```
-
-If unclassified sessions/events exist, invoke `/infer-streams` before continuing.
-
-Then fetch the current week's report data:
+Then fetch the current week's report data — `tt report` is also where you read coverage, since
+its `totals.unassigned_*_ms` is the authoritative unattributed figure:
 
 ```bash
 tt report --last-week --json
@@ -232,20 +259,17 @@ This returns JSON with:
 - `agent_sessions`: `total`, `by_source`, `by_type`, `top_sessions[]`
 - `week_start_day`: "monday"
 
-**Supplementary details** (optional, for richer session context):
-
-```bash
-tt classify --json --start "$WEEK_START" --end "$WEEK_END"
-```
-
-This provides full session data with `summary`, `starting_prompt`, `tool_call_count`, etc.
+**Supplementary detail** (optional): `tt streams list` shows each stream's direct/delegated
+totals, tags, and description, and `tt proposals ls` shows classifier suggestions still awaiting
+a human. Between them they give per-stream context without dumping raw sessions.
 
 ## Phase 4: Present Context
 
 **GATE RE-CHECK (mandatory before presenting):** re-read the `tt report` totals —
-`totals.unassigned_direct_ms` must still be ~zero and no hours-scale catch-all stream
-(`nav`/`ops`/`comms`/`meetings`/`project:other`) may appear. If this fails, STOP: you are
-not ready to present. Return to Phase 1 and finish classification first.
+`totals.unassigned_direct_ms` must still be small enough that no project's share is in
+question, and no hours-scale catch-all stream (`nav`/`ops`/`comms`/`meetings`/`project:other`)
+may appear. Present any real remainder as its own line rather than dropping it. If the
+classifier is behind, STOP: return to Phase 1 and let it catch up first.
 
 1. **Load ontology** from `~/.config/time-tracker/ontology.toml` — use `projects.names[]` and `activities.names[]` to organize the presentation.
 
@@ -391,10 +415,11 @@ On track (personal): Unsure
 ## Phase 8: Save
 
 **FINAL GATE (mandatory before saving):** the entry you save becomes permanent history that
-future reviews trend against. Confirm one last time that its time numbers come from a
-fully-classified week (`unassigned_direct_ms` ≈ 0, no catch-all buckets). Saving an entry
-built on unclassified time poisons every future trend comparison — if the gate fails here,
-go back to Phase 1, fix it, re-pull, and re-present before saving.
+future reviews trend against. Confirm one last time that its time numbers come from a caught-up
+classifier — a small `unassigned_direct_ms` and no catch-all buckets — and that any real
+remainder is recorded in the entry rather than rounded away. Saving an entry built on a stale
+classifier poisons every future trend comparison; if the gate fails here, go back to Phase 1,
+fix it, re-pull, and re-present before saving.
 
 1. **Build the JSON object** with all collected data (see schema below)
    - Include `red_team` with challenges raised and user responses
@@ -447,7 +472,7 @@ Treat the `instructions` field as a freeform brief from the user about what to d
 - Historical JSONL entries (last 8+ weeks of `reflection`, `ratings`, `red_team`, `next_week`)
 - The `[goals]`, `[ratings]`, and `[prompts]` config
 - The `ontology.toml` taxonomy
-- tt data (run `tt report`, `tt classify` etc. if needed)
+- tt data (run `tt report`, `tt streams list` etc. if needed)
 
 **Behavioral guarantees**:
 - Output is **ephemeral** (chat only). Do NOT save action outputs to JSONL. Do NOT modify the just-saved review entry.
@@ -482,7 +507,7 @@ Each line in `weekly-reviews.jsonl` is a JSON object. See the full example in `.
 ## Fallback Handling
 
 ### Classification Failure (Phase 1)
-Classification is the data-integrity gate. If `tt classify` is unavailable or fails, do **NOT** auto-skip and proceed — bypassing the gate requires the user's express permission.
+Coverage is the data-integrity gate. If `tt` is unavailable or the classifier is failing, do **NOT** auto-skip and proceed — bypassing the gate requires the user's express permission.
 1. **STOP.** Tell the user: "Stream classification FAILED — I won't bypass it without your okay, because the time data for this review would be unreliable. Here's what failed: …"
 2. Ask for explicit permission to proceed without trustworthy time data.
 3. Only if the user expressly grants it: continue on manual estimates, note in the saved entry that the time data is unreliable, and do not present per-project tt numbers as sound. Otherwise, pause the review until classification can run.
@@ -534,11 +559,12 @@ If user declines to run them at the confirmation prompt: end the review without 
 
 | Mistake | Fix |
 |---------|-----|
-| Skipping Phase 1 (classification) | **Always** run the `tt classify` + infer-streams pipeline first. Tagged data makes the entire review more meaningful. |
+| Skipping Phase 1 (coverage) | **Always** verify coverage against `tt report` first, and run `tt classify --auto` if the classifier is behind. Attributed data makes the entire review more meaningful. |
 | Skipping ingestion | **Always** run `tt ingest sessions` before `tt report`. Without it you miss most data. |
 | Skipping remote sync | **Always** check `tt machines` and sync all remotes. Remote events are often 50%+ of total data. |
 | Presenting partial results | Run the FULL pipeline (ingest → sync → infer streams → recompute → report). Don't stop partway and show incomplete numbers — it's worse than no answer. |
-| Not running stream inference | If unassigned events exist, run `/infer-streams` BEFORE generating the report. Unassigned events = missing time. |
+| Hand-authoring stream assignments | **Never.** No JSON blobs, no cwd patterns, no time ranges, no raw SQL. `tt classify --auto` is the only inference path; `tt streams assign` corrects one named session or event at a time. |
+| Inventing a bucket for the remainder | A stream named after an activity (`nav`, `ops`, `meetings`) or a date range is not a workstream. Work the classifier refuses to place stays unassigned on purpose — report it. |
 | Calling Toggl MCP tools | Use `tt report` exclusively. tt replaces Toggl for this workflow. |
 | Hardcoding project/activity lists | Read from `~/.config/time-tracker/ontology.toml`. Never hardcode taxonomy. |
 | Condensing user prose | Preserve full text. "Not prioritizing well" loses the detail that enables red-teaming. |
@@ -548,7 +574,7 @@ If user declines to run them at the confirmation prompt: end the review without 
 | Using `toggl` field in JSONL | Use the `tt` field. Schema uses time-tracker data, not Toggl. |
 | Rushing through narration | Let the user talk. Brief acknowledgments only. Don't lead or suggest what they should say. |
 | Including reflect-style analysis | Session pattern analysis is a separate skill. Weekly review focuses on time, goals, and reflection. |
-| Using `tt classify --json` for time data | `classify` shows sessions and clusters, not period-scoped time. Use `tt report` for time within a specific period. |
+| Reading time from anywhere but `tt report` | `tt streams list` totals are as of the last `tt recompute`, not period-scoped. Use `tt report` for time within a specific period. |
 | Running Phase 9 instructions without user confirmation | **Always** ask "Run them now? (y / skip)" before executing the freeform instructions. The instructions are opt-in per-review. |
 | Saving Phase 9 action output to JSONL | Phase 9 outputs are **ephemeral**. The just-saved review entry must remain untouched. If the user wants persistence, they update their instructions to write to a different file. |
 | Treating absent `[post_review_actions]` as an error | It's optional. Skip silently. Don't prompt the user to configure it. |
@@ -569,7 +595,7 @@ Read goal definitions from `~/.config/time-tracker/weekly-review.toml` `[goals]`
 
 ## Notes
 
-- Uses `tt report` and `tt classify` for time data — NOT Toggl
+- Uses `tt report` for time data — NOT Toggl
 - Red team uses Task tool with `subagent_type: "red-teamer"`
 - **Charts**: Use `uvx --with plotext python` for terminal bar charts (no install needed)
 - **Taxonomy**: Read from shared `~/.config/time-tracker/ontology.toml`, not hardcoded
