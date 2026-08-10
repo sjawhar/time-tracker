@@ -1126,6 +1126,47 @@ mod tests {
             + Duration::minutes(minutes)
     }
 
+    #[test]
+    fn many_streams_union_identically_however_the_work_is_scheduled() {
+        // Given: enough streams that rayon will actually split the work, emitted in ascending
+        // timestamp order because the allocator requires ordered events.
+        let mut events = Vec::new();
+        let mut minute = 0_i64;
+        for _round in 0..8 {
+            for stream in 0..64 {
+                events.push(TestEvent::tmux_focus(
+                    ts(minute),
+                    &format!("stream-{stream:02}"),
+                ));
+                minute += 1;
+            }
+        }
+        let config = test_config();
+        let end_times = HashMap::new();
+        let types = HashMap::new();
+
+        // When: the same corpus is allocated twice.
+        let run = || {
+            let mut allocator = Allocator::new(&config, None, &end_times, &types);
+            for event in &events {
+                allocator.push(event);
+            }
+            let mut times = allocator.finish().stream_times;
+            times.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+            times
+        };
+        let first = run();
+        let second = run();
+
+        // Then: every stream is present with identical direct and delegated totals.
+        assert_eq!(first.len(), 64);
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.stream_id, b.stream_id);
+            assert_eq!(a.time_direct_ms, b.time_direct_ms);
+            assert_eq!(a.time_delegated_ms, b.time_delegated_ms);
+        }
+    }
+
     fn get_stream_time<'a>(
         result: &'a AllocationResult,
         stream_id: &str,
