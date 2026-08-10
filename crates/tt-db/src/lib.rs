@@ -1460,6 +1460,43 @@ impl Database {
         Ok(Some((parse(&first)?, parse(&last)?)))
     }
 
+    /// Sessions whose events point at more than one stream, with those streams.
+    ///
+    /// A data-integrity report `recompute` prints, and it never needed the events in
+    /// memory to produce it. Ordered by session id, and each stream list ordered, so the
+    /// warning block is stable between runs.
+    ///
+    /// Reads `events` directly rather than through `row_to_event`, so a row that method
+    /// would drop (unknown type, unparseable timestamp) is included here. Measured at 0
+    /// rows on the live corpus before this replaced the in-memory scan.
+    pub fn sessions_spanning_multiple_streams(
+        &self,
+    ) -> Result<Vec<(String, Vec<String>)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, stream_id FROM events
+             WHERE session_id IS NOT NULL AND stream_id IS NOT NULL
+               AND session_id IN (
+                   SELECT session_id FROM events
+                   WHERE session_id IS NOT NULL AND stream_id IS NOT NULL
+                   GROUP BY session_id
+                   HAVING COUNT(DISTINCT stream_id) > 1
+               )
+             GROUP BY session_id, stream_id
+             ORDER BY session_id ASC, stream_id ASC",
+        )?;
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let stream_id: String = row.get(1)?;
+            match grouped.last_mut() {
+                Some((existing, streams)) if *existing == session_id => streams.push(stream_id),
+                _ => grouped.push((session_id, vec![stream_id])),
+            }
+        }
+        Ok(grouped)
+    }
+
     /// Retrieves events within an inclusive time range.
     ///
     /// Events are returned ordered by timestamp ascending.
@@ -4911,6 +4948,35 @@ mod tests {
     }
 
     #[test]
+    fn event_time_bounds_reports_the_first_and_last_event() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.event_time_bounds().unwrap(), None);
+
+        db.insert_events(&[
+            make_event(
+                "b",
+                Utc.with_ymd_and_hms(2026, 3, 2, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+            make_event(
+                "a",
+                Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+            make_event(
+                "c",
+                Utc.with_ymd_and_hms(2026, 3, 3, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+        ])
+        .unwrap();
+
+        let (first, last) = db.event_time_bounds().unwrap().unwrap();
+        assert_eq!(first, Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap());
+        assert_eq!(last, Utc.with_ymd_and_hms(2026, 3, 3, 9, 0, 0).unwrap());
+    }
+
+    #[test]
     fn test_get_events_time_range_after() {
         let db = Database::open_in_memory().unwrap();
 
@@ -6006,6 +6072,92 @@ mod tests {
             last_event_at: None,
             needs_recompute: false,
         }
+    }
+
+    #[test]
+    fn sessions_spanning_multiple_streams_reports_only_the_split_ones() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("A")))
+            .unwrap();
+        db.insert_stream(&make_stream("stream-b", Some("B")))
+            .unwrap();
+
+        let mut split_one = make_event(
+            "e1",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_one.session_id = Some("split".to_string());
+        split_one.stream_id = Some("stream-a".to_string());
+        let mut split_two = make_event(
+            "e2",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 1, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_two.session_id = Some("split".to_string());
+        split_two.stream_id = Some("stream-b".to_string());
+        let mut settled = make_event(
+            "e3",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 2, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        settled.session_id = Some("settled".to_string());
+        settled.stream_id = Some("stream-a".to_string());
+
+        let mut split_unassigned = make_event(
+            "e4",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 3, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_unassigned.session_id = Some("split".to_string());
+
+        let mut early_one = make_event(
+            "e5",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 4, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        early_one.session_id = Some("aaa".to_string());
+        early_one.stream_id = Some("stream-b".to_string());
+
+        let mut early_two = make_event(
+            "e6",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 5, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        early_two.session_id = Some("aaa".to_string());
+        early_two.stream_id = Some("stream-a".to_string());
+
+        let mut settled_unassigned = make_event(
+            "e7",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 6, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        settled_unassigned.session_id = Some("settled".to_string());
+
+        db.insert_events(&[
+            split_one,
+            split_two,
+            settled,
+            split_unassigned,
+            early_one,
+            early_two,
+            settled_unassigned,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            db.sessions_spanning_multiple_streams().unwrap(),
+            vec![
+                (
+                    "aaa".to_string(),
+                    vec!["stream-a".to_string(), "stream-b".to_string()]
+                ),
+                (
+                    "split".to_string(),
+                    vec!["stream-a".to_string(), "stream-b".to_string()]
+                )
+            ]
+        );
     }
 
     #[test]
