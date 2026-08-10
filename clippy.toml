@@ -1,3 +1,4 @@
 disallowed-methods = [
     { path = "tt_core::allocation::allocate_time", reason = "call tt_db::allocate_for_period instead" },
+    { path = "tt_core::allocation::Allocator::new", reason = "call tt_db::allocate_for_period instead; the streaming pass has the same single entry point as the slice one" },
 ]

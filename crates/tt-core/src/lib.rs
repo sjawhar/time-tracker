@@ -18,7 +18,8 @@ pub mod slug;
 pub mod todos;
 
 pub use allocation::{
-    AllocatableEvent, AllocationConfig, AllocationResult, Interval, StreamTime, allocate_time,
+    AllocatableEvent, AllocationConfig, AllocationResult, Allocator, Interval, StreamTime,
+    allocate_time,
 };
 pub use classification::{
     MisnamedReason, is_misnamed_stream, is_structurally_junk, normalize_stream_name,
