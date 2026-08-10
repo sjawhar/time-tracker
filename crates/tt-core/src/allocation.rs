@@ -1128,8 +1128,9 @@ mod tests {
 
     #[test]
     fn many_streams_union_identically_however_the_work_is_scheduled() {
-        // Given: enough streams that rayon will actually split the work, emitted in ascending
-        // timestamp order because the allocator requires ordered events.
+        // Given: enough streams to exercise repeated unions, emitted in ascending timestamp
+        // order because the allocator requires ordered events. The test pins deterministic
+        // output across runs, independent of scheduling.
         let mut events = Vec::new();
         let mut minute = 0_i64;
         for _round in 0..8 {

@@ -148,6 +148,24 @@ const INHERITED_ASSIGNMENT_SOURCE: &str = "inherited";
 /// parent is reclassified, which must not happen to these.
 const SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE: &str = "session_membership";
 
+// Counts [`Database::get_events_in_range`] calls made on this thread.
+//
+// Exists so a test can assert *structurally* that `allocate_for_period` streams the
+// window rather than collecting it, instead of inferring it from a stopwatch. Thread-
+// local rather than a field on `Database`: `Database` is `Send` but not `Sync` and an
+// allocation runs entirely on its caller's thread, so per-thread counting is exact and
+// unaffected by cargo running tests in parallel. Compiled out entirely outside tests.
+#[cfg(test)]
+thread_local! {
+    static EVENTS_IN_RANGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has called [`Database::get_events_in_range`].
+#[cfg(test)]
+fn events_in_range_calls() -> usize {
+    EVENTS_IN_RANGE_CALLS.with(std::cell::Cell::get)
+}
+
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
 /// This ensures lexicographic ordering matches chronological ordering.
@@ -1511,6 +1529,9 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<StoredEvent>, DbError> {
+        #[cfg(test)]
+        EVENTS_IN_RANGE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let sql = format!(
             "SELECT {EVENT_COLUMNS} FROM events
              WHERE timestamp >= ?1 AND timestamp <= ?2
@@ -5339,6 +5360,64 @@ mod tests {
             db.sessions_with_tool_use_but_no_start(window_start, window_end)
                 .unwrap(),
             vec!["no-start".to_string()]
+        );
+    }
+
+    #[test]
+    fn allocate_for_period_streams_the_window_instead_of_collecting_it() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("A")))
+            .unwrap();
+
+        // 5,000 focus events on one stream. The size is incidental to the guard — it is
+        // the call count that proves the path — but a corpus large enough to make the
+        // streaming loop iterate keeps the correctness assertions meaningful.
+        let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let mut batch = Vec::with_capacity(5_000);
+        for index in 0..5_000_i64 {
+            let mut event = make_event(
+                &format!("f{index}"),
+                base + chrono::Duration::seconds(index * 10),
+                EventType::TmuxPaneFocus,
+            );
+            event.stream_id = Some("stream-a".to_string());
+            batch.push(event);
+        }
+        db.insert_events(&batch).unwrap();
+
+        let (first, last) = db.event_time_bounds().unwrap().unwrap();
+        let config = tt_core::AllocationConfig::default();
+
+        let before = events_in_range_calls();
+        let result = allocate_for_period(
+            &db,
+            first,
+            last + chrono::Duration::milliseconds(1),
+            None,
+            &config,
+        )
+        .unwrap();
+
+        // The guard: the collecting reader was never touched.
+        assert_eq!(
+            events_in_range_calls(),
+            before,
+            "allocate_for_period called get_events_in_range; the window is being \
+             materialized again"
+        );
+
+        assert_eq!(result.stream_times.len(), 1);
+        let span_ms = (last - first).num_milliseconds();
+        let max_direct_ms = span_ms + config.attention_window_ms;
+        assert!(
+            result.stream_times[0].time_direct_ms > 0,
+            "no direct time accrued; the streamed events never reached the allocator"
+        );
+        assert!(
+            result.stream_times[0].time_direct_ms <= max_direct_ms,
+            "direct {} exceeded event span plus final attention window {}",
+            result.stream_times[0].time_direct_ms,
+            max_direct_ms
         );
     }
 
