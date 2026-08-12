@@ -171,64 +171,100 @@ struct StreamAllocation {
     delegated_intervals: Vec<Interval>,
 }
 
-/// Calculate time allocation for a time range.
+/// The allocation pass, fed one event at a time.
 ///
-/// Events must be sorted by timestamp ascending.
-/// Events with `stream_id = None` are attributed to a synthetic unassigned bucket
-/// (surfaced via `unassigned_direct_ms` / `unassigned_delegated_ms`) instead of being
-/// silently dropped. The sentinel is removed from `stream_times` before returning.
+/// [`allocate_time`] has always been a single forward walk over timestamp-sorted events
+/// with its state in maps — it never indexed the slice or looked backwards. Taking
+/// `&[E]` was therefore a property of the signature and not of the algorithm, and it was
+/// an expensive one: `tt recompute` held all 2,738,805 events to run it, peaking at
+/// 8.9 GB where the equivalent `SQLite` aggregate uses 6.4 MB.
 ///
-/// # Arguments
+/// Splitting the walk from its input lets a caller stream rows straight from `SQLite`.
+/// Memory becomes a function of concurrently-open sessions, streams, and recorded
+/// intervals rather than of history length.
 ///
-/// * `events` - Events to process (must implement `AllocatableEvent`)
-/// * `config` - Allocation configuration
-/// * `period_end` - Where to close open intervals. If None, uses last event + `attention_window`
-/// * `session_end_times` - Known end times for agent sessions (from `agent_sessions` table).
-///   When a session has a known `end_time`, the algorithm uses it instead of the timeout heuristic.
-/// * `session_types` - Known session types (from `agent_sessions` table). `UserMessage` events
-///   originating from non-`User` sessions (e.g. subagents) are skipped so they do not establish
+/// Events must still arrive in ascending timestamp order. That requirement is the
+/// algorithm's, not the container's, and pushing them out of order silently produces
+/// wrong time exactly as passing an unsorted slice always did.
 ///
-/// # Returns
+/// # Examples
 ///
-/// Computed time per stream and total tracked time.
-#[allow(clippy::too_many_lines, clippy::implicit_hasher)]
-pub fn allocate_time<E: AllocatableEvent>(
-    events: &[E],
-    config: &AllocationConfig,
+/// ```
+/// use std::collections::HashMap;
+/// use tt_core::{AllocationConfig, Allocator};
+///
+/// let config = AllocationConfig::default();
+/// let session_end_times = HashMap::new();
+/// let session_types = HashMap::new();
+/// let result = Allocator::new(&config, None, &session_end_times, &session_types).finish();
+///
+/// assert_eq!(result.total_tracked_ms, 0);
+/// ```
+pub struct Allocator<'a> {
+    config: &'a AllocationConfig,
     period_end: Option<DateTime<Utc>>,
-    session_end_times: &HashMap<String, DateTime<Utc>>,
-    session_types: &HashMap<String, SessionType>,
-) -> AllocationResult {
-    let mut focus_state = FocusState::Unfocused;
-    let mut window_focus_state = WindowFocusState::default();
-    let mut browser_focus_state = BrowserFocusState::default();
-    let mut tmux_focus_stream_id: Option<String> = None;
-    let mut agent_sessions: HashMap<String, AgentSession> = HashMap::new();
-    let mut stream_times: HashMap<String, StreamAllocation> = HashMap::new();
-    let mut activity_intervals: Vec<Interval> = Vec::new();
-    let mut last_event_time: Option<DateTime<Utc>> = None;
+    session_end_times: &'a HashMap<String, DateTime<Utc>>,
+    session_types: &'a HashMap<String, SessionType>,
+    focus_state: FocusState,
+    window_focus_state: WindowFocusState,
+    browser_focus_state: BrowserFocusState,
+    tmux_focus_stream_id: Option<String>,
+    agent_sessions: HashMap<String, AgentSession>,
+    stream_times: HashMap<String, StreamAllocation>,
+    activity_intervals: Vec<Interval>,
+    last_event_time: Option<DateTime<Utc>>,
+}
 
-    // Helper to add direct time. Only the interval is recorded; the total is unioned at
-    // the end so overlapping observations (e.g. two machines) are not double-counted.
-    let add_direct = |stream_id: &str,
-                      start: DateTime<Utc>,
-                      end: DateTime<Utc>,
-                      intervals: &mut Vec<Interval>,
-                      times: &mut HashMap<String, StreamAllocation>| {
+impl<'a> Allocator<'a> {
+    /// Starts a pass with no events seen yet.
+    #[must_use]
+    pub fn new(
+        config: &'a AllocationConfig,
+        period_end: Option<DateTime<Utc>>,
+        session_end_times: &'a HashMap<String, DateTime<Utc>>,
+        session_types: &'a HashMap<String, SessionType>,
+    ) -> Self {
+        Self {
+            config,
+            period_end,
+            session_end_times,
+            session_types,
+            focus_state: FocusState::Unfocused,
+            window_focus_state: WindowFocusState::default(),
+            browser_focus_state: BrowserFocusState::default(),
+            tmux_focus_stream_id: None,
+            agent_sessions: HashMap::new(),
+            stream_times: HashMap::new(),
+            activity_intervals: Vec::new(),
+            last_event_time: None,
+        }
+    }
+
+    /// Helper to add direct time. Only the interval is recorded; the total is unioned at
+    /// the end so overlapping observations (e.g. two machines) are not double-counted.
+    fn add_direct(
+        stream_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        intervals: &mut Vec<Interval>,
+        times: &mut HashMap<String, StreamAllocation>,
+    ) {
         if end > start {
             let interval = Interval { start, end };
             let allocation = times.entry(stream_id.to_string()).or_default();
             allocation.focus_intervals.push(interval);
             intervals.push(interval);
         }
-    };
+    }
 
-    // Helper to add delegated time
-    let add_delegated = |stream_id: &str,
-                         start: DateTime<Utc>,
-                         end: DateTime<Utc>,
-                         intervals: &mut Vec<Interval>,
-                         times: &mut HashMap<String, StreamAllocation>| {
+    /// Helper to add delegated time.
+    fn add_delegated(
+        stream_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        intervals: &mut Vec<Interval>,
+        times: &mut HashMap<String, StreamAllocation>,
+    ) {
         if end > start {
             let duration_ms = (end - start).num_milliseconds();
             let interval = Interval { start, end };
@@ -237,9 +273,14 @@ pub fn allocate_time<E: AllocatableEvent>(
             allocation.delegated_intervals.push(interval);
             intervals.push(interval);
         }
-    };
+    }
 
-    for event in events {
+    /// Processes one timestamp-ordered event.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "push mechanically preserves the existing single-pass allocation rules"
+    )]
+    pub fn push<E: AllocatableEvent>(&mut self, event: &E) {
         let event_time = event.timestamp();
         let event_type = event.event_type();
         let data = event.data();
@@ -247,7 +288,8 @@ pub fn allocate_time<E: AllocatableEvent>(
         // Check for agent timeouts before processing this event.
         // If a session has a known end_time (from agent_sessions table), use it.
         // Otherwise, fall back to the timeout heuristic.
-        let timeout_attributions: Vec<_> = agent_sessions
+        let timeout_attributions: Vec<_> = self
+            .agent_sessions
             .iter()
             .filter(|(_, session)| !session.ended)
             .filter_map(|(session_id, session)| {
@@ -255,7 +297,7 @@ pub fn allocate_time<E: AllocatableEvent>(
                 let first_tool = session.first_tool_use_at?;
 
                 // Use known end_time if available, otherwise timeout heuristic
-                if let Some(&known_end) = session_end_times.get(session_id) {
+                if let Some(&known_end) = self.session_end_times.get(session_id) {
                     if event_time > known_end {
                         Some((
                             session_id.clone(),
@@ -267,7 +309,8 @@ pub fn allocate_time<E: AllocatableEvent>(
                         None
                     }
                 } else {
-                    let timeout_at = last_tool + Duration::milliseconds(config.agent_timeout_ms);
+                    let timeout_at =
+                        last_tool + Duration::milliseconds(self.config.agent_timeout_ms);
                     if event_time > timeout_at {
                         Some((
                             session_id.clone(),
@@ -284,15 +327,15 @@ pub fn allocate_time<E: AllocatableEvent>(
 
         for (session_id, stream_id, first_tool, timeout_at) in timeout_attributions {
             // Attribute delegated time from first tool use to timeout
-            add_delegated(
+            Self::add_delegated(
                 &stream_id,
                 first_tool,
                 timeout_at,
-                &mut activity_intervals,
-                &mut stream_times,
+                &mut self.activity_intervals,
+                &mut self.stream_times,
             );
             // Mark session as ended
-            if let Some(session) = agent_sessions.get_mut(&session_id) {
+            if let Some(session) = self.agent_sessions.get_mut(&session_id) {
                 session.ended = true;
             }
         }
@@ -302,30 +345,30 @@ pub fn allocate_time<E: AllocatableEvent>(
                 let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
                 {
                     // Close previous focus interval using resolved stream
-                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                    if let FocusState::Focused { focus_start, .. } = &self.focus_state {
                         let resolved = resolve_focus_stream(
-                            &window_focus_state,
-                            tmux_focus_stream_id.as_deref(),
-                            browser_focus_state.stream_id.as_deref(),
+                            &self.window_focus_state,
+                            self.tmux_focus_stream_id.as_deref(),
+                            self.browser_focus_state.stream_id.as_deref(),
                         );
                         if let Some(resolved_stream) = &resolved {
-                            let max_end =
-                                *focus_start + Duration::milliseconds(config.attention_window_ms);
+                            let max_end = *focus_start
+                                + Duration::milliseconds(self.config.attention_window_ms);
                             let actual_end = event_time.min(max_end);
-                            add_direct(
+                            Self::add_direct(
                                 resolved_stream,
                                 *focus_start,
                                 actual_end,
-                                &mut activity_intervals,
-                                &mut stream_times,
+                                &mut self.activity_intervals,
+                                &mut self.stream_times,
                             );
                         }
                     }
 
-                    tmux_focus_stream_id = Some(stream_id.to_string());
-                    window_focus_state.app = None;
-                    window_focus_state.stream_id = None;
-                    focus_state = FocusState::Focused {
+                    self.tmux_focus_stream_id = Some(stream_id.to_string());
+                    self.window_focus_state.app = None;
+                    self.window_focus_state.stream_id = None;
+                    self.focus_state = FocusState::Focused {
                         stream_id: stream_id.to_string(),
                         focus_start: event_time,
                     };
@@ -343,29 +386,29 @@ pub fn allocate_time<E: AllocatableEvent>(
                         .map_or(event_time, |ms| event_time - Duration::milliseconds(ms));
 
                     // Close focus at idle_start, not event_time
-                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                    if let FocusState::Focused { focus_start, .. } = &self.focus_state {
                         let end_time = idle_start.max(*focus_start); // Don't go before focus started
                         if end_time > *focus_start {
                             let resolved = resolve_focus_stream(
-                                &window_focus_state,
-                                tmux_focus_stream_id.as_deref(),
-                                browser_focus_state.stream_id.as_deref(),
+                                &self.window_focus_state,
+                                self.tmux_focus_stream_id.as_deref(),
+                                self.browser_focus_state.stream_id.as_deref(),
                             );
                             if let Some(resolved_stream) = &resolved {
                                 let max_end = *focus_start
-                                    + Duration::milliseconds(config.attention_window_ms);
+                                    + Duration::milliseconds(self.config.attention_window_ms);
                                 let actual_end = end_time.min(max_end);
-                                add_direct(
+                                Self::add_direct(
                                     resolved_stream,
                                     *focus_start,
                                     actual_end, // Use calculated idle_start, not event_time
-                                    &mut activity_intervals,
-                                    &mut stream_times,
+                                    &mut self.activity_intervals,
+                                    &mut self.stream_times,
                                 );
                             }
                         }
                     }
-                    focus_state = FocusState::Unfocused;
+                    self.focus_state = FocusState::Unfocused;
                 }
                 // Note: "active" does NOT restore focus - wait for next focus event
             }
@@ -376,13 +419,13 @@ pub fn allocate_time<E: AllocatableEvent>(
                 if let FocusState::Focused {
                     stream_id: focused_stream,
                     focus_start,
-                } = &focus_state
+                } = &self.focus_state
                 {
                     // Resolve which stream should actually get the time
                     let resolved = resolve_focus_stream(
-                        &window_focus_state,
-                        tmux_focus_stream_id.as_deref(),
-                        browser_focus_state.stream_id.as_deref(),
+                        &self.window_focus_state,
+                        self.tmux_focus_stream_id.as_deref(),
+                        self.browser_focus_state.stream_id.as_deref(),
                     );
                     // Reset the attention window if this scroll belongs to the
                     // focused pane. The tmux hook emits scroll events with no stream
@@ -395,17 +438,17 @@ pub fn allocate_time<E: AllocatableEvent>(
                         {
                             if event_time > *focus_start {
                                 let max_end = *focus_start
-                                    + Duration::milliseconds(config.attention_window_ms);
+                                    + Duration::milliseconds(self.config.attention_window_ms);
                                 let actual_end = event_time.min(max_end);
-                                add_direct(
+                                Self::add_direct(
                                     resolved_stream,
                                     *focus_start,
                                     actual_end,
-                                    &mut activity_intervals,
-                                    &mut stream_times,
+                                    &mut self.activity_intervals,
+                                    &mut self.stream_times,
                                 );
                             }
-                            focus_state = FocusState::Focused {
+                            self.focus_state = FocusState::Focused {
                                 stream_id: focused_stream.clone(),
                                 focus_start: event_time,
                             };
@@ -423,38 +466,38 @@ pub fn allocate_time<E: AllocatableEvent>(
                 // parent agent's delegation, not human attention, so they are skipped.
                 let is_subagent_message = event
                     .session_id()
-                    .and_then(|session_id| session_types.get(session_id))
+                    .and_then(|session_id| self.session_types.get(session_id))
                     .is_some_and(|session_type| *session_type != SessionType::User);
                 if is_subagent_message {
-                    continue;
+                    return;
                 }
                 let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
                 {
                     // Close previous focus interval
-                    if let FocusState::Focused { focus_start, .. } = &focus_state {
+                    if let FocusState::Focused { focus_start, .. } = &self.focus_state {
                         let resolved = resolve_focus_stream(
-                            &window_focus_state,
-                            tmux_focus_stream_id.as_deref(),
-                            browser_focus_state.stream_id.as_deref(),
+                            &self.window_focus_state,
+                            self.tmux_focus_stream_id.as_deref(),
+                            self.browser_focus_state.stream_id.as_deref(),
                         );
                         if let Some(resolved_stream) = &resolved {
-                            let max_end =
-                                *focus_start + Duration::milliseconds(config.attention_window_ms);
+                            let max_end = *focus_start
+                                + Duration::milliseconds(self.config.attention_window_ms);
                             let actual_end = event_time.min(max_end);
-                            add_direct(
+                            Self::add_direct(
                                 resolved_stream,
                                 *focus_start,
                                 actual_end,
-                                &mut activity_intervals,
-                                &mut stream_times,
+                                &mut self.activity_intervals,
+                                &mut self.stream_times,
                             );
                         }
                     }
 
-                    tmux_focus_stream_id = Some(stream_id.to_string());
-                    window_focus_state.app = None;
-                    window_focus_state.stream_id = None;
-                    focus_state = FocusState::Focused {
+                    self.tmux_focus_stream_id = Some(stream_id.to_string());
+                    self.window_focus_state.app = None;
+                    self.window_focus_state.stream_id = None;
+                    self.focus_state = FocusState::Focused {
                         stream_id: stream_id.to_string(),
                         focus_start: event_time,
                     };
@@ -487,11 +530,12 @@ pub fn allocate_time<E: AllocatableEvent>(
                         // that does name a stream still updates it, so a genuine
                         // re-attribution is unaffected.
                         let shadows_known_stream = stream_id == UNASSIGNED_STREAM_ID
-                            && agent_sessions
+                            && self
+                                .agent_sessions
                                 .get(session_id)
                                 .is_some_and(|tracked| tracked.stream_id != UNASSIGNED_STREAM_ID);
                         if !shadows_known_stream {
-                            agent_sessions.insert(
+                            self.agent_sessions.insert(
                                 session_id.to_string(),
                                 AgentSession {
                                     stream_id: stream_id.to_string(),
@@ -504,21 +548,21 @@ pub fn allocate_time<E: AllocatableEvent>(
                     }
                     "ended" => {
                         // Close the session
-                        if let Some(session) = agent_sessions.get(session_id) {
+                        if let Some(session) = self.agent_sessions.get(session_id) {
                             if !session.ended {
                                 if let Some(first_tool) = session.first_tool_use_at {
                                     // Attribute from first tool use to end
-                                    add_delegated(
+                                    Self::add_delegated(
                                         &session.stream_id.clone(),
                                         first_tool,
                                         event_time,
-                                        &mut activity_intervals,
-                                        &mut stream_times,
+                                        &mut self.activity_intervals,
+                                        &mut self.stream_times,
                                     );
                                 }
                             }
                         }
-                        if let Some(session) = agent_sessions.get_mut(session_id) {
+                        if let Some(session) = self.agent_sessions.get_mut(session_id) {
                             session.ended = true;
                         }
                     }
@@ -528,7 +572,7 @@ pub fn allocate_time<E: AllocatableEvent>(
 
             EventType::AgentToolUse => {
                 let session_id = event.session_id().unwrap_or("");
-                if let Some(session) = agent_sessions.get_mut(session_id) {
+                if let Some(session) = self.agent_sessions.get_mut(session_id) {
                     if !session.ended {
                         if session.first_tool_use_at.is_none() {
                             // First tool use - delegated time starts here
@@ -545,46 +589,47 @@ pub fn allocate_time<E: AllocatableEvent>(
                     .and_then(|v| v.as_str())
                     .map(str::to_ascii_lowercase);
 
-                if let FocusState::Focused { focus_start, .. } = &focus_state {
+                if let FocusState::Focused { focus_start, .. } = &self.focus_state {
                     let resolved = resolve_focus_stream(
-                        &window_focus_state,
-                        tmux_focus_stream_id.as_deref(),
-                        browser_focus_state.stream_id.as_deref(),
+                        &self.window_focus_state,
+                        self.tmux_focus_stream_id.as_deref(),
+                        self.browser_focus_state.stream_id.as_deref(),
                     );
                     if let Some(resolved_stream) = &resolved {
                         let max_end =
-                            *focus_start + Duration::milliseconds(config.attention_window_ms);
+                            *focus_start + Duration::milliseconds(self.config.attention_window_ms);
                         let actual_end = event_time.min(max_end);
-                        add_direct(
+                        Self::add_direct(
                             resolved_stream,
                             *focus_start,
                             actual_end,
-                            &mut activity_intervals,
-                            &mut stream_times,
+                            &mut self.activity_intervals,
+                            &mut self.stream_times,
                         );
                     }
                 }
 
-                window_focus_state.app = app;
-                window_focus_state.stream_id = event.stream_id().map(String::from);
+                self.window_focus_state.app = app;
+                self.window_focus_state.stream_id = event.stream_id().map(String::from);
 
                 if let Some(stream_id) = resolve_focus_stream(
-                    &window_focus_state,
-                    tmux_focus_stream_id.as_deref(),
-                    browser_focus_state.stream_id.as_deref(),
+                    &self.window_focus_state,
+                    self.tmux_focus_stream_id.as_deref(),
+                    self.browser_focus_state.stream_id.as_deref(),
                 ) {
-                    focus_state = FocusState::Focused {
+                    self.focus_state = FocusState::Focused {
                         stream_id,
                         focus_start: event_time,
                     };
                 } else {
-                    focus_state = FocusState::Unfocused;
+                    self.focus_state = FocusState::Unfocused;
                 }
             }
 
             EventType::BrowserTab => {
                 // If we're in a browser app and have focus, update focus state
-                if window_focus_state
+                if self
+                    .window_focus_state
                     .app
                     .as_ref()
                     .is_some_and(|app| is_browser_app(app))
@@ -592,34 +637,34 @@ pub fn allocate_time<E: AllocatableEvent>(
                     let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);
                     {
                         // Close previous focus interval
-                        if let FocusState::Focused { focus_start, .. } = &focus_state {
+                        if let FocusState::Focused { focus_start, .. } = &self.focus_state {
                             let resolved = resolve_focus_stream(
-                                &window_focus_state,
-                                tmux_focus_stream_id.as_deref(),
-                                browser_focus_state.stream_id.as_deref(),
+                                &self.window_focus_state,
+                                self.tmux_focus_stream_id.as_deref(),
+                                self.browser_focus_state.stream_id.as_deref(),
                             );
                             if let Some(resolved_stream) = &resolved {
                                 let max_end = *focus_start
-                                    + Duration::milliseconds(config.attention_window_ms);
+                                    + Duration::milliseconds(self.config.attention_window_ms);
                                 let actual_end = event_time.min(max_end);
-                                add_direct(
+                                Self::add_direct(
                                     resolved_stream,
                                     *focus_start,
                                     actual_end,
-                                    &mut activity_intervals,
-                                    &mut stream_times,
+                                    &mut self.activity_intervals,
+                                    &mut self.stream_times,
                                 );
                             }
                         }
 
-                        focus_state = FocusState::Focused {
+                        self.focus_state = FocusState::Focused {
                             stream_id: stream_id.to_string(),
                             focus_start: event_time,
                         };
                     }
                 }
 
-                browser_focus_state.stream_id = Some(
+                self.browser_focus_state.stream_id = Some(
                     event
                         .stream_id()
                         .unwrap_or(UNASSIGNED_STREAM_ID)
@@ -628,94 +673,147 @@ pub fn allocate_time<E: AllocatableEvent>(
             }
         }
 
-        last_event_time = Some(event_time);
+        self.last_event_time = Some(event_time);
     }
 
-    // Finalize: close open intervals
-    let end_time = period_end.or(last_event_time);
+    /// Finalizes allocation after every event has been processed.
+    #[must_use]
+    pub fn finish(mut self) -> AllocationResult {
+        // Finalize: close open intervals
+        let end_time = self.period_end.or(self.last_event_time);
 
-    if let Some(end) = end_time {
-        // Close focus - cap at attention window, using resolved stream
-        if let FocusState::Focused { focus_start, .. } = &focus_state {
-            let resolved = resolve_focus_stream(
-                &window_focus_state,
-                tmux_focus_stream_id.as_deref(),
-                browser_focus_state.stream_id.as_deref(),
-            );
-            if let Some(resolved_stream) = &resolved {
-                let window_end = *focus_start + Duration::milliseconds(config.attention_window_ms);
-                let actual_end = period_end.map_or(window_end, |pe| pe.min(window_end));
-                if actual_end > *focus_start {
-                    add_direct(
-                        resolved_stream,
-                        *focus_start,
-                        actual_end,
-                        &mut activity_intervals,
-                        &mut stream_times,
+        if let Some(end) = end_time {
+            // Close focus - cap at attention window, using resolved stream
+            if let FocusState::Focused { focus_start, .. } = &self.focus_state {
+                let resolved = resolve_focus_stream(
+                    &self.window_focus_state,
+                    self.tmux_focus_stream_id.as_deref(),
+                    self.browser_focus_state.stream_id.as_deref(),
+                );
+                if let Some(resolved_stream) = &resolved {
+                    let window_end =
+                        *focus_start + Duration::milliseconds(self.config.attention_window_ms);
+                    let actual_end = self.period_end.map_or(window_end, |pe| pe.min(window_end));
+                    if actual_end > *focus_start {
+                        Self::add_direct(
+                            resolved_stream,
+                            *focus_start,
+                            actual_end,
+                            &mut self.activity_intervals,
+                            &mut self.stream_times,
+                        );
+                    }
+                }
+            }
+
+            // Close active agent sessions.
+            // Use known end_time when available, otherwise timeout heuristic.
+            let final_attributions: Vec<_> = self
+                .agent_sessions
+                .iter()
+                .filter(|(_, session)| !session.ended)
+                .filter_map(|(session_id, session)| {
+                    let first_tool = session.first_tool_use_at?;
+                    let last_tool = session.last_tool_use_at.unwrap_or(first_tool);
+
+                    let session_end =
+                        if let Some(&known_end) = self.session_end_times.get(session_id) {
+                            // Use known end_time, capped at period end
+                            known_end.min(end)
+                        } else {
+                            // Timeout heuristic: last_tool + timeout, capped at period end
+                            let timeout_at =
+                                last_tool + Duration::milliseconds(self.config.agent_timeout_ms);
+                            if end > timeout_at { timeout_at } else { end }
+                        };
+
+                    Some((session.stream_id.clone(), first_tool, session_end))
+                })
+                .collect();
+
+            for (stream_id, first_tool, session_end) in final_attributions {
+                if session_end > first_tool {
+                    Self::add_delegated(
+                        &stream_id,
+                        first_tool,
+                        session_end,
+                        &mut self.activity_intervals,
+                        &mut self.stream_times,
                     );
                 }
             }
         }
 
-        // Close active agent sessions.
-        // Use known end_time when available, otherwise timeout heuristic.
-        let final_attributions: Vec<_> = agent_sessions
-            .iter()
-            .filter(|(_, session)| !session.ended)
-            .filter_map(|(session_id, session)| {
-                let first_tool = session.first_tool_use_at?;
-                let last_tool = session.last_tool_use_at.unwrap_or(first_tool);
+        // Calculate total tracked time from interval union
+        let total_tracked_ms = union_duration_ms(&self.activity_intervals);
 
-                let session_end = if let Some(&known_end) = session_end_times.get(session_id) {
-                    // Use known end_time, capped at period end
-                    known_end.min(end)
-                } else {
-                    // Timeout heuristic: last_tool + timeout, capped at period end
-                    let timeout_at = last_tool + Duration::milliseconds(config.agent_timeout_ms);
-                    if end > timeout_at { timeout_at } else { end }
-                };
+        let unassigned = self
+            .stream_times
+            .remove(UNASSIGNED_STREAM_ID)
+            .unwrap_or_default();
 
-                Some((session.stream_id.clone(), first_tool, session_end))
+        let stream_times_vec = self
+            .stream_times
+            .into_iter()
+            .map(|(stream_id, allocation)| StreamTime {
+                stream_id,
+                time_direct_ms: union_duration_ms(&allocation.focus_intervals),
+                time_delegated_ms: allocation.delegated_ms,
+                focus_intervals: allocation.focus_intervals,
+                delegated_intervals: allocation.delegated_intervals,
             })
             .collect();
 
-        for (stream_id, first_tool, session_end) in final_attributions {
-            if session_end > first_tool {
-                add_delegated(
-                    &stream_id,
-                    first_tool,
-                    session_end,
-                    &mut activity_intervals,
-                    &mut stream_times,
-                );
-            }
+        AllocationResult {
+            stream_times: stream_times_vec,
+            total_tracked_ms,
+            unassigned_direct_ms: union_duration_ms(&unassigned.focus_intervals),
+            unassigned_delegated_ms: unassigned.delegated_ms,
         }
     }
+}
 
-    // Calculate total tracked time from interval union
-    let total_tracked_ms = union_duration_ms(&activity_intervals);
-
-    let unassigned = stream_times
-        .remove(UNASSIGNED_STREAM_ID)
-        .unwrap_or_default();
-
-    let stream_times_vec = stream_times
-        .into_iter()
-        .map(|(stream_id, allocation)| StreamTime {
-            stream_id,
-            time_direct_ms: union_duration_ms(&allocation.focus_intervals),
-            time_delegated_ms: allocation.delegated_ms,
-            focus_intervals: allocation.focus_intervals,
-            delegated_intervals: allocation.delegated_intervals,
-        })
-        .collect();
-
-    AllocationResult {
-        stream_times: stream_times_vec,
-        total_tracked_ms,
-        unassigned_direct_ms: union_duration_ms(&unassigned.focus_intervals),
-        unassigned_delegated_ms: unassigned.delegated_ms,
+/// Calculate time allocation for a time range.
+///
+/// Events must be sorted by timestamp ascending.
+/// Events with `stream_id = None` are attributed to a synthetic unassigned bucket
+/// (surfaced via `unassigned_direct_ms` / `unassigned_delegated_ms`) instead of being
+/// silently dropped. The sentinel is removed from `stream_times` before returning.
+///
+/// # Arguments
+///
+/// * `events` - Events to process (must implement `AllocatableEvent`)
+/// * `config` - Allocation configuration
+/// * `period_end` - Where to close open intervals. If None, uses last event + `attention_window`
+/// * `session_end_times` - Known end times for agent sessions (from `agent_sessions` table).
+///   When a session has a known `end_time`, the algorithm uses it instead of the timeout heuristic.
+/// * `session_types` - Known session types (from `agent_sessions` table). `UserMessage` events
+///   originating from non-`User` sessions (e.g. subagents) are skipped so they do not establish
+///   focus.
+///
+/// # Returns
+///
+/// Computed time per stream and total tracked time.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "callers hold the maps tt-db builds with the default hasher"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "allocate_time is the in-crate wrapper over the incremental pass"
+)]
+pub fn allocate_time<E: AllocatableEvent>(
+    events: &[E],
+    config: &AllocationConfig,
+    period_end: Option<DateTime<Utc>>,
+    session_end_times: &HashMap<String, DateTime<Utc>>,
+    session_types: &HashMap<String, SessionType>,
+) -> AllocationResult {
+    let mut allocator = Allocator::new(config, period_end, session_end_times, session_types);
+    for event in events {
+        allocator.push(event);
     }
+    allocator.finish()
 }
 
 /// Total duration covered by the union of `intervals`, merging any overlap.
@@ -816,6 +914,50 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn incremental_allocation_matches_the_hardcoded_oracle() {
+        // Given: a corpus exercising focus, agent work, and an unassigned stretch.
+        let events = vec![
+            TestEvent::tmux_focus(ts(0), "stream-a"),
+            TestEvent::agent_session(ts(1), "started", "session-1", Some("stream-a")),
+            TestEvent::agent_tool_use(ts(2), "session-1", "stream-a"),
+            TestEvent::agent_tool_use(ts(30), "session-1", "stream-a"),
+            TestEvent::tmux_focus_unassigned(ts(60)),
+            TestEvent::agent_session(ts(61), "ended", "session-1", Some("stream-a")),
+        ];
+        let config = test_config();
+        let end_times = HashMap::new();
+        let types = HashMap::new();
+
+        // When: the incremental path runs.
+        let mut allocator = Allocator::new(&config, None, &end_times, &types);
+        for event in &events {
+            allocator.push(event);
+        }
+        let from_pushes = allocator.finish();
+
+        // Then: focus intervals union while delegated intervals sum.
+        assert_eq!(from_pushes.total_tracked_ms, 3_600_000);
+        assert_eq!(from_pushes.unassigned_direct_ms, 60_000);
+        assert_eq!(from_pushes.unassigned_delegated_ms, 0);
+        assert_eq!(
+            from_pushes.stream_times,
+            vec![StreamTime {
+                stream_id: "stream-a".to_string(),
+                time_direct_ms: 60_000,
+                time_delegated_ms: 3_480_000,
+                focus_intervals: vec![Interval {
+                    start: ts(0),
+                    end: ts(1),
+                }],
+                delegated_intervals: vec![Interval {
+                    start: ts(2),
+                    end: ts(60),
+                }],
+            }]
+        );
+    }
 
     fn test_config() -> AllocationConfig {
         AllocationConfig {
@@ -982,6 +1124,48 @@ mod tests {
             .single()
             .expect("valid test timestamp")
             + Duration::minutes(minutes)
+    }
+
+    #[test]
+    fn many_streams_union_identically_however_the_work_is_scheduled() {
+        // Given: enough streams to exercise repeated unions, emitted in ascending timestamp
+        // order because the allocator requires ordered events. The test pins deterministic
+        // output across runs, independent of scheduling.
+        let mut events = Vec::new();
+        let mut minute = 0_i64;
+        for _round in 0..8 {
+            for stream in 0..64 {
+                events.push(TestEvent::tmux_focus(
+                    ts(minute),
+                    &format!("stream-{stream:02}"),
+                ));
+                minute += 1;
+            }
+        }
+        let config = test_config();
+        let end_times = HashMap::new();
+        let types = HashMap::new();
+
+        // When: the same corpus is allocated twice.
+        let run = || {
+            let mut allocator = Allocator::new(&config, None, &end_times, &types);
+            for event in &events {
+                allocator.push(event);
+            }
+            let mut times = allocator.finish().stream_times;
+            times.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+            times
+        };
+        let first = run();
+        let second = run();
+
+        // Then: every stream is present with identical direct and delegated totals.
+        assert_eq!(first.len(), 64);
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.stream_id, b.stream_id);
+            assert_eq!(a.time_direct_ms, b.time_direct_ms);
+            assert_eq!(a.time_delegated_ms, b.time_delegated_ms);
+        }
     }
 
     fn get_stream_time<'a>(

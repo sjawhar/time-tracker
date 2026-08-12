@@ -72,7 +72,7 @@ Three properties of that repair are deliberate. It is **recorded in `meta`** (`s
 
 ## Allocation entry point
 
-`allocate_for_period(db, start, end, period_end, config) -> AllocationResult` (free function in `lib.rs`) is **the only permitted time-allocation entry point outside `tt-core`** — it wraps the clippy-blocked `tt_core::allocation::allocate_time` and carries the sole `#[expect(clippy::disallowed_methods, …)]`. **`end` is exclusive**: an event at exactly `end` belongs to the next period (internally it queries `start..=end − 1ms`).
+`allocate_for_period(db, start, end, period_end, config) -> AllocationResult` (free function in `lib.rs`) is **the only permitted time-allocation entry point outside `tt-core`** — it streams the half-open window into `tt_core::allocation::Allocator`, rather than collecting it, and carries the sole `#[expect(clippy::disallowed_methods, …)]`. **`end` is exclusive**: an event at exactly `end` belongs to the next period (internally it queries `start..=end − 1ms`).
 
 ## Key Types
 
@@ -99,7 +99,11 @@ Three properties of that repair are deliberate. It is **recorded in `meta`** (`s
 |--------|---------|
 | `insert_event` / `insert_events` | Idempotent insert (`INSERT OR IGNORE`); bumps `db_version` when rows land |
 | `get_events` | All events, optional time_after/time_before filters |
-| `get_events_in_range` | Events between start..end (inclusive) |
+| `event_time_bounds` | `MIN`/`MAX` of `events.timestamp`, or `None` when empty. What `recompute` used to derive by materializing all 2.7M events. Reads the raw table, so unlike `get_events` it does not drop rows `row_to_event` cannot parse |
+| `get_events_in_range` | Collects events between start..end (inclusive). Do not use for allocation: its `Vec` materializes the window |
+| `for_each_event_in_range` | Streaming counterpart of `get_events_in_range`: visits each row in ascending timestamp order without collecting. The allocation pass walks forward only, so it never needed the `Vec` |
+| `sessions_spanning_multiple_streams` | Sessions whose events point at more than one stream, with those streams. A data-integrity report, ordered for stable output |
+| `sessions_with_tool_use_but_no_start` | Sessions with `agent_tool_use` in a window but no `agent_session`/`started` in it — the query form of a pre-pass that used to run over a materialized `Vec` |
 | `get_events_by_stream` / `unassigned_event_ids` / `count_events_by_stream` | By stream / the unassigned, **ids only** / how many point at one stream, whoever assigned them. `unassigned_event_ids` deliberately returns ids rather than rows: as `get_events_without_stream` it was the only whole-table scan of unassigned events, and cwd inference read each row's `cwd` straight out of it. See root `AGENTS.md`, "A folder is not a project" |
 | `get_last_event_per_source` | Latest timestamp per source name, across **every** machine. Answers "is anything reporting", not "is this machine's watcher alive" — a synced remote's healthy watcher shares the `local.cosmic` source string and makes the type look current |
 | `last_local_event_per_type` | Latest timestamp per event type over the rows **this machine** produced, ordered by type. "This machine" is derived from the data: `machines` holds only remotes registered by `tt sync`, so a `machine_id` absent from it (NULL rows included) was produced here — reading `machine.json` would put the answer outside the database and out of reach of an in-memory test. A type this machine never produced is **absent rather than old**, which is what lets its caller tell silence from absence. See root `AGENTS.md`, "A dead input must announce itself" |

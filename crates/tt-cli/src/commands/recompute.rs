@@ -3,10 +3,8 @@
 //! Uses the attention allocation algorithm to calculate time based on
 //! focus events and agent activity.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use tt_core::AllocationConfig;
 use tt_db::{Database, allocate_for_period};
 
@@ -66,46 +64,33 @@ pub fn run(db: &Database, force: bool) -> Result<()> {
 
     println!("Recomputing {} stream(s)...", streams.len());
 
-    // Get all events - we need all events to build the focus/agent timelines correctly
-    // even if we're only updating specific streams
-    let events = db.get_events(None, None).context("failed to get events")?;
-
-    if events.is_empty() {
+    // Bounds and the split-session warning are aggregates. Loading every event to derive
+    // them cost 8.9 GB of RSS on the live corpus, and `allocate_for_period` loads the
+    // events it needs itself.
+    let Some((earliest, latest)) = db
+        .event_time_bounds()
+        .context("failed to read event time bounds")?
+    else {
         println!("No events to process.");
         return Ok(());
+    };
+
+    // Sessions split across streams undercount, so they are reported. Not fatal: only the
+    // user can say which stream such a session belongs to.
+    for (session_id, stream_ids) in db
+        .sessions_spanning_multiple_streams()
+        .context("failed to check for sessions split across streams")?
+    {
+        let shown = &session_id[..session_id.len().min(30)];
+        eprintln!(
+            "Warning: session {} has events in {} streams: {:?}",
+            shown,
+            stream_ids.len(),
+            stream_ids,
+        );
+        eprintln!("  Use 'tt streams assign <stream-ref> --session {shown}' to settle it.");
     }
 
-    tracing::debug!(event_count = events.len(), "loaded events for allocation");
-
-    // Warn about sessions with events split across multiple streams.
-    // This is a data integrity issue that causes undercounting.
-    let mut session_streams: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
-    for event in &events {
-        if let (Some(session_id), Some(stream_id)) = (&event.session_id, &event.stream_id) {
-            session_streams
-                .entry(session_id.clone())
-                .or_default()
-                .insert(stream_id.clone());
-        }
-    }
-    for (session_id, stream_ids) in &session_streams {
-        if stream_ids.len() > 1 {
-            let streams_list: Vec<_> = stream_ids.iter().collect();
-            eprintln!(
-                "Warning: session {} has events in {} streams: {:?}",
-                &session_id[..session_id.len().min(30)],
-                stream_ids.len(),
-                streams_list,
-            );
-            eprintln!(
-                "  Use 'tt streams assign <stream-ref> --session {}' to settle it.",
-                &session_id[..session_id.len().min(30)]
-            );
-        }
-    }
-
-    let earliest = events.first().map_or_else(Utc::now, |e| e.timestamp);
-    let latest = events.last().map_or_else(Utc::now, |e| e.timestamp);
     let config = AllocationConfig::default();
     // `allocate_for_period` uses an exclusive end, so extend it past the final event.
     let result = allocate_for_period(
@@ -439,6 +424,21 @@ mod tests {
             focus_intervals: Vec::new(),
             delegated_intervals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn streams_needing_recompute_with_no_events_are_left_untouched() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&zt_stream("stream-1")).unwrap();
+
+        run(&db, false).unwrap();
+
+        let after = db.get_stream("stream-1").unwrap().unwrap();
+        assert_eq!(
+            after.time_direct_ms, 99_999,
+            "no events means no allocation and no write"
+        );
+        assert!(after.needs_recompute);
     }
 
     #[test]

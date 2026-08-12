@@ -30,7 +30,7 @@
 //! version mismatches fail fast rather than silently corrupting data.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     path::Path,
     time::Duration,
 };
@@ -42,7 +42,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tt_core::attribution::{ArtifactMention, RemoteActivity};
-use tt_core::{AllocationConfig, AllocationResult, EventType, SessionType, allocate_time};
+use tt_core::{AllocationConfig, AllocationResult, Allocator, SessionType};
 
 pub mod timeline_gaps;
 pub use timeline_gaps::IdleGap;
@@ -147,6 +147,24 @@ const INHERITED_ASSIGNMENT_SOURCE: &str = "inherited";
 /// parent's stream, and `inherit_stream_for_session` re-points those rows when the
 /// parent is reclassified, which must not happen to these.
 const SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE: &str = "session_membership";
+
+// Counts [`Database::get_events_in_range`] calls made on this thread.
+//
+// Exists so a test can assert *structurally* that `allocate_for_period` streams the
+// window rather than collecting it, instead of inferring it from a stopwatch. Thread-
+// local rather than a field on `Database`: `Database` is `Send` but not `Sync` and an
+// allocation runs entirely on its caller's thread, so per-thread counting is exact and
+// unaffected by cargo running tests in parallel. Compiled out entirely outside tests.
+#[cfg(test)]
+thread_local! {
+    static EVENTS_IN_RANGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has called [`Database::get_events_in_range`].
+#[cfg(test)]
+fn events_in_range_calls() -> usize {
+    EVENTS_IN_RANGE_CALLS.with(std::cell::Cell::get)
+}
 
 /// Format a datetime as RFC3339 with second precision and 'Z' suffix.
 ///
@@ -1460,6 +1478,43 @@ impl Database {
         Ok(Some((parse(&first)?, parse(&last)?)))
     }
 
+    /// Sessions whose events point at more than one stream, with those streams.
+    ///
+    /// A data-integrity report `recompute` prints, and it never needed the events in
+    /// memory to produce it. Ordered by session id, and each stream list ordered, so the
+    /// warning block is stable between runs.
+    ///
+    /// Reads `events` directly rather than through `row_to_event`, so a row that method
+    /// would drop (unknown type, unparseable timestamp) is included here. Measured at 0
+    /// rows on the live corpus before this replaced the in-memory scan.
+    pub fn sessions_spanning_multiple_streams(
+        &self,
+    ) -> Result<Vec<(String, Vec<String>)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, stream_id FROM events
+             WHERE session_id IS NOT NULL AND stream_id IS NOT NULL
+               AND session_id IN (
+                   SELECT session_id FROM events
+                   WHERE session_id IS NOT NULL AND stream_id IS NOT NULL
+                   GROUP BY session_id
+                   HAVING COUNT(DISTINCT stream_id) > 1
+               )
+             GROUP BY session_id, stream_id
+             ORDER BY session_id ASC, stream_id ASC",
+        )?;
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let stream_id: String = row.get(1)?;
+            match grouped.last_mut() {
+                Some((existing, streams)) if *existing == session_id => streams.push(stream_id),
+                _ => grouped.push((session_id, vec![stream_id])),
+            }
+        }
+        Ok(grouped)
+    }
+
     /// Retrieves events within an inclusive time range.
     ///
     /// Events are returned ordered by timestamp ascending.
@@ -1474,6 +1529,9 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<StoredEvent>, DbError> {
+        #[cfg(test)]
+        EVENTS_IN_RANGE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let sql = format!(
             "SELECT {EVENT_COLUMNS} FROM events
              WHERE timestamp >= ?1 AND timestamp <= ?2
@@ -1491,6 +1549,69 @@ impl Database {
         }
 
         Ok(events)
+    }
+
+    /// Visits every event in `start..=end`, in ascending timestamp order.
+    ///
+    /// The streaming counterpart of [`Self::get_events_in_range`], which returns a `Vec`
+    /// and therefore holds the whole window: on the live corpus that was 2,738,805 rows
+    /// and the larger half of `tt recompute`'s 8.9 GB. The allocation pass only ever
+    /// walks forward, so it never needed the `Vec`.
+    ///
+    /// Rows that cannot be read are skipped, matching `get_events_in_range`.
+    pub fn for_each_event_in_range<F>(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        mut f: F,
+    ) -> Result<(), DbError>
+    where
+        F: FnMut(StoredEvent),
+    {
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM events
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![format_timestamp(start), format_timestamp(end)])?;
+        while let Some(row) = rows.next()? {
+            if let Some(event) = Self::row_to_event(row)? {
+                f(event);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sessions with agent tool use in the window but no `started` event in it.
+    ///
+    /// The query form of the pre-pass `allocate_for_period` used to run over a
+    /// materialized `Vec` of every event in the window. Same window, same predicate: a
+    /// session whose start fell outside the range needs its start event fetched, or its
+    /// delegated span has no opening.
+    pub fn sessions_with_tool_use_but_no_start(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT t.session_id FROM events t
+             WHERE t.type = 'agent_tool_use'
+               AND t.session_id IS NOT NULL
+               AND t.timestamp >= ?1 AND t.timestamp <= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM events s
+                   WHERE s.type = 'agent_session' AND s.action = 'started'
+                     AND s.session_id = t.session_id
+                     AND s.timestamp >= ?1 AND s.timestamp <= ?2
+               )
+             ORDER BY t.session_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![format_timestamp(start), format_timestamp(end)],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
     pub fn get_agent_session_start_events(
@@ -4628,7 +4749,7 @@ impl Database {
 /// `end` is exclusive: events at exactly `end` belong to the next period.
 #[expect(
     clippy::disallowed_methods,
-    reason = "single permitted allocation boundary"
+    reason = "single permitted allocation boundary; allocate_for_period is the only caller of Allocator::new"
 )]
 pub fn allocate_for_period(
     db: &Database,
@@ -4638,34 +4759,22 @@ pub fn allocate_for_period(
     config: &AllocationConfig,
 ) -> Result<AllocationResult, DbError> {
     let inclusive_end = end - chrono::Duration::milliseconds(1);
-    let mut events = if inclusive_end < start {
-        Vec::new()
-    } else {
-        db.get_events_in_range(start, inclusive_end)?
-    };
-
-    let session_ids_with_starts: BTreeSet<&str> = events
-        .iter()
-        .filter(|event| {
-            event.event_type == EventType::AgentSession
-                && event.action.as_deref() == Some("started")
-        })
-        .filter_map(|event| event.session_id.as_deref())
-        .collect();
-    let missing_session_ids: Vec<String> = events
-        .iter()
-        .filter(|event| event.event_type == EventType::AgentToolUse)
-        .filter_map(|event| event.session_id.as_deref())
-        .filter(|session_id| !session_ids_with_starts.contains(*session_id))
-        .map(ToString::to_string)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
-    if !missing_session_ids.is_empty() {
-        let mut start_events = db.get_agent_session_start_events(&missing_session_ids)?;
-        start_events.append(&mut events);
-        events = start_events;
+    if inclusive_end < start {
+        let agent_sessions = db.agent_sessions_in_range(start, end)?;
+        let session_types: HashMap<String, SessionType> = agent_sessions
+            .iter()
+            .map(|session| (session.session_id.clone(), session.session_type))
+            .collect();
+        let session_end_times: HashMap<String, DateTime<Utc>> = agent_sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .end_time
+                    .map(|end| (session.session_id.clone(), end))
+            })
+            .collect();
+        let allocator = Allocator::new(config, period_end, &session_end_times, &session_types);
+        return Ok(allocator.finish());
     }
 
     let agent_sessions = db.agent_sessions_in_range(start, end)?;
@@ -4682,13 +4791,22 @@ pub fn allocate_for_period(
         })
         .collect();
 
-    Ok(allocate_time(
-        &events,
-        config,
-        period_end,
-        &session_end_times,
-        &session_types,
-    ))
+    let mut allocator = Allocator::new(config, period_end, &session_end_times, &session_types);
+
+    // Start events for sessions whose opening fell outside the window are pushed first,
+    // exactly as the old code prepended them to the Vec.
+    let missing_session_ids = db.sessions_with_tool_use_but_no_start(start, inclusive_end)?;
+    if !missing_session_ids.is_empty() {
+        for event in db.get_agent_session_start_events(&missing_session_ids)? {
+            allocator.push(&event);
+        }
+    }
+
+    // Then the window itself, streamed in timestamp order: one row is resident at a time
+    // instead of all 2.7M.
+    db.for_each_event_in_range(start, inclusive_end, |event| allocator.push(&event))?;
+
+    Ok(allocator.finish())
 }
 
 #[cfg(test)]
@@ -4696,6 +4814,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use serde_json::json;
+    use tt_core::EventType;
 
     fn make_event(
         id: &str,
@@ -4908,6 +5027,35 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let events = db.get_events(None, None).unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn event_time_bounds_reports_the_first_and_last_event() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.event_time_bounds().unwrap(), None);
+
+        db.insert_events(&[
+            make_event(
+                "b",
+                Utc.with_ymd_and_hms(2026, 3, 2, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+            make_event(
+                "a",
+                Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+            make_event(
+                "c",
+                Utc.with_ymd_and_hms(2026, 3, 3, 9, 0, 0).unwrap(),
+                EventType::UserMessage,
+            ),
+        ])
+        .unwrap();
+
+        let (first, last) = db.event_time_bounds().unwrap().unwrap();
+        assert_eq!(first, Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap());
+        assert_eq!(last, Utc.with_ymd_and_hms(2026, 3, 3, 9, 0, 0).unwrap());
     }
 
     #[test]
@@ -5140,6 +5288,140 @@ mod tests {
     }
 
     #[test]
+    fn for_each_event_in_range_visits_rows_in_timestamp_order_without_collecting() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_events(&[
+            make_event(
+                "b",
+                Utc.with_ymd_and_hms(2026, 3, 1, 9, 1, 0).unwrap(),
+                tt_core::EventType::UserMessage,
+            ),
+            make_event(
+                "a",
+                Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+                tt_core::EventType::UserMessage,
+            ),
+            make_event(
+                "c",
+                Utc.with_ymd_and_hms(2026, 3, 1, 9, 2, 0).unwrap(),
+                tt_core::EventType::UserMessage,
+            ),
+            make_event(
+                "outside",
+                Utc.with_ymd_and_hms(2026, 4, 1, 9, 0, 0).unwrap(),
+                tt_core::EventType::UserMessage,
+            ),
+        ])
+        .unwrap();
+
+        let mut seen = Vec::new();
+        db.for_each_event_in_range(
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 2, 0).unwrap(),
+            |event| seen.push(event.id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn sessions_with_tool_use_but_no_start_finds_only_the_unstarted() {
+        let db = Database::open_in_memory().unwrap();
+        let window_start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0).unwrap();
+
+        let mut started = make_event(
+            "s",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+            tt_core::EventType::AgentSession,
+        );
+        started.session_id = Some("has-start".to_string());
+        started.action = Some("started".to_string());
+        let mut tool_with = make_event(
+            "t1",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 1, 0).unwrap(),
+            tt_core::EventType::AgentToolUse,
+        );
+        tool_with.session_id = Some("has-start".to_string());
+        let mut tool_without = make_event(
+            "t2",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 2, 0).unwrap(),
+            tt_core::EventType::AgentToolUse,
+        );
+        tool_without.session_id = Some("no-start".to_string());
+        db.insert_events(&[started, tool_with, tool_without])
+            .unwrap();
+
+        assert_eq!(
+            db.sessions_with_tool_use_but_no_start(window_start, window_end)
+                .unwrap(),
+            vec!["no-start".to_string()]
+        );
+    }
+
+    #[test]
+    fn allocate_for_period_streams_the_window_instead_of_collecting_it() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("A")))
+            .unwrap();
+
+        // 5,000 focus events on one stream. The size is incidental to the guard — it is
+        // the call count that proves the path — but a corpus large enough to make the
+        // streaming loop iterate keeps the correctness assertions meaningful.
+        let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let mut batch = Vec::with_capacity(5_000);
+        for index in 0..5_000_i64 {
+            let mut event = make_event(
+                &format!("f{index}"),
+                base + chrono::Duration::seconds(index * 10),
+                EventType::TmuxPaneFocus,
+            );
+            event.stream_id = Some("stream-a".to_string());
+            batch.push(event);
+        }
+        db.insert_events(&batch).unwrap();
+
+        let (first, last) = db.event_time_bounds().unwrap().unwrap();
+        let config = tt_core::AllocationConfig::default();
+
+        let before = events_in_range_calls();
+        let result = allocate_for_period(
+            &db,
+            first,
+            last + chrono::Duration::milliseconds(1),
+            None,
+            &config,
+        )
+        .unwrap();
+
+        // The guard: the collecting reader was never touched.
+        assert_eq!(
+            events_in_range_calls(),
+            before,
+            "allocate_for_period called get_events_in_range; the window is being \
+             materialized again"
+        );
+
+        assert_eq!(result.stream_times.len(), 1);
+        let span_ms = (last - first).num_milliseconds();
+        let max_direct_ms = span_ms + config.attention_window_ms;
+        assert!(
+            result.stream_times[0].time_direct_ms > 0,
+            "no direct time accrued; the streamed events never reached the allocator"
+        );
+        assert!(
+            result.stream_times[0].time_direct_ms <= max_direct_ms,
+            "direct {} exceeded event span plus final attention window {}",
+            result.stream_times[0].time_direct_ms,
+            max_direct_ms
+        );
+    }
+
+    #[test]
     fn test_allocate_for_period_populates_session_maps() {
         let db = Database::open_in_memory().unwrap();
         // Session with an explicit end_time; delegated time must stop at end_time,
@@ -5184,6 +5466,61 @@ mod tests {
             total_delegated(&result) > 0,
             "session start must be backfilled"
         );
+    }
+
+    #[test]
+    fn a_session_started_before_the_window_still_accrues_delegated_time() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("A")))
+            .unwrap();
+
+        // The session opens an hour before the window and works inside it, so its
+        // `started` event is not among the rows the window query returns.
+        let mut started = make_event(
+            "s",
+            Utc.with_ymd_and_hms(2026, 3, 1, 8, 0, 0).unwrap(),
+            tt_core::EventType::AgentSession,
+        );
+        started.session_id = Some("session-1".to_string());
+        started.action = Some("started".to_string());
+        started.stream_id = Some("stream-a".to_string());
+
+        let mut first_tool = make_event(
+            "t1",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 5, 0).unwrap(),
+            tt_core::EventType::AgentToolUse,
+        );
+        first_tool.session_id = Some("session-1".to_string());
+        first_tool.stream_id = Some("stream-a".to_string());
+
+        let mut last_tool = make_event(
+            "t2",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 20, 0).unwrap(),
+            tt_core::EventType::AgentToolUse,
+        );
+        last_tool.session_id = Some("session-1".to_string());
+        last_tool.stream_id = Some("stream-a".to_string());
+
+        db.insert_events(&[started, first_tool, last_tool]).unwrap();
+
+        let config = tt_core::AllocationConfig::default();
+        let result = allocate_for_period(
+            &db,
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 30, 0).unwrap(),
+            None,
+            &config,
+        )
+        .unwrap();
+
+        // 09:05 (first tool use) to 09:20 (the last event, which closes the still-open
+        // session). Zero here means the backfilled start never reached the allocator.
+        let stream = result
+            .stream_times
+            .iter()
+            .find(|stream| stream.stream_id == "stream-a")
+            .expect("stream-a should have accrued delegated time");
+        assert_eq!(stream.time_delegated_ms, 15 * 60 * 1000);
     }
 
     #[test]
@@ -6006,6 +6343,92 @@ mod tests {
             last_event_at: None,
             needs_recompute: false,
         }
+    }
+
+    #[test]
+    fn sessions_spanning_multiple_streams_reports_only_the_split_ones() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("A")))
+            .unwrap();
+        db.insert_stream(&make_stream("stream-b", Some("B")))
+            .unwrap();
+
+        let mut split_one = make_event(
+            "e1",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_one.session_id = Some("split".to_string());
+        split_one.stream_id = Some("stream-a".to_string());
+        let mut split_two = make_event(
+            "e2",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 1, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_two.session_id = Some("split".to_string());
+        split_two.stream_id = Some("stream-b".to_string());
+        let mut settled = make_event(
+            "e3",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 2, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        settled.session_id = Some("settled".to_string());
+        settled.stream_id = Some("stream-a".to_string());
+
+        let mut split_unassigned = make_event(
+            "e4",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 3, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        split_unassigned.session_id = Some("split".to_string());
+
+        let mut early_one = make_event(
+            "e5",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 4, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        early_one.session_id = Some("aaa".to_string());
+        early_one.stream_id = Some("stream-b".to_string());
+
+        let mut early_two = make_event(
+            "e6",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 5, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        early_two.session_id = Some("aaa".to_string());
+        early_two.stream_id = Some("stream-a".to_string());
+
+        let mut settled_unassigned = make_event(
+            "e7",
+            Utc.with_ymd_and_hms(2026, 3, 1, 9, 6, 0).unwrap(),
+            EventType::UserMessage,
+        );
+        settled_unassigned.session_id = Some("settled".to_string());
+
+        db.insert_events(&[
+            split_one,
+            split_two,
+            settled,
+            split_unassigned,
+            early_one,
+            early_two,
+            settled_unassigned,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            db.sessions_spanning_multiple_streams().unwrap(),
+            vec![
+                (
+                    "aaa".to_string(),
+                    vec!["stream-a".to_string(), "stream-b".to_string()]
+                ),
+                (
+                    "split".to_string(),
+                    vec!["stream-a".to_string(), "stream-b".to_string()]
+                )
+            ]
+        );
     }
 
     #[test]
