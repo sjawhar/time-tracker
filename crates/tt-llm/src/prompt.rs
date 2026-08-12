@@ -215,6 +215,7 @@ mod tests {
 
     fn input(user_prompts: Vec<String>) -> ClassificationInput {
         ClassificationInput {
+            has_session: true,
             session_id: "session-1".to_owned(),
             machine: Some("laptop".to_owned()),
             cwd: Some("/work/project".to_owned()),

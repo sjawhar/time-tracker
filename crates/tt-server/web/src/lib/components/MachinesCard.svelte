@@ -20,6 +20,9 @@ function formatTimeAgo(dateStr: string | null): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+let displayMachines = $derived(machines.slice(0, 10));
+let remainingMachines = $derived(machines.length - displayMachines.length);
 </script>
 
 <div class="flex flex-col p-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -29,7 +32,7 @@ function formatTimeAgo(dateStr: string | null): string {
   
   {#if machines.length > 0}
     <ul class="flex flex-col gap-2 w-full">
-      {#each machines as machine}
+      {#each displayMachines as machine}
         <li class="flex justify-between items-center gap-2 w-full">
           <span class="text-sm text-[var(--color-text-base)] break-words min-w-0" title={machine.label}>
             {machine.label}
@@ -40,6 +43,11 @@ function formatTimeAgo(dateStr: string | null): string {
           </span>
         </li>
       {/each}
+      {#if remainingMachines > 0}
+        <li class="text-xs text-center text-[var(--color-text-muted)] italic mt-1">
+          + {remainingMachines} more machines
+        </li>
+      {/if}
     </ul>
   {:else}
     <div class="text-sm text-[var(--color-text-muted)] italic">

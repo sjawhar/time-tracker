@@ -19,6 +19,11 @@ function formatDuration(ms: number): string {
   const remainingMins = minutes % 60;
   return `${hours}h ${remainingMins}m`;
 }
+
+let displaySessions = $derived(sessions ? sessions.slice(0, 12) : []);
+let remainingSessions = $derived(
+  sessions ? sessions.length - displaySessions.length : 0,
+);
 </script>
 
 <div class="flex flex-col p-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -35,17 +40,17 @@ function formatDuration(ms: number): string {
   
   {#if sessions && sessions.length > 0}
     <div class="flex flex-col gap-2">
-      {#each sessions as session (session.session_id)}
+      {#each displaySessions as session (session.session_id)}
         {@const quiet = isQuiet(session.last_activity)}
         <div class="flex flex-col gap-1.5 p-2 rounded bg-[var(--color-bg-base)] border {quiet ? 'border-[var(--color-status-amber)]/50' : 'border-[var(--color-border)]'}">
           <div class="flex justify-between items-start gap-2">
             <div class="flex items-center gap-1.5 min-w-0">
               <div class="w-2 h-2 rounded-full shrink-0 {quiet ? 'bg-[var(--color-status-amber)]' : 'bg-[var(--color-status-green)] animate-pulse'}" title={quiet ? 'Quiet (>10m no activity)' : 'Active'}></div>
-              <div class="text-sm font-medium text-[var(--color-text-base)] truncate" title={session.harness}>
+              <div class="text-sm font-medium text-[var(--color-text-base)] line-clamp-2 break-words" title={session.harness}>
                 {session.harness}
               </div>
               {#if session.machine_label}
-                <div class="text-xs text-[var(--color-text-muted)] bg-[var(--color-bg-surface)] px-1.5 py-0.5 rounded truncate max-w-[80px]" title={session.machine_label}>
+                <div class="text-xs text-[var(--color-text-muted)] bg-[var(--color-bg-surface)] px-1.5 py-0.5 rounded line-clamp-2 break-words max-w-[80px]" title={session.machine_label}>
                   {session.machine_label}
                 </div>
               {/if}
@@ -57,7 +62,7 @@ function formatDuration(ms: number): string {
           
           <div class="flex items-center gap-1.5">
             {#if session.stream}
-              <div class="text-xs text-[var(--color-text-base)] truncate" title={session.stream.name}>
+              <div class="text-xs text-[var(--color-text-base)] line-clamp-2 break-words" title={session.stream.name}>
                 {session.stream.name}
               </div>
             {:else}
@@ -68,19 +73,24 @@ function formatDuration(ms: number): string {
           </div>
           
           {#if session.linked_todo_text}
-            <div class="text-xs text-[var(--color-text-muted)] truncate border-t border-[var(--color-border)] pt-1.5 mt-0.5" title={session.linked_todo_text}>
+            <div class="text-xs text-[var(--color-text-muted)] line-clamp-2 break-words border-t border-[var(--color-border)] pt-1.5 mt-0.5" title={session.linked_todo_text}>
               <span class="opacity-70">↳</span> {session.linked_todo_text}
             </div>
           {:else}
             <div class="text-xs text-[var(--color-text-muted)] italic border-t border-dashed border-[var(--color-border)] pt-1.5 mt-0.5 flex justify-between items-center">
               <span>Unlinked</span>
-              <button class="text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors" title="Linking not yet wired" disabled>
+              <button class="text-[var(--color-text-muted)] transition-colors opacity-50 cursor-not-allowed" title="Linking not yet wired" disabled>
                 Link...
               </button>
             </div>
           {/if}
         </div>
       {/each}
+      {#if remainingSessions > 0}
+        <div class="text-xs text-center text-[var(--color-text-muted)] py-1">
+          + {remainingSessions} more active
+        </div>
+      {/if}
     </div>
   {:else}
     <div class="text-sm text-[var(--color-text-muted)] italic py-2 text-center">

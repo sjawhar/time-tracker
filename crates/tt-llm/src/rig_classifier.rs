@@ -278,7 +278,16 @@ impl RigClassifier {
         roster: &[StreamSummary],
     ) -> Result<ClassificationOutput, LlmError> {
         let prompt = prompt::build(input, roster);
-        let Some(tools) = self.tools.as_ref() else {
+        // No provider configured, or nothing for one to read. A scope with no session must
+        // not be offered the session-fetch tools: the preamble would promise it may "look
+        // further into the session", the model would call a tool that cannot succeed, and
+        // `SessionDetail` would answer `is not indexed` -- which reads as a broken system
+        // rather than as a scope that never had a session. Measured live, that reached 161
+        // of 518 pending proposals, all window-scoped, averaging 0.491 confidence against
+        // 0.597 for the rest of the queue. Withholding the tools is the same remedy
+        // `WithdrawSpentTools` applies to a spent budget: stop the model rather than inform
+        // it, because a tool it can see is a tool it will call.
+        let Some(tools) = self.tools.as_ref().filter(|_| input.has_session) else {
             return self.extract::<ClassificationExtract>(&prompt)?.try_into();
         };
         let attempt = retrying(
@@ -1019,6 +1028,7 @@ mod tests {
         let classifier =
             RigClassifier::from_config("claude-haiku-4-5", "ANTHROPIC_API_KEY").unwrap();
         let input = ClassificationInput {
+            has_session: true,
             session_id: "manual-verification".to_owned(),
             machine: None,
             cwd: Some("/tmp".to_owned()),

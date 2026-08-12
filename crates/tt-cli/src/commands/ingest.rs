@@ -911,7 +911,7 @@ fn assign_terminal_focus(db: &tt_db::Database) -> Result<u64> {
         .filter_map(|event| {
             let stream_id =
                 resolve_terminal_focus(event.timestamp, &activity, TERMINAL_CORRELATION_WINDOW_MS)?;
-            Some((event.id.clone(), stream_id))
+            (stream_id != tt_db::JUNK_STREAM_SLUG).then_some((event.id.clone(), stream_id))
         })
         .collect();
 
@@ -2444,6 +2444,46 @@ fn assign_terminal_focus_attributes_a_terminal_window_to_concurrent_remote_work(
     // and the browser focus stays unassigned rather than being invented into a stream.
     let unassigned = db.unassigned_event_ids().unwrap();
     assert_eq!(unassigned, vec!["focus-browser".to_string()]);
+}
+
+#[test]
+fn assign_terminal_focus_leaves_a_junk_winner_unassigned() {
+    use chrono::TimeZone;
+
+    // Given: terminal activity whose only correlated stream is the reserved junk stream.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    let junk_stream_id = db.junk_stream_id().unwrap();
+    let base = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+    let mut remote = StoredEvent {
+        stream_id: Some(junk_stream_id),
+        cwd: Some("/home/ubuntu/junk".to_string()),
+        event_type: tt_core::EventType::AgentToolUse,
+        ..test_window_focus("junk-tool", base, "", "")
+    };
+    remote.window_app_id = None;
+    remote.window_title = None;
+    db.insert_event(&remote).unwrap();
+    db.insert_event(&test_window_focus(
+        "junk-focus",
+        base + chrono::Duration::seconds(20),
+        "com.mitchellh.ghostty",
+        "mosh devbox",
+    ))
+    .unwrap();
+
+    // When: terminal-focus correlation resolves only junk activity.
+    let assigned = assign_terminal_focus(&db).unwrap();
+
+    // Then: the human focus remains unassigned instead of being filed as no work.
+    assert_eq!(assigned, 0);
+    let focus = db
+        .get_events(None, None)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.id == "junk-focus")
+        .unwrap();
+    assert_eq!(focus.stream_id, None);
+    assert_eq!(focus.assignment_source, None);
 }
 
 #[cfg(test)]

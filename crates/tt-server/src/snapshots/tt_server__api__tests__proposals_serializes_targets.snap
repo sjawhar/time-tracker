@@ -35,5 +35,6 @@ expression: rendered
         "name": "Support handoff"
       }
     }
-  ]
+  ],
+  "total_pending": 2
 }

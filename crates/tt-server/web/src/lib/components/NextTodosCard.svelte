@@ -7,7 +7,12 @@ let expanded = $state(false);
 
 let displayTodos = $derived(() => {
   if (!todos) return [];
-  return expanded ? todos : todos.slice(0, 3);
+  return expanded ? todos.slice(0, 12) : todos.slice(0, 3);
+});
+
+let remainingTodos = $derived(() => {
+  if (!todos) return 0;
+  return todos.length - displayTodos().length;
 });
 </script>
 
@@ -17,11 +22,14 @@ let displayTodos = $derived(() => {
       Next Todos
     </div>
     {#if todos && todos.length > 3}
-      <button 
-        class="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors"
+      <!-- min-h-6/px-1.5 keep this a WCAG 2.2 SC 2.5.8 target (24x24 CSS px minimum).
+           text-xs alone gave it a 16px box, which is the one control on the page that
+           failed that floor -- and it is the only route to the rest of the queue. -->
+      <button
+        class="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors cursor-pointer min-h-6 px-1.5 py-1 -mr-1.5 inline-flex items-center"
         onclick={() => expanded = !expanded}
       >
-        {expanded ? 'Show less' : `Show all (${todos.length})`}
+        {expanded ? 'Show less' : `Show more (${todos.length})`}
       </button>
     {/if}
   </div>
@@ -34,7 +42,7 @@ let displayTodos = $derived(() => {
             {todo.text}
           </div>
           <div class="flex items-center justify-between mt-1">
-            <div class="text-xs text-[var(--color-text-muted)] truncate max-w-[60%]" title={todo.stream_slug || 'Unassigned'}>
+            <div class="text-xs text-[var(--color-text-muted)] line-clamp-2 break-words max-w-[60%]" title={todo.stream_slug || 'Unassigned'}>
               {todo.stream_slug || 'Unassigned'}
             </div>
             {#if todo.linked_agent_count > 0}
@@ -46,6 +54,11 @@ let displayTodos = $derived(() => {
           </div>
         </div>
       {/each}
+      {#if expanded && remainingTodos() > 0}
+        <div class="text-xs text-center text-[var(--color-text-muted)] py-1">
+          + {remainingTodos()} more pending
+        </div>
+      {/if}
     </div>
   {:else}
     <div class="text-sm text-[var(--color-text-muted)] italic py-2 text-center">

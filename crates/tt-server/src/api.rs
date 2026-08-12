@@ -31,6 +31,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("request conflict: {0}")]
     Conflict(String),
+    #[error("report unavailable")]
+    Report(#[source] anyhow::Error),
     #[error("status unavailable")]
     Status(#[source] anyhow::Error),
     #[error("timeline unavailable")]
@@ -67,6 +69,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/status", get(status))
         .route("/api/timeline", get(timeline))
+        .route("/api/report", get(report))
         .route("/api/sse", get(sse))
         .merge(rail::router())
         .with_state(state)
@@ -113,6 +116,53 @@ async fn timeline(
     Ok(Json(data))
 }
 
+#[derive(Debug, Deserialize)]
+struct ReportQuery {
+    period: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+}
+
+async fn report(
+    State(state): State<ApiState>,
+    Query(query): Query<ReportQuery>,
+) -> Result<Json<tt_cli::commands::report::JsonReport>, ApiError> {
+    let period = if let Some(p) = query.period {
+        match p.as_str() {
+            "week" => tt_cli::commands::report::Period::Week,
+            "last_week" => tt_cli::commands::report::Period::LastWeek,
+            "day" => tt_cli::commands::report::Period::Day,
+            "last_day" => tt_cli::commands::report::Period::LastDay,
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "invalid period query parameter".to_owned(),
+                ));
+            }
+        }
+    } else if let (Some(start), Some(end)) = (query.start, query.end) {
+        let start = DateTime::parse_from_rfc3339(&start)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|_| ApiError::BadRequest("invalid start query parameter".to_owned()))?;
+        let end = DateTime::parse_from_rfc3339(&end)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|_| ApiError::BadRequest("invalid end query parameter".to_owned()))?;
+        tt_cli::commands::report::Period::Custom(start, end)
+    } else {
+        tt_cli::commands::report::Period::Week
+    };
+
+    let database_path = state.database_path;
+    let data = tokio::task::spawn_blocking(move || -> Result<_> {
+        let db = tt_db::Database::open(&database_path).context("open report database")?;
+        tt_cli::commands::report::generate_report_data(&db, period, Utc::now())
+            .context("generate report data")
+    })
+    .await
+    .map_err(|error| ApiError::Report(anyhow::Error::new(error).context("report task panicked")))?
+    .map_err(ApiError::Report)?;
+
+    Ok(Json(tt_cli::commands::report::build_json_report(&data)))
+}
 fn resolve_timeline_window(
     query: TimelineQuery,
     now: DateTime<Utc>,

@@ -4,6 +4,8 @@ import type { WipStatus } from '../types';
 let { wip }: { wip: WipStatus } = $props();
 
 let isOverLimit = $derived(wip.in_flight.length > wip.limit);
+let displayWip = $derived(wip.in_flight.slice(0, 10));
+let remainingWip = $derived(wip.in_flight.length - displayWip.length);
 </script>
 
 <div 
@@ -18,11 +20,16 @@ let isOverLimit = $derived(wip.in_flight.length > wip.limit);
   
   {#if wip.in_flight.length > 0}
     <ul class="flex flex-col gap-1">
-      {#each wip.in_flight as stream}
+      {#each displayWip as stream}
         <li class="text-sm text-[var(--color-text-base)] break-words" title={stream.name}>
           • {stream.name}
         </li>
       {/each}
+      {#if remainingWip > 0}
+        <li class="text-xs text-[var(--color-text-muted)] italic mt-1">
+          + {remainingWip} more in flight
+        </li>
+      {/if}
     </ul>
   {:else}
     <div class="text-sm text-[var(--color-text-muted)] italic">

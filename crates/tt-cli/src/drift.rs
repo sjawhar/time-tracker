@@ -47,6 +47,8 @@ pub struct CurrentStream {
     pub stream_id: String,
     pub name: String,
     pub since: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -216,6 +218,7 @@ pub fn compute_verdict(db: &Database, config: &Config, now: DateTime<Utc>) -> Re
     Ok(Verdict {
         aligned: current_stream
             .as_ref()
+            .filter(|c| c.active)
             .zip(top_stream_id.as_ref())
             .map(|(current, top_stream_id)| current.stream_id == *top_stream_id),
         current_stream,
@@ -321,12 +324,10 @@ fn current_stream(
     else {
         return Ok(None);
     };
-    if latest.timestamp < attention_start {
-        return Ok(None);
-    }
     let Some(stream_id) = latest.stream_id.as_deref() else {
         return Ok(None);
     };
+    let active = latest.timestamp >= attention_start;
     let mut since = latest.timestamp;
     for event in events[..latest_index]
         .iter()
@@ -356,6 +357,8 @@ fn current_stream(
         stream_id: stream_id.to_string(),
         name,
         since,
+        last_seen: latest.timestamp,
+        active,
     }))
 }
 

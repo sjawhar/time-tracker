@@ -5,6 +5,7 @@ import ClassifierHealthCard from './lib/components/ClassifierHealthCard.svelte';
 import MachinesCard from './lib/components/MachinesCard.svelte';
 import NextTodosCard from './lib/components/NextTodosCard.svelte';
 import ProposalsCard from './lib/components/ProposalsCard.svelte';
+import TimeCard from './lib/components/TimeCard.svelte';
 import Timeline from './lib/components/Timeline.svelte';
 import TopTodoCard from './lib/components/TopTodoCard.svelte';
 import VerdictCard from './lib/components/VerdictCard.svelte';
@@ -28,13 +29,17 @@ onMount(() => {
     {:else if store.verdict}
       <div class="flex flex-col gap-5 p-5 min-h-full">
         <VerdictCard verdict={store.verdict} />
+        {#if store.report}
+          <TimeCard report={store.report} period={store.reportPeriod} onPeriodChange={(p) => store.setReportPeriod(p)} />
+        {/if}
         <TopTodoCard todo={store.verdict.top_todo} />
         <WipCard wip={store.verdict.wip} />
         
         <div class="flex-1 flex flex-col gap-4">
           <NextTodosCard todos={store.todos} />
           <AgentSessionsCard sessions={store.sessions} />
-          <ProposalsCard proposals={store.proposals} />
+          <ProposalsCard proposalsData={store.proposals} deciding={store.decidingProposal}
+            onDecide={(id, decision) => store.decideProposal(id, decision)} />
         </div>
         
         <div class="mt-auto pt-5 flex flex-col gap-5">

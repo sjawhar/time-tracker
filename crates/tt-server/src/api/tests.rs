@@ -35,6 +35,36 @@ async fn timeline_empty_window_returns_an_empty_stream_list() -> Result<()> {
 }
 
 #[tokio::test]
+async fn report_serializes_a_representative_fixture() -> Result<()> {
+    let (app, _database_file, _todo_store) = fixture_app()?;
+
+    let response = request(
+        app,
+        "/api/report?start=2025-01-15T00:00:00Z&end=2025-01-16T00:00:00Z",
+    )
+    .await?;
+
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let mut value: serde_json::Value = serde_json::from_str(response_body(&response))?;
+    // Normalize the values that depend on when and where the test runs.
+    //
+    // `period` is rendered as a LOCAL date (report/json.rs converts through
+    // `Local`), and this request asks for a custom range given as UTC instants,
+    // so UTC midnight is the previous day in every negative offset: CI printed
+    // 2025-01-15 where America/Denver printed 2025-01-14. The seven report-json
+    // snapshots do cover period rendering, and they are stable because their
+    // periods are local-midnight aligned to begin with. Re-covering it here
+    // would only re-cover it fragilely, so this asserts payload SHAPE instead.
+    value["generated_at"] = serde_json::json!("[timestamp]");
+    value["timezone"] = serde_json::json!("Etc/UTC");
+    value["period"]["start"] = serde_json::json!("[local-date]");
+    value["period"]["end"] = serde_json::json!("[local-date]");
+    let rendered = serde_json::to_string_pretty(&value)?;
+    with_snapshots(|| insta::assert_snapshot!(rendered));
+    Ok(())
+}
+
+#[tokio::test]
 async fn timeline_rejects_a_malformed_duration() -> Result<()> {
     let (app, _database_file, _todo_store) = fixture_app()?;
 

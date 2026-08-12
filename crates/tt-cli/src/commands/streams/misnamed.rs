@@ -26,7 +26,8 @@ pub struct MisnamedStream {
     pub id: String,
     pub id_short: String,
     pub name: String,
-    /// What the name describes instead: `activity_type`, `date_range`, `catch_all`.
+    /// What the name describes instead: `activity_type`, `date_range`, `instance_suffix`, or
+    /// `catch_all`.
     pub reason: &'static str,
     /// Events currently pointing at this stream, whoever assigned them.
     pub events: u64,
@@ -38,7 +39,9 @@ const fn reason_key(reason: MisnamedReason) -> &'static str {
     match reason {
         MisnamedReason::ActivityType => "activity_type",
         MisnamedReason::DateRange => "date_range",
+        MisnamedReason::InstanceSuffix => "instance_suffix",
         MisnamedReason::CatchAll => "catch_all",
+        MisnamedReason::Fragmented => "fragmented",
     }
 }
 
@@ -100,7 +103,7 @@ pub fn format_misnamed(entries: &[MisnamedStream]) -> Result<String> {
 
     writeln!(
         output,
-        "These names describe an activity, a date, or a leftover bucket rather than the work."
+        "These names describe an activity, a date, an execution instance, or a leftover bucket rather than the work."
     )?;
     writeln!(output)?;
 

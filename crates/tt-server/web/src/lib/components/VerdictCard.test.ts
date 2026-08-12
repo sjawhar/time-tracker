@@ -9,6 +9,8 @@ describe('VerdictCard', () => {
       stream_id: '1',
       name: 'Test Stream',
       since: new Date().toISOString(),
+      last_seen: new Date().toISOString(),
+      active: true,
     },
     top_todo: null,
     aligned: null,
@@ -24,9 +26,9 @@ describe('VerdictCard', () => {
     },
   };
 
-  it('renders UNKNOWN state when aligned is null', () => {
+  it('renders AWAY state when aligned is null and current_stream is present', () => {
     const { getByText } = render(VerdictCard, { verdict: baseVerdict });
-    expect(getByText('UNKNOWN')).toBeInTheDocument();
+    expect(getByText('AWAY')).toBeInTheDocument();
   });
 
   it('renders ALIGNED state when aligned is true', () => {
@@ -43,11 +45,11 @@ describe('VerdictCard', () => {
     expect(getByText('DRIFTING')).toBeInTheDocument();
   });
 
-  it('renders "No active stream" when current_stream is null', () => {
+  it('renders "No recent stream" when current_stream is null', () => {
     const { getByText } = render(VerdictCard, {
       verdict: { ...baseVerdict, current_stream: null },
     });
-    expect(getByText('No active stream')).toBeInTheDocument();
+    expect(getByText('No recent stream')).toBeInTheDocument();
   });
 
   it('applies green styling when ALIGNED', () => {

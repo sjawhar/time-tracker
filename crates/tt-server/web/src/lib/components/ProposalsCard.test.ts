@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import { describe, expect, it } from 'vitest';
 import type { Proposal } from '../types';
 import ProposalsCard from './ProposalsCard.svelte';
@@ -29,17 +29,23 @@ describe('ProposalsCard', () => {
   ];
 
   it('renders empty state when no proposals', () => {
-    render(ProposalsCard, { proposals: [] });
+    render(ProposalsCard, {
+      proposalsData: { items: [], total_pending: 0 },
+      onDecide: () => {},
+    });
     expect(screen.getByText('No pending proposals')).toBeInTheDocument();
   });
 
   it('renders empty state when proposals is null', () => {
-    render(ProposalsCard, { proposals: null });
+    render(ProposalsCard, { proposalsData: null, onDecide: () => {} });
     expect(screen.getByText('No pending proposals')).toBeInTheDocument();
   });
 
   it('renders proposals with correct formatting', () => {
-    render(ProposalsCard, { proposals: mockProposals });
+    render(ProposalsCard, {
+      proposalsData: { items: mockProposals, total_pending: 2 },
+      onDecide: () => {},
+    });
 
     expect(screen.getByText('Alpha Stream')).toBeInTheDocument();
     expect(screen.getByText('85%')).toBeInTheDocument();
@@ -53,16 +59,43 @@ describe('ProposalsCard', () => {
     expect(screen.getByText('Looks like a new feature.')).toBeInTheDocument();
   });
 
-  it('renders disabled accept/reject buttons', () => {
-    render(ProposalsCard, { proposals: mockProposals });
+  it('calls onDecide with the proposal id and the verdict', async () => {
+    const calls: Array<[string, string]> = [];
+    render(ProposalsCard, {
+      proposalsData: { items: mockProposals, total_pending: 2 },
+      onDecide: (id: string, decision: 'accept' | 'reject') => {
+        calls.push([id, decision]);
+      },
+    });
 
     const rejectButtons = screen.getAllByText('Reject');
     const acceptButtons = screen.getAllByText('Accept');
-
     expect(rejectButtons).toHaveLength(2);
     expect(acceptButtons).toHaveLength(2);
+    expect(rejectButtons[0]).toBeEnabled();
+    expect(acceptButtons[0]).toBeEnabled();
 
-    expect(rejectButtons[0]).toBeDisabled();
-    expect(acceptButtons[0]).toBeDisabled();
+    await fireEvent.click(acceptButtons[0]);
+    await fireEvent.click(rejectButtons[1]);
+
+    expect(calls).toEqual([
+      ['1', 'accept'],
+      ['2', 'reject'],
+    ]);
+  });
+
+  it('locks every button while a decision is in flight', () => {
+    // Accepting writes `assignment_source = 'user'`, a verdict no machine writer
+    // overwrites, so a double-click must not be able to send a second one.
+    render(ProposalsCard, {
+      proposalsData: { items: mockProposals, total_pending: 2 },
+      deciding: '1',
+      onDecide: () => {},
+    });
+
+    expect(screen.getByText('Accepting...')).toBeInTheDocument();
+    for (const b of [...screen.getAllByRole('button')]) {
+      expect(b).toBeDisabled();
+    }
   });
 });

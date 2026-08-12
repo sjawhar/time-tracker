@@ -156,6 +156,7 @@ fn thinking_classifier(detail: Option<Arc<dyn SessionDetail>>) -> MockClassifier
 
 fn input(starting_prompt: &str) -> ClassificationInput {
     ClassificationInput {
+        has_session: true,
         session_id: "ses-1".to_owned(),
         machine: Some("devbox".to_owned()),
         cwd: Some("/home/sami/Code/dotfiles".to_owned()),
@@ -180,6 +181,39 @@ fn a_thin_prompt_defeats_a_classifier_that_cannot_fetch() {
     assert!(output.confidence <= CANNOT_DETERMINE);
     // And: it did try to look further — what defeats it is the payload, not the brain.
     assert_eq!(classifier.fetches().len(), 1);
+}
+
+/// A window run has no session, so it must not be offered the session-fetch tools.
+#[test]
+fn a_scope_with_no_session_is_never_offered_the_session_fetch_tools() {
+    // Given: a provider that would happily answer, and a scope that has no session to
+    // answer about — a window run, which passes a synthetic `window:<event_id>`.
+    let detail = FakeSession::new(Some("COSMIC DisplayLink rotation bug fix"), &[]);
+    let classifier = thinking_classifier(Some(Arc::clone(&detail) as Arc<dyn SessionDetail>));
+    let run = ClassificationInput {
+        has_session: false,
+        session_id: "window:evt-1".to_owned(),
+        starting_prompt: None,
+        window_titles: vec!["PR #14835 - Brave".to_owned()],
+        ..input("list a file")
+    };
+
+    // When
+    let output = classifier.classify(&run, &[]).unwrap();
+
+    // Then: the provider is never consulted. `fetches()` records attempts rather than
+    // successes, so what matters is that nothing reached a session that cannot exist:
+    // offering the tools had the model call them and be told `session window:<id> is not
+    // indexed`, which reads as a broken system rather than as a scope that never had a
+    // session. Live, that reached 161 of 518 pending proposals, every one window-scoped,
+    // averaging 0.491 confidence against 0.597 for the rest of the queue.
+    assert_eq!(
+        detail.reads.load(Ordering::SeqCst),
+        0,
+        "a sessionless scope reached the provider"
+    );
+    // And: it still answers from the titles it does have, rather than erroring.
+    assert_eq!(output.choice, StreamChoice::Undetermined);
 }
 
 /// Test 1: the same brain, the same thin payload, now able to fetch.

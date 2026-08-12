@@ -44,6 +44,8 @@ function formatDuration(since: string): string {
       ALIGNED
     {:else if isDrifting}
       DRIFTING
+    {:else if verdict.current_stream}
+      AWAY
     {:else}
       UNKNOWN
     {/if}
@@ -53,10 +55,16 @@ function formatDuration(since: string): string {
     <div class="text-base font-medium text-[var(--color-text-base)] break-words leading-snug" title={verdict.current_stream.name}>
       {verdict.current_stream.name}
     </div>
-    <div class="text-sm font-semibold mt-2 opacity-80" style="color: {statusColor}">
-      for {formatDuration(verdict.current_stream.since)}
-    </div>
+    {#if verdict.current_stream.active}
+      <div class="text-sm font-semibold mt-2 opacity-80" style="color: {statusColor}">
+        for {formatDuration(verdict.current_stream.since)}
+      </div>
+    {:else}
+      <div class="text-sm font-semibold mt-2 opacity-80" style="color: {statusColor}">
+        last seen {formatDuration(verdict.current_stream.last_seen)} ago
+      </div>
+    {/if}
   {:else}
-    <div class="text-base font-medium text-[var(--color-text-muted)]">No active stream</div>
+    <div class="text-base font-medium text-[var(--color-text-muted)]">No recent stream</div>
   {/if}
 </div>

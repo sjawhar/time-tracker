@@ -122,6 +122,8 @@ const UNATTRIBUTABLE_PANE_FOCUS_SQL: &str = "type = 'tmux_pane_focus' AND sessio
 /// is already clean, so excluding it is what makes a second run report zero.
 const RELEASABLE_ATTRIBUTION_SQL: &str = "(stream_id IS NOT NULL OR assignment_source IS NOT NULL) \
      AND (assignment_source IS NULL OR assignment_source != 'user')";
+const JUNKED_ATTENTION_SQL: &str = "stream_id = 'junk' AND type IN \
+    ('user_message', 'window_focus', 'tmux_pane_focus')";
 
 /// Reserved slug of the stream holding sessions with no attributable work.
 ///
@@ -1046,6 +1048,22 @@ impl Database {
                     params![SCHEMA_VERSION],
                 )?;
                 tx.commit()?;
+                // A migration is one-way and silent, and silence is what makes it
+                // expensive. Every `tt` binary older than this now fails outright with
+                // `SchemaVersionMismatch` until it is redeployed, and the operator finds
+                // out when an unrelated command dies rather than when the change happens.
+                // That has now cost this project three times: devbox sat at schema 10 and
+                // could not open its database, the mise-distributed binaries sat at v0.7.0
+                // while the schema moved past them, and a `tt-serve` built from the wrong
+                // branch migrated a live database from 13 to 14 and killed the CLI on a
+                // machine whose `tt` came from mise. Announce it where the operator is
+                // already looking.
+                tracing::warn!(
+                    from = v,
+                    to = SCHEMA_VERSION,
+                    "migrated the database schema; every `tt` binary older than this will \
+                     fail with SchemaVersionMismatch until it is redeployed"
+                );
             }
             Some(v) => {
                 return Err(DbError::SchemaVersionMismatch {
@@ -1594,18 +1612,37 @@ impl Database {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<String>, DbError> {
+        // A set difference, not a correlated NOT EXISTS, and pinned to the timestamp
+        // index. Both halves are load-bearing and both were measured on the live
+        // 2.3 GB corpus (2,789,492 events) with a warm cache.
+        //
+        // The NOT EXISTS form re-probed `idx_events_session` once per candidate row.
+        // A week holds 16,074 `agent_tool_use` rows sharing only 26 session ids, so
+        // each probe re-scanned that session's whole history: a one-week report spent
+        // **26.34s** here, against 0.01s for the plain window scan beside it. That is
+        // the entire cost of `tt report --week` (18.06s wall) and of the dashboard's
+        // TIME panel, which reads the same path over HTTP.
+        //
+        // Rewriting as EXCEPT drops it to 1.03s; pinning the index as well drops it to
+        // **0.047s**, a ~560x improvement, returning byte-identical rows. Without the
+        // pin SQLite picks `idx_events_type` and scans all 2,294,628 `agent_tool_use`
+        // rows to find the few thousand in range -- the same wrong choice, and the same
+        // fix, as `pending_proposals_by_attention`.
+        //
+        // The pin costs the full-history caller (`tt recompute`) 2.93s against 1.71s
+        // unpinned. That is 1.2s on a pass that already takes ~270s, traded for 20x on
+        // the interactive path, so it is deliberately optimised for the window.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT t.session_id FROM events t
-             WHERE t.type = 'agent_tool_use'
-               AND t.session_id IS NOT NULL
-               AND t.timestamp >= ?1 AND t.timestamp <= ?2
-               AND NOT EXISTS (
-                   SELECT 1 FROM events s
-                   WHERE s.type = 'agent_session' AND s.action = 'started'
-                     AND s.session_id = t.session_id
-                     AND s.timestamp >= ?1 AND s.timestamp <= ?2
-               )
-             ORDER BY t.session_id ASC",
+            "SELECT session_id FROM events INDEXED BY idx_events_timestamp
+             WHERE type = 'agent_tool_use'
+               AND session_id IS NOT NULL
+               AND timestamp >= ?1 AND timestamp <= ?2
+             EXCEPT
+             SELECT session_id FROM events INDEXED BY idx_events_timestamp
+             WHERE type = 'agent_session' AND action = 'started'
+               AND session_id IS NOT NULL
+               AND timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY session_id ASC",
         )?;
         let rows = stmt.query_map(
             params![format_timestamp(start), format_timestamp(end)],
@@ -1731,6 +1768,144 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    /// The share of subject words two names must have in common to be one initiative,
+    /// as an exact ratio. 4/5, i.e. a Jaccard overlap of 0.80; see
+    /// [`Self::find_stream_by_near_name`] for how it was calibrated.
+    const SUBJECT_OVERLAP_NUMERATOR: usize = 4;
+    const SUBJECT_OVERLAP_DENOMINATOR: usize = 5;
+
+    /// The stream already covering `name`'s initiative, when no row carries that exact
+    /// name.
+    ///
+    /// [`Self::find_stream_by_normalized_name`] answers the exact half of this question
+    /// and runs first. It is also what made capping the classifier's roster safe: a name
+    /// proposed for a stream the model was never shown became reuse of that row, so the
+    /// cap could only ever cost a *semantically* near-duplicate, never an exact one. That
+    /// backing stopped holding once the table outgrew the cap. `tt_llm::ROSTER_LIMIT` is
+    /// 200 against 2,288 streams — **8.7% of what exists** — so the model routinely names
+    /// a stream it cannot see, and any wording it does not reproduce to the character
+    /// mints a second row. Creation ran at 143 streams in May and **1,638 in August**, 86
+    /// a day, while collapsing every instance-suffixed family afterwards recovers only
+    /// 118 of 2,288 rows: this is over-creation at write time, not duplication to be
+    /// merged away later.
+    ///
+    /// Two names are one initiative when they share an **area** exactly and **4/5 of
+    /// their subject words**. Both halves are deliberately conservative, because the two
+    /// mistakes are not symmetric: a wrongly reused stream is a silent write no later
+    /// pass can question, while a wrongly minted one is only the status quo.
+    ///
+    /// *Area* is the text before the first `:`, compared verbatim. It says which body of
+    /// work a name belongs to, and comparing it case-sensitively is what keeps this rule
+    /// out of a judgement that is not its to make: the live table holds 13 streams under
+    /// `DPI:` and 7 under `dpi:`, and deciding those are one initiative is
+    /// `tt streams merge`, an operator command with an audit trail. Names differing by
+    /// case alone are skipped for that reason, and a name carrying no area matches
+    /// nothing.
+    ///
+    /// *Subject words* are the remainder's tokens, lowercased, with purely numeric tokens
+    /// dropped — and that omission is the rule's discriminating power. A counter marks an
+    /// instance rather than a subject, so `(Ralph iteration 3)` and `(Ralph iteration 7)`
+    /// are one initiative; a differing *word* is a different subject however much of the
+    /// rest matches. Hyphens stay inside a token, so `eval-3` and `WO-005` are compared
+    /// whole as the identifiers they are rather than as a word beside a number.
+    ///
+    /// Calibrated by replaying all 2,288 live names in creation order:
+    ///
+    /// | overlap | reused | verdict                                                     |
+    /// |---------|--------|-------------------------------------------------------------|
+    /// | 3/5     |    393 | merges `eval-3 shipbox` into `eval-3 traccar`                |
+    /// | 2/3     |    248 | still merges distinct `eval-3 <app>` and `scenario-gen` work |
+    /// | **4/5** |**202** | every probe below lands correctly                           |
+    /// | 17/20   |    120 | loses `dojo: smart home …`, a known-true reuse               |
+    ///
+    /// 4/5 is the *highest* ratio that still reunites both reuse cases known to be true —
+    /// `reskin implementer (Ralph iteration 3)` against `(Ralph iteration 7)` scores 1.00,
+    /// and `dojo: smart home ideation + planning` against `dojo: smart home automation
+    /// ideation + planning` scores exactly 4/5 — which is why it is the one chosen. It
+    /// clears every family that must stay apart by 0.133 or more: `eval-3 shipbox`
+    /// against `eval-3 traccar` 0.667, `eval-3 gitea` against `eval-3 saleor` 0.600,
+    /// `scenario-gen epm mnpi-exfil` against `fraudulent-JE` 0.667. No cross-application
+    /// or cross-cohort pair merges at this ratio. All 95 pairs it accepts and 17/20
+    /// refuses were read individually; some 50 of them are the WO-005 typing family, one
+    /// initiative the model re-worded per session.
+    ///
+    /// 202 of 2,288 rows (8.8%) would have been reused rather than minted, concentrated
+    /// where the explosion is — 18.6% of August's `agent-c:` streams. A brake on the rate
+    /// rather than a cure for it.
+    ///
+    /// The ratio is compared as integers, so `dojo`'s exact 4/5 is decided identically on
+    /// every machine instead of by a float landing either side of the boundary.
+    ///
+    /// Like the exact lookup this reads the table rather than the caller's roster
+    /// snapshot, and returns the **earliest created** match: several rows can be near one
+    /// name, and an arbitrary winner would let successive passes alternate between them
+    /// and keep splitting one initiative across both.
+    pub fn find_stream_by_near_name(&self, name: &str) -> Result<Option<Stream>, DbError> {
+        let normalized = tt_core::normalize_stream_name(name);
+        let Some((area, remainder)) = Self::split_area(&normalized) else {
+            return Ok(None);
+        };
+        let wanted = Self::subject_tokens(remainder);
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams WHERE name IS NOT NULL
+             ORDER BY created_at ASC, id ASC"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let stream = Self::row_to_stream(row)?;
+            let Some(stored) = stream.name.as_deref().map(tt_core::normalize_stream_name) else {
+                continue;
+            };
+            if stored.eq_ignore_ascii_case(&normalized) {
+                continue;
+            }
+            let Some((stored_area, stored_remainder)) = Self::split_area(&stored) else {
+                continue;
+            };
+            if stored_area != area {
+                continue;
+            }
+            if Self::shares_subject(&wanted, &Self::subject_tokens(stored_remainder)) {
+                return Ok(Some(stream));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Splits a normalized name into the area before its first `:` and the rest.
+    fn split_area(name: &str) -> Option<(&str, &str)> {
+        let (area, remainder) = name.split_once(':')?;
+        let (area, remainder) = (area.trim(), remainder.trim());
+        (!area.is_empty() && !remainder.is_empty()).then_some((area, remainder))
+    }
+
+    /// The words a name uses to say what the work is.
+    fn subject_tokens(remainder: &str) -> HashSet<String> {
+        remainder
+            .split(|character: char| {
+                !(character.is_alphanumeric() || character == '-' || character == '_')
+            })
+            .map(|token| token.trim_matches(|character| character == '-' || character == '_'))
+            .filter(|token| {
+                !token.is_empty() && !token.chars().all(|character| character.is_ascii_digit())
+            })
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    /// Whether two sets of subject words overlap enough to name one initiative.
+    fn shares_subject(wanted: &HashSet<String>, stored: &HashSet<String>) -> bool {
+        if stored.is_empty() {
+            return false;
+        }
+        let shared = wanted.intersection(stored).count();
+        let union = wanted.len() + stored.len() - shared;
+        shared * Self::SUBJECT_OVERLAP_DENOMINATOR >= union * Self::SUBJECT_OVERLAP_NUMERATOR
     }
 
     /// The period each stream has been active over, from its events.
@@ -2104,8 +2279,15 @@ impl Database {
         let tx = self.write_tx()?;
         let count = tx.execute(
             "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
-             WHERE session_id = ?3 AND stream_id IS NULL",
-            params![stream_id, source, session_id],
+             WHERE session_id = ?3 AND stream_id IS NULL \
+               AND (?4 != ?5 OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))",
+            params![
+                stream_id,
+                source,
+                session_id,
+                source,
+                JUNK_ASSIGNMENT_SOURCE
+            ],
         )?;
         if count > 0 {
             Self::bump_db_version_in_transaction(&tx)?;
@@ -2129,8 +2311,15 @@ impl Database {
         let count = tx.execute(
             "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
              WHERE session_id = ?3 \
-               AND (stream_id IS NULL OR assignment_source = ?2)",
-            params![stream_id, INHERITED_ASSIGNMENT_SOURCE, session_id],
+               AND (stream_id IS NULL OR assignment_source = ?2) \
+               AND (?4 != ?5 OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))",
+            params![
+                stream_id,
+                INHERITED_ASSIGNMENT_SOURCE,
+                session_id,
+                stream_id,
+                JUNK_STREAM_SLUG
+            ],
         )?;
         if count > 0 {
             Self::bump_db_version_in_transaction(&tx)?;
@@ -2154,8 +2343,8 @@ impl Database {
     /// session, and this repeats that ruling onto a row that was a member of it all
     /// along. It is the same principle as [`Self::inherit_stream_for_session`] giving a
     /// subagent its parent's stream — an identity established at capture, not inferred
-    /// here. A junked session propagates its junk stream for the same reason, and
-    /// `tt streams dissolve junk` reverses that exactly as it does for the session.
+    /// here. A junked session propagates its junk stream onto agent activity; its
+    /// attention-opening events stay unassigned because they record real human attention.
     ///
     /// The stream is read from the session's **own already-assigned events**, because
     /// `classified_sessions` records only that a session was classified and never which
@@ -2196,13 +2385,16 @@ impl Database {
 
             let mut claim = tx.prepare(
                 "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
-                 WHERE session_id = ?3 AND stream_id IS NULL",
+                 WHERE session_id = ?3 AND stream_id IS NULL \
+                   AND (?4 != ?5 OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))",
             )?;
             for (session_id, stream_id) in sessions {
                 count += claim.execute(params![
                     stream_id,
                     SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE,
-                    session_id
+                    session_id,
+                    stream_id,
+                    JUNK_STREAM_SLUG
                 ])? as u64;
             }
         }
@@ -2229,12 +2421,15 @@ impl Database {
             .join(", ");
         let sql = format!(
             "UPDATE events SET stream_id = ?, assignment_source = ? \
-             WHERE id IN ({placeholders}) AND stream_id IS NULL"
+             WHERE id IN ({placeholders}) AND stream_id IS NULL \
+               AND (? != ? OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))"
         );
-        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 4);
         params_vec.push(&stream_id);
         params_vec.push(&source);
         params_vec.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        params_vec.push(&source);
+        params_vec.push(&JUNK_ASSIGNMENT_SOURCE);
         let tx = self.write_tx()?;
         let count = tx.execute(&sql, params_from_iter(params_vec))?;
         if count > 0 {
@@ -2254,8 +2449,15 @@ impl Database {
         let tx = self.write_tx()?;
         let count = tx.execute(
             "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
-             WHERE session_id = ?3 AND assignment_source = 'inferred'",
-            params![stream_id, source, session_id],
+             WHERE session_id = ?3 AND assignment_source = 'inferred' \
+               AND (?4 != ?5 OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))",
+            params![
+                stream_id,
+                source,
+                session_id,
+                source,
+                JUNK_ASSIGNMENT_SOURCE
+            ],
         )?;
         if count > 0 {
             Self::bump_db_version_in_transaction(&tx)?;
@@ -2623,6 +2825,48 @@ impl Database {
             &format!(
                 "UPDATE events SET stream_id = NULL, assignment_source = NULL \
                  WHERE {UNATTRIBUTABLE_PANE_FOCUS_SQL} AND {RELEASABLE_ATTRIBUTION_SQL}"
+            ),
+            [],
+        )? as u64;
+
+        if released > 0 {
+            Self::bump_db_version_in_transaction(&tx)?;
+        }
+
+        match mode {
+            ReleaseMode::Apply => tx.commit()?,
+            ReleaseMode::DryRun => tx.rollback()?,
+        }
+
+        Ok(ReleaseOutcome {
+            released,
+            retained,
+            streams_affected,
+        })
+    }
+
+    pub fn release_junk_attention(&self, mode: ReleaseMode) -> Result<ReleaseOutcome, DbError> {
+        let tx = self.write_tx()?;
+        let retained: u64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM events \
+                 WHERE {JUNKED_ATTENTION_SQL} AND assignment_source = 'user'"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        let streams_affected: u64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT stream_id) FROM events \
+                 WHERE {JUNKED_ATTENTION_SQL} AND {RELEASABLE_ATTRIBUTION_SQL}"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        let released = tx.execute(
+            &format!(
+                "UPDATE events SET stream_id = NULL, assignment_source = NULL \
+                 WHERE {JUNKED_ATTENTION_SQL} AND {RELEASABLE_ATTRIBUTION_SQL}"
             ),
             [],
         )? as u64;
@@ -3126,9 +3370,9 @@ impl Database {
                             WHERE e.session_id = p.session_id
                               AND e.type IN {ATTENTION_EVENT_TYPES_SQL})
                         WHEN p.event_ids IS NOT NULL THEN (
-                            SELECT COUNT(*) FROM events e
-                            WHERE e.id IN (SELECT value FROM json_each(p.event_ids))
-                              AND e.type IN {ATTENTION_EVENT_TYPES_SQL})
+                            SELECT COUNT(*) FROM json_each(p.event_ids) j
+                            CROSS JOIN events e ON e.id = j.value
+                            WHERE e.type IN {ATTENTION_EVENT_TYPES_SQL})
                         ELSE 0
                     END AS attention_events
              FROM proposals p
@@ -3585,6 +3829,69 @@ impl Database {
             params![event_ids],
         )?;
         Ok(superseded as u64)
+    }
+
+    /// Retires pending window-run proposals whose event set is a strict subset of
+    /// `event_ids`, a later pass having asked the same run with more of it in view.
+    ///
+    /// A window run's identity *is* its exact event set, which is what
+    /// `proposals.event_ids` is keyed on. That makes the duplicate guard above narrow by
+    /// construction, and it has a cost nothing measured: a run that gains one focus event
+    /// stops matching its own pending proposal, so the next pass asks again and files a
+    /// second answer beside the first. Measured on the live queue, that left **121
+    /// near-duplicates among 792 event-set proposals** (671 distinct runs). One growing
+    /// run held five, nesting 42 in 49 in 61 in 62 in 63 events, answering
+    /// `cybertasks: submission verification`, `NEW: cybertasks + red-teaming infra
+    /// review` and `NEW: browsing: cybertasks + agent-tools exploration` at confidences
+    /// from 0.25 to 0.75. A reviewer cannot act on that: the contradictions sit side by
+    /// side with no way to tell which saw more.
+    ///
+    /// Superseding the subsets keeps the **best-informed** answer, since the newest
+    /// proposal saw every event the older ones saw and more. Three properties are
+    /// deliberate. It is a **strict** subset test, so two genuinely different runs that
+    /// merely overlap are both kept -- only a prefix of the same run is retired. It is
+    /// **bookkeeping, never a verdict**: status alone changes, no assignment moves, and
+    /// so it must not bump `db_version`. And it is never `rejected`, which is a human
+    /// verdict `has_rejected_proposal` reads to suppress future answers; manufacturing
+    /// one would silence the classifier on that run for good.
+    pub fn supersede_pending_subset_proposals_for_events(
+        &self,
+        event_ids: &[String],
+    ) -> Result<u64, DbError> {
+        let target: std::collections::HashSet<&str> =
+            event_ids.iter().map(String::as_str).collect();
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, event_ids FROM proposals
+                 WHERE session_id IS NULL AND event_ids IS NOT NULL AND status = 'pending'",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut victims = Vec::new();
+        for (id, raw) in candidates {
+            let ids: Vec<String> = serde_json::from_str(&raw)?;
+            // Equal sets belong to the exact guard above; only a strict prefix is stale.
+            if ids.is_empty() || ids.len() >= target.len() {
+                continue;
+            }
+            if ids.iter().all(|one| target.contains(one.as_str())) {
+                victims.push(id);
+            }
+        }
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.write_tx()?;
+        let mut superseded = 0u64;
+        for id in &victims {
+            superseded += tx.execute(
+                "UPDATE proposals SET status = 'superseded' WHERE id = ?1 AND status = 'pending'",
+                params![id],
+            )? as u64;
+        }
+        tx.commit()?;
+        Ok(superseded)
     }
 
     /// Whether this exact window-run event set already carries an answerable pending
@@ -4240,7 +4547,8 @@ impl Database {
             let candidates = Self::structurally_junk_sessions(&tx, limit)?;
             let mut route = tx.prepare(
                 "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
-                 WHERE session_id = ?3 AND stream_id IS NULL",
+                 WHERE session_id = ?3 AND stream_id IS NULL \
+                   AND type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus')",
             )?;
             // The same claim `inherit_stream_for_session` makes, and it must stay the
             // same: unassigned events plus ones already `inherited`, so a subagent
@@ -4249,7 +4557,8 @@ impl Database {
                 "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
                  WHERE session_id IN \
                        (SELECT session_id FROM agent_sessions WHERE parent_session_id = ?3) \
-                   AND (stream_id IS NULL OR assignment_source = ?2)",
+                   AND (stream_id IS NULL OR assignment_source = ?2) \
+                   AND type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus')",
             )?;
             let mut record = tx.prepare(
                 "INSERT INTO classified_sessions (session_id, classified_at, prompt_count)
@@ -8174,6 +8483,163 @@ mod tests {
     }
 
     #[test]
+    fn find_stream_by_near_name_reuses_a_name_that_only_adds_a_qualifier() {
+        // Given: the live pair `dojo: smart home ideation + planning` and
+        // `dojo: smart home automation ideation + planning`, minted for one initiative.
+        // The exact lookup cannot collapse them precisely because they are not exact.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream(
+            "s1",
+            Some("dojo: smart home ideation + planning"),
+        ))
+        .unwrap();
+
+        // When/Then
+        let found = db
+            .find_stream_by_near_name("dojo: smart home automation ideation + planning")
+            .unwrap();
+        assert_eq!(found.map(|stream| stream.id), Some("s1".to_owned()));
+    }
+
+    #[test]
+    fn find_stream_by_near_name_reuses_a_name_differing_only_by_an_instance_counter() {
+        // Given: one initiative the model re-named once per run. A stream is a unit of
+        // work, not a row per task instance, so the counter is not a subject.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream(
+            "s1",
+            Some("agent-c: reskin implementer (Ralph iteration 3)"),
+        ))
+        .unwrap();
+
+        // When/Then
+        let found = db
+            .find_stream_by_near_name("agent-c: reskin implementer (Ralph iteration 7)")
+            .unwrap();
+        assert_eq!(found.map(|stream| stream.id), Some("s1".to_owned()));
+    }
+
+    #[test]
+    fn find_stream_by_near_name_keeps_distinct_initiatives_sharing_a_prefix_apart() {
+        // Given: the families a crude prefix match already flagged wrongly. One differing
+        // *word* is a different subject however much of the rest is shared — `agent-c`
+        // alone spans 1,210 streams, so a shared prefix decides nothing.
+        let db = Database::open_in_memory().unwrap();
+        for (id, name) in [
+            ("s1", "agent-c: eval-3 traccar test-stage worker (round 2)"),
+            (
+                "s2",
+                "agent-c: scenario-gen epm fraudulent-JE (corp-finance cohort)",
+            ),
+        ] {
+            db.insert_stream(&make_stream(id, Some(name))).unwrap();
+        }
+
+        // When/Then
+        for query in [
+            "agent-c: eval-3 shipbox test-stage worker (round 2)",
+            "agent-c: scenario-gen epm mnpi-exfil (corp-finance cohort)",
+        ] {
+            assert!(
+                db.find_stream_by_near_name(query).unwrap().is_none(),
+                "{query:?} names distinct work and must not be merged"
+            );
+        }
+    }
+
+    #[test]
+    fn find_stream_by_near_name_requires_the_same_area() {
+        // Given: the same words under a different project. The prefix is the one token
+        // that says which body of work this is.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("legion: worker dispatch")))
+            .unwrap();
+
+        // When/Then
+        assert!(
+            db.find_stream_by_near_name("opencode: worker dispatch")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_stream_by_near_name_returns_no_match_for_unrelated_work() {
+        // Given: a name sharing nothing but its area, which is the ordinary case — the
+        // fallback must stay silent so a genuinely new initiative still gets a row.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("agent-c: kubeconfig cleanup")))
+            .unwrap();
+
+        // When/Then
+        assert!(
+            db.find_stream_by_near_name("agent-c: convoy scaling bottleneck")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_stream_by_near_name_does_not_fold_case() {
+        // Given: the live table's `DPI:` (13 streams) and `dpi:` (7). Whether those are
+        // one initiative is an operator judgement carried out by `tt streams merge`, and
+        // a near match must not decide it as a side effect of writing a name.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", Some("DPI: ingest pipeline")))
+            .unwrap();
+
+        // When/Then
+        assert!(
+            db.find_stream_by_near_name("dpi: ingest pipeline")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_stream_by_near_name_returns_the_earliest_of_several_matches() {
+        // Given: two rows a proposed name is near to. Reuse has to converge on one row,
+        // or successive passes would alternate and keep splitting one initiative.
+        let db = Database::open_in_memory().unwrap();
+        for (id, created, name) in [
+            (
+                "younger",
+                ts(50),
+                "agent-c: env typing roadmap (WO-005 types)",
+            ),
+            ("elder", ts(10), "agent-c: env typing roadmap (WO-005)"),
+        ] {
+            let mut stream = make_stream(id, Some(name));
+            stream.created_at = created;
+            db.insert_stream(&stream).unwrap();
+        }
+
+        // When/Then
+        let found = db
+            .find_stream_by_near_name("agent-c: WO-005 env typing roadmap")
+            .unwrap();
+        assert_eq!(found.map(|stream| stream.id), Some("elder".to_owned()));
+    }
+
+    #[test]
+    fn find_stream_by_near_name_ignores_unnamed_and_area_less_streams() {
+        // Given: a stream with no name, and one whose name carries no area at all. Neither
+        // can be compared, and a name with no area of its own matches nothing.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("s1", None)).unwrap();
+        db.insert_stream(&make_stream("s2", Some("reasoning-tasks extraction")))
+            .unwrap();
+
+        // When/Then
+        for query in ["anything at all", "reasoning-tasks extraction work"] {
+            assert!(
+                db.find_stream_by_near_name(query).unwrap().is_none(),
+                "looking up {query:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stream_activity_windows_report_the_period_each_stream_spans() {
         // Given: two streams with events, and one with none. This is the roster's
         // ordering key, and it comes from `events` rather than `streams.first_event_at`/
@@ -8949,6 +9415,12 @@ mod tests {
             .unwrap()
     }
 
+    fn event_for_session(id: &str, session_id: &str, event_type: EventType) -> StoredEvent {
+        let mut event = make_event(id, ts(0), event_type);
+        event.session_id = Some(session_id.to_string());
+        event
+    }
+
     #[test]
     fn a_classified_sessions_stream_reaches_an_event_stamped_after_it_was_classified() {
         // Given: the session→stream write already ran, so nothing else will ever
@@ -8969,6 +9441,102 @@ mod tests {
             late.assignment_source.as_deref(),
             Some(SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE)
         );
+    }
+
+    #[test]
+    fn session_membership_leaves_junk_attention_unassigned() {
+        // Given: a classified junk session with an already-assigned agent-session anchor and
+        // late agent activity plus every attention-opening event type.
+        let db = Database::open_in_memory().unwrap();
+        let junk_stream_id = db.junk_stream_id().unwrap();
+        db.insert_event(&event_for_session(
+            "junk-anchor",
+            "junk-session",
+            EventType::AgentSession,
+        ))
+        .unwrap();
+        db.assign_events_by_session_id("junk-session", &junk_stream_id, JUNK_ASSIGNMENT_SOURCE)
+            .unwrap();
+        db.record_classification("junk-session", 1).unwrap();
+        for (id, event_type) in [
+            ("junk-agent-tool", EventType::AgentToolUse),
+            ("junk-user-message", EventType::UserMessage),
+            ("junk-window-focus", EventType::WindowFocus),
+            ("junk-pane-focus", EventType::TmuxPaneFocus),
+        ] {
+            db.insert_event(&event_for_session(id, "junk-session", event_type))
+                .unwrap();
+        }
+
+        // When: session membership propagates the classified session's stream.
+        let claimed = db
+            .claim_unassigned_events_for_classified_sessions()
+            .unwrap();
+
+        // Then: delegated agent activity keeps the junk classification, while real attention
+        // remains visibly unassigned.
+        assert_eq!(claimed, 1);
+        let agent_tool = event_by_id(&db, "junk-agent-tool");
+        assert_eq!(agent_tool.stream_id.as_deref(), Some(JUNK_STREAM_SLUG));
+        assert_eq!(
+            agent_tool.assignment_source.as_deref(),
+            Some(SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE)
+        );
+        for id in ["junk-user-message", "junk-window-focus", "junk-pane-focus"] {
+            let attention = event_by_id(&db, id);
+            assert_eq!(attention.stream_id, None, "{id} was routed to junk");
+            assert_eq!(
+                attention.assignment_source, None,
+                "{id} retained attribution provenance"
+            );
+        }
+    }
+
+    #[test]
+    fn session_membership_claims_every_event_type_for_a_normal_stream() {
+        // Given: a classified session on a normal stream with the same late-event shape.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", Some("normal work")))
+            .unwrap();
+        db.insert_event(&event_for_session(
+            "normal-anchor",
+            "normal-session",
+            EventType::AgentSession,
+        ))
+        .unwrap();
+        db.assign_events_by_session_id("normal-session", "stream-a", "inferred")
+            .unwrap();
+        db.record_classification("normal-session", 1).unwrap();
+        for (id, event_type) in [
+            ("normal-agent-tool", EventType::AgentToolUse),
+            ("normal-user-message", EventType::UserMessage),
+            ("normal-window-focus", EventType::WindowFocus),
+            ("normal-pane-focus", EventType::TmuxPaneFocus),
+        ] {
+            db.insert_event(&event_for_session(id, "normal-session", event_type))
+                .unwrap();
+        }
+
+        // When: session membership propagates the normal stream.
+        let claimed = db
+            .claim_unassigned_events_for_classified_sessions()
+            .unwrap();
+
+        // Then: all event types retain the pre-existing non-junk behavior.
+        assert_eq!(claimed, 4);
+        for id in [
+            "normal-agent-tool",
+            "normal-user-message",
+            "normal-window-focus",
+            "normal-pane-focus",
+        ] {
+            let event = event_by_id(&db, id);
+            assert_eq!(event.stream_id.as_deref(), Some("stream-a"));
+            assert_eq!(
+                event.assignment_source.as_deref(),
+                Some(SESSION_MEMBERSHIP_ASSIGNMENT_SOURCE)
+            );
+        }
     }
 
     #[test]
@@ -9443,6 +10011,68 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_growing_window_run_retires_only_its_strictly_less_complete_proposals() {
+        // Given: one run asked repeatedly as it grew, plus runs that merely overlap it.
+        //
+        // A run's identity is its exact event set, so gaining a focus event defeats the
+        // duplicate guard and files another answer. Live, that left 121 near-duplicates
+        // among 792 event-set proposals; one run held five, nesting 42..63 events and
+        // answering three different streams at confidences from 0.25 to 0.75.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", None)).unwrap();
+        let ev = |n: usize| (1..=n).map(|i| format!("w{i}")).collect::<Vec<_>>();
+        let current = ev(5);
+        insert_window_proposal(&db, "prefix-2", &ev(2), "stream-a", None);
+        insert_window_proposal(&db, "prefix-4", &ev(4), "stream-a", None);
+        insert_window_proposal(&db, "exact-5", &current, "stream-a", None);
+        insert_window_proposal(&db, "superset-6", &ev(6), "stream-a", None);
+        insert_window_proposal(
+            &db,
+            "overlapping",
+            &["w4".to_string(), "w9".to_string()],
+            "stream-a",
+            None,
+        );
+        insert_window_proposal(&db, "disjoint", &["z1".to_string()], "stream-a", None);
+
+        // When
+        let retired = db
+            .supersede_pending_subset_proposals_for_events(&current)
+            .unwrap();
+
+        // Then: only strict prefixes of this run go, keeping the best-informed answer.
+        assert_eq!(retired, 2);
+        assert_eq!(proposal_status(&db, "prefix-2"), ProposalStatus::Superseded);
+        assert_eq!(proposal_status(&db, "prefix-4"), ProposalStatus::Superseded);
+        // The equal set belongs to the exact duplicate guard, not to this.
+        assert_eq!(proposal_status(&db, "exact-5"), ProposalStatus::Pending);
+        // A larger run is a different, better-informed question; never retired here.
+        assert_eq!(proposal_status(&db, "superset-6"), ProposalStatus::Pending);
+        // Sharing an event is not being a prefix: two real runs can overlap.
+        assert_eq!(proposal_status(&db, "overlapping"), ProposalStatus::Pending);
+        assert_eq!(proposal_status(&db, "disjoint"), ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn retiring_subsumed_proposals_changes_no_assignment_so_it_must_not_bump_db_version() {
+        // Given: a queued prefix of a run that has since grown.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("stream-a", None)).unwrap();
+        insert_window_proposal(&db, "prefix", &["w1".to_string()], "stream-a", None);
+        let before = db.get_db_version().unwrap();
+
+        // When
+        let retired = db
+            .supersede_pending_subset_proposals_for_events(&["w1".to_string(), "w2".to_string()])
+            .unwrap();
+
+        // Then: bookkeeping only. Bumping would fire the daemon's 2s watcher for a row
+        // whose events still carry exactly the stream they carried before.
+        assert_eq!(retired, 1);
+        assert_eq!(db.get_db_version().unwrap(), before);
     }
 
     /// Files one pending window-run proposal carrying a stated generation.
