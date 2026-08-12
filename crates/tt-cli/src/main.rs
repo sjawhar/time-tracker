@@ -219,6 +219,14 @@ fn main() -> Result<()> {
                     };
                     streams::release_junk_attention(&db, mode)?;
                 }
+                StreamsAction::BackfillPaneBindings { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::ReleaseMode::DryRun
+                    } else {
+                        tt_db::ReleaseMode::Apply
+                    };
+                    streams::backfill_pane_session_bindings(&db, mode)?;
+                }
                 StreamsAction::Merge {
                     streams: from_refs,
                     into,

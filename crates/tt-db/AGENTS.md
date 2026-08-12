@@ -2,9 +2,9 @@
 
 Single-file monolith (`src/lib.rs`). All database types and methods live here, plus the `allocate_for_period` allocation entry point.
 
-## Schema (v13)
+## Schema (v14)
 
-`init()` migrates supported older versions forward: v8–v12 → v13 via `ALTER TABLE … ADD COLUMN …` inside one transaction (v8 adds `window_app_id`/`window_title`; v≤9 adds `streams.slug`; v≤10 adds `streams.description` + `streams.color`; v≤12 adds `proposals.classifier_generation`). Any other version mismatch (newer-than-expected, or an unsupported older version) = `DbError::SchemaVersionMismatch` (hard error). New tables are declared `CREATE TABLE IF NOT EXISTS`, so they appear on both fresh init and forward migration. To evolve: bump the `SCHEMA_VERSION` constant, add the columns to the `CREATE TABLE`, and add a migration arm in `init()`.
+`init()` migrates supported older versions forward: v8–v13 → v14 via additive `ALTER TABLE` or `CREATE TABLE IF NOT EXISTS` statements inside one transaction (v8 adds `window_app_id`/`window_title`; v≤9 adds `streams.slug`; v≤10 adds `streams.description` + `streams.color`; v≤12 adds `proposals.classifier_generation`; v≤13 adds `pane_session_bindings`). Any other version mismatch (newer-than-expected, or an unsupported older version) = `DbError::SchemaVersionMismatch` (hard error). New tables are declared `CREATE TABLE IF NOT EXISTS`, so they appear on both fresh init and forward migration. To evolve: bump the `SCHEMA_VERSION` constant, add the columns to the `CREATE TABLE`, and add a migration arm in `init()`.
 
 Because the migration `ALTER`s tables rather than creating them, a fixture standing in for an older version has to carry every table the arm touches. **But an arm may only assume what the version guarantees, not what a typical database happens to hold.** The v≤12 arm ALTERed `proposals` unconditionally, and a capture-only machine never runs the classifier so nothing there ever creates that table: devbox sat at schema 10 with six tables and no `proposals`, the migration aborted, and `tt` could not open the database at all. Every migration fixture built a `proposals` table, which is exactly why none of them caught it. The arm now probes `sqlite_master` first and skips the ALTER when the table is absent — the `CREATE TABLE IF NOT EXISTS` block runs after the match and declares the column, so a missing table is created complete rather than patched. `a_capture_only_machine_with_no_proposals_table_still_migrates` pins it.
 
@@ -40,6 +40,9 @@ classified_sessions (session_id TEXT PK, classified_at TEXT,
                      prompt_count INT, rechecked INT)   -- one follow-up re-check per session
 
 machines (machine_id TEXT PK, label TEXT, last_sync_at TEXT, last_event_id TEXT)
+
+pane_session_bindings (machine_id TEXT, pane_id TEXT, session_id TEXT, observed_at TEXT,
+                       PK(machine_id, pane_id, observed_at))
 ```
 
 Timestamps: ISO 8601 TEXT (`2024-01-15T10:30:00.000Z`), always UTC, millisecond precision. Lexicographic order = chronological order.
@@ -60,7 +63,7 @@ Three properties of that repair are deliberate. It is **recorded in `meta`** (`s
 
 ### Indexes
 
-`idx_events_timestamp`, `idx_events_type`, `idx_events_stream`, `idx_events_cwd`, `idx_events_session`, `idx_events_git_project`, `idx_events_machine`, `idx_streams_updated`, `idx_streams_slug` (unique), `idx_stream_tags_tag`, `idx_proposals_status`, `idx_agent_sessions_start_time`, `idx_agent_sessions_project_path`, `idx_agent_sessions_parent`
+`idx_events_timestamp`, `idx_events_type`, `idx_events_stream`, `idx_events_cwd`, `idx_events_session`, `idx_events_git_project`, `idx_events_machine`, `idx_streams_updated`, `idx_streams_slug` (unique), `idx_stream_tags_tag`, `idx_proposals_status`, `idx_agent_sessions_start_time`, `idx_agent_sessions_project_path`, `idx_agent_sessions_parent`, `idx_pane_session_bindings_lookup`
 
 ## `db_version` — the daemon's change signal
 
@@ -84,6 +87,7 @@ Three properties of that repair are deliberate. It is **recorded in `meta`** (`s
 - `RankedProposal` — a pending proposal paired with `attention_events`, the count of its `user_message` / `window_focus` / `tmux_pane_focus` events. Counted in events rather than milliseconds because a proposal is answered before its events are allocated, and allocation needs the stream the reviewer has not supplied yet
 - `DissolveMode` / `DissolveOutcome` — whether a dissolution commits or rolls back, and its released/retained/retired counts
 - `ReleaseMode` / `ReleaseOutcome` — whether a pane-focus release commits or rolls back, and its released/retained/streams-affected counts
+- `PaneSessionBindingBackfillOutcome` — historical pane focuses that gained a recent observed session identity, plus human assignments retained untouched
 - `MergeMode` / `MergedSource` — whether a merge commits or rolls back, and per source what it moved: `events_moved`, `user_events_moved`, `tags_moved`, `retired`
 - `JunkRoutingOutcome` — what one bulk junk-routing step settled: `sessions` routed and `events` moved. Two counts rather than one because the per-session junk path moves both `junked` and `assigned`, and a pass summary folding in only the first would understate the pass by exactly the work the bulk step took over
 - `ClassifierHealth` / `ClassifierHealthState` — persisted classifier state (`Ready` / `Unconfigured` / `Failing`) + consecutive-failure backoff
@@ -131,6 +135,7 @@ Three properties of that repair are deliberate. It is **recorded in `meta`** (`s
 | `delete_orphaned_streams` | Remove streams with no events |
 | `dissolve_stream` | Release a stream's non-`user` events back to unassigned, then retire it. `DissolveMode::DryRun` runs the same statements and rolls back, so a preview reports the counts a real run would produce |
 | `release_unattributable_pane_focus` | Release the attribution carried by `tmux_pane_focus` rows with a NULL `session_id` — the one population no writer here can select, since every session-keyed writer filters on `session_id = ?` and the only id-keyed one is fed from a `type = 'window_focus'` query. A stream on such a row came from the deleted cwd propagator, which wrote `'inferred'`, so it cannot be found by `assignment_source`. Selection is hardcoded (`UNATTRIBUTABLE_PANE_FOCUS_SQL` + `RELEASABLE_ATTRIBUTION_SQL`) so this cannot become a bulk-release primitive. Both columns go NULL, `'user'` is never touched, no row is deleted, no stream is retired. `ReleaseMode::DryRun` rolls back. See root `AGENTS.md`, "Deleting the propagator did not undo it" |
+| `backfill_pane_session_bindings` | Restore a historical `tmux_pane_focus` row's `session_id` from the newest process-tree-observed identity for its exact machine and pane, only when that observation is within the 30-minute agent timeout. It writes neither `stream_id` nor `assignment_source`; the existing session-membership pass remains the sole stream writer. Human assignments are skipped, no event row is deleted, and `ReleaseMode::DryRun` rolls back. |
 | `merge_streams` | Re-point every source's events at one target, move its tags via `INSERT OR IGNORE`, retire the emptied sources. The counterpart to `dissolve_stream`, and the opposite on one point: **`user` assignments move too**, because a merge corrects which row holds the work, not the human's verdict about what it was. All sources in one transaction; no event row is ever deleted; the target is marked `needs_recompute` with `updated_at` left alone. `MergeMode::DryRun` rolls back, so a preview reports a real run's counts. Errors with `MergeIntoSelf` / `MergeTargetNotFound` rather than letting a stale id surface as a foreign-key failure mid-write |
 | `update_stream_times` | Set direct/delegated ms, `updated_at` and `needs_recompute = 0`. **Not** `first_event_at`/`last_event_at` — it never has, and `tt_core::StreamTime` carries no such fields to write |
 | `mark_streams_for_recompute` / `get_streams_needing_recompute` | Recompute flagging |

@@ -313,6 +313,17 @@ pub enum StreamsAction {
         dry_run: bool,
     },
 
+    /// Apply recent, observed pane session identities to historical tmux focus events.
+    ///
+    /// This writes only `session_id`, never a stream or assignment source. A binding is usable
+    /// only for the same pane on the same machine within the 30-minute freshness window. Start
+    /// with --dry-run.
+    BackfillPaneBindings {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Collapse streams onto one row, moving their events and tags.
     ///
     /// The counterpart to dissolve: dissolving says this was never work, merging

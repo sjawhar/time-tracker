@@ -54,7 +54,11 @@ mod session_activity;
 pub use session_activity::WindowedAgentSession;
 
 /// Current schema version. Increment when making schema changes.
-const SCHEMA_VERSION: i32 = 13;
+const SCHEMA_VERSION: i32 = 14;
+
+/// A pane can later host a different agent, so a captured identity expires with the existing
+/// 30-minute agent timeout rather than being reused indefinitely.
+const PANE_SESSION_BINDING_FRESHNESS_MINUTES: i64 = 30;
 
 /// `meta` key recording that `normalize_stream_timestamps` has already run.
 ///
@@ -503,6 +507,15 @@ pub struct ReleaseOutcome {
     pub retained: u64,
     /// Streams that lost at least one event.
     pub streams_affected: u64,
+}
+
+/// The result of applying recent pane identities to historical focus events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneSessionBindingBackfillOutcome {
+    /// Events that gained a session identity.
+    pub bound: u64,
+    /// Matching events left alone because a human assigned them.
+    pub retained: u64,
 }
 
 /// What one bulk junk-routing step settled.
@@ -1001,7 +1014,7 @@ impl Database {
 
         match existing_version {
             Some(v) if v == SCHEMA_VERSION => return self.normalize_stream_timestamps(),
-            Some(v @ 8..=12) => {
+            Some(v @ 8..=13) => {
                 let tx = self.write_tx()?;
                 if v == 8 {
                     tx.execute("ALTER TABLE events ADD COLUMN window_app_id TEXT", [])?;
@@ -1039,6 +1052,47 @@ impl Database {
                     if has_proposals {
                         tx.execute(
                             "ALTER TABLE proposals ADD COLUMN classifier_generation INTEGER",
+                            [],
+                        )?;
+                    }
+                }
+                if v <= 13 {
+                    tx.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS pane_session_bindings (
+                            machine_id TEXT NOT NULL,
+                            pane_id TEXT NOT NULL,
+                            session_id TEXT NOT NULL,
+                            observed_at TEXT NOT NULL,
+                            PRIMARY KEY (machine_id, pane_id, observed_at)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_pane_session_bindings_lookup
+                            ON pane_session_bindings(machine_id, pane_id, observed_at DESC);",
+                    )?;
+                    // Seeding reads `events`, and this arm may only assume what the
+                    // version guarantees. The v<=12 arm above learned the same lesson on
+                    // `proposals`: devbox sat at schema 10 with six tables and none of them
+                    // `proposals`, and an unconditional statement left `tt` unable to open
+                    // the database at all. Every migration fixture happens to build
+                    // `events`, which is exactly why three of them caught this.
+                    //
+                    // Skipping is correct rather than merely safe: a database with no
+                    // `events` has no historical pane focus to seed from, and the CREATE
+                    // above already declared the binding table complete.
+                    let has_events: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                          WHERE type = 'table' AND name = 'events')",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if has_events {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO pane_session_bindings
+                             (machine_id, pane_id, session_id, observed_at)
+                             SELECT COALESCE(machine_id, ''), pane_id, session_id, timestamp
+                             FROM events
+                             WHERE type = 'tmux_pane_focus'
+                               AND pane_id IS NOT NULL
+                               AND session_id IS NOT NULL",
                             [],
                         )?;
                     }
@@ -1146,6 +1200,18 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_streams_updated ON streams(updated_at);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_streams_slug ON streams(slug);
             CREATE INDEX IF NOT EXISTS idx_stream_tags_tag ON stream_tags(tag);
+
+            -- Agent session identities observed in tmux panes, scoped to the machine that owns
+            -- the pane because tmux pane IDs are not global across machines.
+            CREATE TABLE IF NOT EXISTS pane_session_bindings (
+                machine_id TEXT NOT NULL,
+                pane_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (machine_id, pane_id, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pane_session_bindings_lookup
+                ON pane_session_bindings(machine_id, pane_id, observed_at DESC);
 
             -- Mutable metadata observed by classifier pollers
             CREATE TABLE IF NOT EXISTS meta (
@@ -1383,6 +1449,52 @@ impl Database {
 
             for event in events {
                 let timestamp_str = format_timestamp(event.timestamp);
+                let session_id = if event.event_type == tt_core::EventType::TmuxPaneFocus {
+                    match (event.pane_id.as_deref(), event.session_id.as_deref()) {
+                        (Some(pane_id), Some(session_id)) => {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO pane_session_bindings
+                                 (machine_id, pane_id, session_id, observed_at)
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                params![
+                                    event.machine_id.as_deref().unwrap_or(""),
+                                    pane_id,
+                                    session_id,
+                                    &timestamp_str
+                                ],
+                            )?;
+                            Some(session_id.to_string())
+                        }
+                        (Some(pane_id), None) => {
+                            let freshness_start = format_timestamp(
+                                event.timestamp
+                                    - chrono::Duration::minutes(
+                                        PANE_SESSION_BINDING_FRESHNESS_MINUTES,
+                                    ),
+                            );
+                            tx.query_row(
+                                "SELECT session_id FROM pane_session_bindings
+                                 WHERE machine_id = ?1
+                                   AND pane_id = ?2
+                                   AND observed_at >= ?3
+                                   AND observed_at <= ?4
+                                 ORDER BY observed_at DESC
+                                 LIMIT 1",
+                                params![
+                                    event.machine_id.as_deref().unwrap_or(""),
+                                    pane_id,
+                                    freshness_start,
+                                    &timestamp_str
+                                ],
+                                |row| row.get(0),
+                            )
+                            .optional()?
+                        }
+                        (None, _) => event.session_id.clone(),
+                    }
+                } else {
+                    event.session_id.clone()
+                };
 
                 let rows = stmt.execute(params![
                     event.id,
@@ -1400,7 +1512,7 @@ impl Database {
                     event.status,
                     event.idle_duration_ms,
                     event.action,
-                    event.session_id,
+                    session_id,
                     event.stream_id,
                     event.assignment_source,
                     event.window_app_id,
@@ -2752,6 +2864,64 @@ impl Database {
             retained,
             retired,
         })
+    }
+
+    /// Applies recent, observed pane identities to historical tmux focus events.
+    ///
+    /// This writes only `session_id`; the established session-membership pass remains the sole
+    /// path from an identity to a stream. Human assignments are skipped, no event row is deleted,
+    /// and dry runs roll the transaction back after measuring the same update as an apply run.
+    pub fn backfill_pane_session_bindings(
+        &self,
+        mode: ReleaseMode,
+    ) -> Result<PaneSessionBindingBackfillOutcome, DbError> {
+        let tx = self.write_tx()?;
+        let freshness_modifier = format!("-{PANE_SESSION_BINDING_FRESHNESS_MINUTES} minutes");
+        let matching_binding = "EXISTS (
+            SELECT 1 FROM pane_session_bindings binding
+            WHERE binding.machine_id = COALESCE(event.machine_id, '')
+              AND binding.pane_id = event.pane_id
+              AND binding.observed_at <= event.timestamp
+              AND julianday(binding.observed_at) >= julianday(event.timestamp, ?1)
+        )";
+        let retained: u64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM events AS event
+                 WHERE event.type = 'tmux_pane_focus'
+                   AND event.session_id IS NULL
+                   AND event.assignment_source = 'user'
+                   AND {matching_binding}"
+            ),
+            params![freshness_modifier],
+            |row| row.get(0),
+        )?;
+        let bound = tx.execute(
+            &format!(
+                "UPDATE events AS event
+                 SET session_id = (
+                     SELECT binding.session_id FROM pane_session_bindings binding
+                     WHERE binding.machine_id = COALESCE(event.machine_id, '')
+                       AND binding.pane_id = event.pane_id
+                       AND binding.observed_at <= event.timestamp
+                       AND julianday(binding.observed_at) >= julianday(event.timestamp, ?1)
+                     ORDER BY binding.observed_at DESC
+                     LIMIT 1
+                 )
+                 WHERE event.type = 'tmux_pane_focus'
+                   AND event.session_id IS NULL
+                   AND (event.assignment_source IS NULL OR event.assignment_source != 'user')
+                   AND {matching_binding}"
+            ),
+            params![freshness_modifier],
+        )? as u64;
+        if bound > 0 {
+            Self::bump_db_version_in_transaction(&tx)?;
+        }
+        match mode {
+            ReleaseMode::Apply => tx.commit()?,
+            ReleaseMode::DryRun => tx.rollback()?,
+        }
+        Ok(PaneSessionBindingBackfillOutcome { bound, retained })
     }
 
     /// Releases the attribution carried by pane focus that could never have earned it.
@@ -6510,20 +6680,20 @@ mod tests {
     #[test]
     fn test_open_fails_on_newer_schema() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("v14.db");
+        let db_path = temp_dir.path().join("v15.db");
 
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE schema_info (version INTEGER NOT NULL);
-                 INSERT INTO schema_info (version) VALUES (14);",
+                 INSERT INTO schema_info (version) VALUES (15);",
             )
             .unwrap();
         }
 
         assert!(matches!(
             Database::open(&db_path),
-            Err(DbError::SchemaVersionMismatch { found: 14, .. })
+            Err(DbError::SchemaVersionMismatch { found: 15, .. })
         ));
     }
 
@@ -10872,6 +11042,9 @@ mod tests {
     ) {
         let mut event = make_event(id, ts(0), event_type);
         event.session_id = session_id.map(String::from);
+        if session_id.is_some() && matches!(event_type, tt_core::EventType::TmuxPaneFocus) {
+            event.pane_id = Some("%4".to_string());
+        }
         event.stream_id = Some(CONTAINER.to_string());
         event.assignment_source = source.map(String::from);
         if matches!(event_type, tt_core::EventType::WindowFocus) {
@@ -11779,5 +11952,242 @@ mod tests {
             })
             .unwrap();
         assert_eq!(value, "3");
+    }
+
+    #[test]
+    fn pane_focus_reuses_a_fresh_stamped_session_binding() {
+        // Given: a pane whose process tree identified the agent session moments ago.
+        let db = Database::open_in_memory().unwrap();
+        let mut stamped = make_event("stamped", ts(0), tt_core::EventType::TmuxPaneFocus);
+        stamped.session_id = Some("session-a".to_string());
+        db.insert_event(&stamped).unwrap();
+
+        // When: a later focus cannot see an agent process in that same pane.
+        let unstamped = make_event(
+            "unstamped",
+            ts(0) + chrono::Duration::minutes(30),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+        db.insert_event(&unstamped).unwrap();
+
+        // Then: it retains the recently observed pane identity without assigning a stream.
+        let events = db.get_events(None, None).unwrap();
+        let later = events.iter().find(|event| event.id == "unstamped").unwrap();
+        assert_eq!(later.session_id.as_deref(), Some("session-a"));
+        assert_eq!(later.stream_id, None);
+        assert_eq!(later.assignment_source, None);
+    }
+
+    #[test]
+    fn pane_binding_backfill_dry_run_keeps_historical_events_unchanged() {
+        // Given: a historical unstamped focus alongside a fresh binding for its pane.
+        let db = Database::open_in_memory().unwrap();
+        let mut stamped = make_event("stamped", ts(0), tt_core::EventType::TmuxPaneFocus);
+        stamped.session_id = Some("session-a".to_string());
+        db.insert_event(&stamped).unwrap();
+        let unstamped = make_event(
+            "historic",
+            ts(0) + chrono::Duration::minutes(30),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+        db.insert_event(&unstamped).unwrap();
+        db.conn
+            .execute(
+                "UPDATE events SET session_id = NULL WHERE id = 'historic'",
+                [],
+            )
+            .unwrap();
+        let version_before = db.get_db_version().unwrap();
+
+        // When: the backfill is previewed.
+        let outcome = db
+            .backfill_pane_session_bindings(ReleaseMode::DryRun)
+            .unwrap();
+
+        // Then: the prospective binding is counted but neither the row nor db_version changes.
+        assert_eq!(outcome.bound, 1);
+        assert_eq!(db.get_db_version().unwrap(), version_before);
+        let historic = db
+            .get_events(None, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == "historic")
+            .unwrap();
+        assert_eq!(historic.session_id, None);
+    }
+
+    #[test]
+    fn pane_focus_outside_the_binding_freshness_window_stays_unassigned() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stamped = make_event("stamped", ts(0), tt_core::EventType::TmuxPaneFocus);
+        stamped.session_id = Some("session-a".to_string());
+        db.insert_event(&stamped).unwrap();
+        let unstamped = make_event(
+            "expired",
+            ts(0) + chrono::Duration::minutes(PANE_SESSION_BINDING_FRESHNESS_MINUTES + 1),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+
+        db.insert_event(&unstamped).unwrap();
+
+        let expired = db
+            .get_events(None, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == "expired")
+            .unwrap();
+        assert_eq!(expired.session_id, None);
+        assert_eq!(expired.stream_id, None);
+    }
+
+    #[test]
+    fn pane_focus_uses_the_newest_binding_for_a_reused_pane() {
+        let db = Database::open_in_memory().unwrap();
+        let mut first = make_event("first", ts(0), tt_core::EventType::TmuxPaneFocus);
+        first.session_id = Some("session-a".to_string());
+        db.insert_event(&first).unwrap();
+        let mut second = make_event(
+            "second",
+            ts(0) + chrono::Duration::minutes(1),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+        second.session_id = Some("session-b".to_string());
+        db.insert_event(&second).unwrap();
+        let unstamped = make_event(
+            "reused",
+            ts(0) + chrono::Duration::minutes(2),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+
+        db.insert_event(&unstamped).unwrap();
+
+        let reused = db
+            .get_events(None, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == "reused")
+            .unwrap();
+        assert_eq!(reused.session_id.as_deref(), Some("session-b"));
+    }
+
+    #[test]
+    fn pane_binding_backfill_never_changes_human_assignments_or_deletes_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stamped = make_event("stamped", ts(0), tt_core::EventType::TmuxPaneFocus);
+        stamped.session_id = Some("session-a".to_string());
+        db.insert_event(&stamped).unwrap();
+        let historic = make_event(
+            "human",
+            ts(0) + chrono::Duration::minutes(30),
+            tt_core::EventType::TmuxPaneFocus,
+        );
+        db.insert_event(&historic).unwrap();
+        db.conn
+            .execute(
+                "UPDATE events SET session_id = NULL, assignment_source = 'user' WHERE id = 'human'",
+                [],
+            )
+            .unwrap();
+
+        let outcome = db
+            .backfill_pane_session_bindings(ReleaseMode::Apply)
+            .unwrap();
+
+        assert_eq!(outcome.bound, 0);
+        assert_eq!(outcome.retained, 1);
+        let events = db.get_events(None, None).unwrap();
+        assert_eq!(events.len(), 2);
+        let human = events
+            .into_iter()
+            .find(|event| event.id == "human")
+            .unwrap();
+        assert_eq!(human.session_id, None);
+        assert_eq!(human.assignment_source.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn a_capture_only_schema_without_pane_bindings_still_migrates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("capture-only-v13.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut stamped = make_event("stamped", ts(0), tt_core::EventType::TmuxPaneFocus);
+        stamped.session_id = Some("session-a".to_string());
+        db.insert_event(&stamped).unwrap();
+        db.conn
+            .execute("DROP TABLE pane_session_bindings", [])
+            .unwrap();
+        db.conn.execute("DROP TABLE proposals", []).unwrap();
+        db.conn
+            .execute("UPDATE schema_info SET version = 13", [])
+            .unwrap();
+        drop(db);
+
+        let migrated = Database::open(&db_path).unwrap();
+        let pane_table_exists: bool = migrated
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pane_session_bindings')",
+                [],
+                |row| row.get(0),
+        )
+        .unwrap();
+        assert!(pane_table_exists);
+        let migrated_binding: String = migrated
+            .conn
+            .query_row(
+                "SELECT session_id FROM pane_session_bindings WHERE pane_id = '%3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_binding, "session-a");
+    }
+
+    #[test]
+    fn a_database_with_no_events_table_still_migrates_to_pane_bindings() {
+        // Given: a schema-13 database that carries no `events` table at all.
+        //
+        // The v<=13 arm seeds `pane_session_bindings` with INSERT..SELECT FROM events,
+        // which is the same unconditional-statement bug the v<=12 arm hit on `proposals`
+        // and left devbox unable to open its database. Three existing migration fixtures
+        // (v9 slug, v10 stream metadata, v12 classifier generation) build no `events`
+        // table and caught this; none of them is NAMED for it, so this states the rule.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("no-events-v13.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_info (version INTEGER NOT NULL);
+                 INSERT INTO schema_info (version) VALUES (13);
+                 CREATE TABLE streams (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    name TEXT,
+                    slug TEXT,
+                    description TEXT,
+                    color TEXT,
+                    time_direct_ms INTEGER DEFAULT 0,
+                    time_delegated_ms INTEGER DEFAULT 0,
+                    first_event_at TEXT,
+                    last_event_at TEXT,
+                    needs_recompute INTEGER DEFAULT 0
+                 );",
+            )
+            .unwrap();
+        }
+
+        // When: the current binary opens it.
+        let db = Database::open(&db_path).unwrap();
+
+        // Then: it migrated, and the binding table was created complete but unseeded --
+        // a database with no events has no historical pane focus to seed from.
+        let bindings: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM pane_session_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(bindings, 0, "nothing to seed, and seeding must not fail");
     }
 }
