@@ -21,6 +21,10 @@ mod dissolve;
 pub use dissolve::dissolve;
 mod release_pane_focus;
 pub use release_pane_focus::release_pane_focus;
+mod release_junk_attention;
+pub use release_junk_attention::release_junk_attention;
+mod backfill_pane_bindings;
+pub use backfill_pane_bindings::backfill_pane_session_bindings;
 mod slug;
 pub use slug::set_slug;
 mod misnamed;
@@ -31,6 +35,10 @@ mod rename;
 pub use rename::rename;
 mod assign;
 pub use assign::assign;
+mod instance_families;
+pub use instance_families::collapse_instance_families;
+#[cfg(test)]
+mod backfill_pane_binding_tests;
 
 /// Labels a stream as `name (id-prefix)` for report headers and confirmations.
 fn format_stream_label(name: Option<&str>, id: &str) -> String {
@@ -148,12 +156,22 @@ pub fn get_streams_for_display(db: &Database, today: NaiveDate) -> Result<Vec<St
     Ok(entries)
 }
 
-/// Most recent `updated_at` among `entries` — when `tt recompute` last wrote
-/// their times.
+/// When `tt recompute` last wrote these times, as `(oldest, newest)`.
+///
+/// The **oldest** is what the freshness note leads with, because the note answers "how far
+/// can I trust these numbers" and any single figure a reader's eye lands on may be the
+/// worst one. Reporting only the newest flatters: measured live, one recently-touched
+/// stream put "Times last computed 4h ago" under a listing whose reserved `junk` row was
+/// written **five days** earlier and overstated its direct time by about 40 hours -- so the
+/// label converted "I do not know how old this is" into a confident and wrong claim. That
+/// is the same failure this repo records for `streams.last_event_at`: a number presented
+/// more confidently than it has earned is worse than an absent one.
 ///
 /// `None` exactly when `entries` is empty.
-fn times_computed_at(entries: &[StreamEntry]) -> Option<DateTime<Utc>> {
-    entries.iter().map(|entry| entry.updated_at).max()
+fn times_computed_at(entries: &[StreamEntry]) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let oldest = entries.iter().map(|entry| entry.updated_at).min()?;
+    let newest = entries.iter().map(|entry| entry.updated_at).max()?;
+    Some((oldest, newest))
 }
 
 // ========== Human-Readable Output ==========
@@ -171,7 +189,7 @@ pub fn format_streams(entries: &[StreamEntry], now: DateTime<Utc>) -> Result<Str
     writeln!(output, "STREAMS (last 7 days)")?;
     writeln!(output)?;
 
-    let Some(times_computed_at) = times_computed_at(entries) else {
+    let Some((computed_oldest, computed_newest)) = times_computed_at(entries) else {
         writeln!(output, "No streams with activity in the last 7 days.")?;
         writeln!(output)?;
         writeln!(
@@ -234,8 +252,14 @@ pub fn format_streams(entries: &[StreamEntry], now: DateTime<Utc>) -> Result<Str
     writeln!(output)?;
     writeln!(
         output,
-        "Times last computed {} ago. Run 'tt recompute' to refresh.",
-        format_age(times_computed_at, now)
+        "Times last computed {} ago{}. Run 'tt recompute' to refresh.",
+        format_age(computed_oldest, now),
+        // Named only when the spread is real, so the ordinary case stays one clean figure.
+        if format_age(computed_oldest, now) == format_age(computed_newest, now) {
+            String::new()
+        } else {
+            format!(" (most recent: {})", format_age(computed_newest, now))
+        }
     )?;
     writeln!(
         output,
@@ -255,6 +279,14 @@ pub struct JsonStreams {
     /// When `tt recompute` last wrote the listed streams' times; `None` when
     /// no streams are listed.
     pub times_computed_at: Option<String>,
+    /// When the *oldest* of those times was written.
+    ///
+    /// Added rather than folded into `times_computed_at`, whose meaning is a consumed
+    /// contract: silently redefining it would move every existing reader's numbers without
+    /// telling it. This is the figure that bounds how far the totals can be trusted --
+    /// live, one recently-touched stream reported "4h ago" over a listing containing a row
+    /// five days old and wrong by about 40 hours.
+    pub times_computed_oldest_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,8 +305,11 @@ pub fn format_streams_json(entries: &[StreamEntry], today: NaiveDate) -> Result<
             start: start_date.format("%Y-%m-%d").to_string(),
             end: today.format("%Y-%m-%d").to_string(),
         },
+        // Unchanged meaning: the newest write, as every existing consumer already reads it.
         times_computed_at: times_computed_at(entries)
-            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            .map(|(_, newest)| newest.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        times_computed_oldest_at: times_computed_at(entries)
+            .map(|(oldest, _)| oldest.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
     };
 
     Ok(serde_json::to_string_pretty(&json_streams)?)

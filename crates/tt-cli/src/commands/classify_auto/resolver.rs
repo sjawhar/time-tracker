@@ -396,6 +396,18 @@ impl<'a> Resolver<'a> {
             return Ok(());
         }
         let (session_id, event_ids) = target.proposal_scope();
+        // A window run that gained a focus event no longer matches its own pending
+        // proposal, so the guard above lets it through and this files a second answer
+        // beside the first. Retire the strictly-less-complete ones now: the queue then
+        // holds one question per run, answered with the most evidence anyone had. See
+        // `Database::supersede_pending_subset_proposals_for_events`.
+        if let Some(ids) = event_ids.as_deref() {
+            let retired = self
+                .db
+                .supersede_pending_subset_proposals_for_events(ids)
+                .context("retire less-complete proposals for this window run")?;
+            self.outcome.superseded += retired;
+        }
         let proposal = tt_db::Proposal {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: Utc::now(),
@@ -429,6 +441,13 @@ impl<'a> Resolver<'a> {
     /// `tt_llm::ROSTER_LIMIT`, so a name it proposes may belong to a stream it was never
     /// shown; turning that into reuse is exactly what makes the cap safe to have.
     ///
+    /// An exact match is only half of that, and the half that stopped being enough: the
+    /// model rarely re-words an unseen stream to the character, and every near miss minted
+    /// a row — 1,638 streams in August against 143 in May. So once the exact lookup misses,
+    /// [`tt_db::Database::find_stream_by_near_name`] asks the narrower question of the
+    /// whole table: is some stream already covering this initiative. Exact still runs
+    /// first and still wins, because it is the one answer that is not a judgement.
+    ///
     /// A `None` description is stored as one: the stream is real and named, it simply
     /// has no description yet, which is exactly the population
     /// `tt streams describe --backfill` selects.
@@ -451,14 +470,25 @@ impl<'a> Resolver<'a> {
         {
             return Ok(stream_id);
         }
-        if let Some(existing) = self
+        let exact = self
             .db
             .find_stream_by_normalized_name(&name)
-            .context("look for a stream already carrying the chosen name")?
-        {
+            .context("look for a stream already carrying the chosen name")?;
+        let existing = match exact {
+            Some(found) => Some(found),
+            None => self
+                .db
+                .find_stream_by_near_name(&name)
+                .context("look for a stream already covering the chosen name's initiative")?,
+        };
+        if let Some(existing) = existing {
+            // Both names, because a near match is a judgement and this line is what makes
+            // it auditable after the fact.
             debug!(
                 stream_id = existing.id,
-                name, "reusing a stream the roster did not list"
+                name,
+                reused = existing.name.as_deref().unwrap_or_default(),
+                "reusing a stream the roster did not list"
             );
             // Read fresh so the reused stream competes on its real period rather than on
             // the `streams` columns, which only `tt recompute` writes.

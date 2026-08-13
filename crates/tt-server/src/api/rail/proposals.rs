@@ -4,9 +4,7 @@ use axum::{
     extract::{Path, State},
 };
 use serde::{Deserialize, Serialize};
-use tt_db::{
-    AcceptProposalOutcome, Database, DbError, Proposal, ProposalStatus, RejectProposalOutcome,
-};
+use tt_db::{AcceptProposalOutcome, Database, DbError, Proposal, RejectProposalOutcome};
 
 use crate::ServerEvent;
 
@@ -15,6 +13,7 @@ use super::super::{ApiError, ApiState};
 #[derive(Serialize)]
 pub(super) struct ProposalsResponse {
     proposals: Vec<ProposalResponse>,
+    total_pending: usize,
 }
 
 #[derive(Serialize)]
@@ -82,14 +81,19 @@ pub(super) async fn handler(
     let database_path = state.database_path;
     let response = tokio::task::spawn_blocking(move || {
         let db = Database::open(&database_path).context("open proposals database")?;
-        let proposals = db
-            .get_proposals(Some(ProposalStatus::Pending))
+        let ranked_proposals = db
+            .pending_proposals_by_attention()
             .context("load pending classifier proposals")?;
-        proposals
+        let total_pending = ranked_proposals.len();
+        let proposals = ranked_proposals
             .into_iter()
-            .map(|proposal| proposal_response(&db, proposal))
-            .collect::<Result<Vec<_>>>()
-            .map(|proposals| ProposalsResponse { proposals })
+            .take(12)
+            .map(|ranked| proposal_response(&db, ranked.proposal))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ProposalsResponse {
+            proposals,
+            total_pending,
+        })
     })
     .await
     .map_err(|error| {

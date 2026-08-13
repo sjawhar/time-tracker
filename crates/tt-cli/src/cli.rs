@@ -306,6 +306,24 @@ pub enum StreamsAction {
         dry_run: bool,
     },
 
+    /// Release attention-opening events incorrectly routed to the reserved junk stream.
+    ReleaseJunkAttention {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Apply recent, observed pane session identities to historical tmux focus events.
+    ///
+    /// This writes only `session_id`, never a stream or assignment source. A binding is usable
+    /// only for the same pane on the same machine within the 30-minute freshness window. Start
+    /// with --dry-run.
+    BackfillPaneBindings {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Collapse streams onto one row, moving their events and tags.
     ///
     /// The counterpart to dissolve: dissolving says this was never work, merging
@@ -328,6 +346,19 @@ pub enum StreamsAction {
         into: String,
 
         /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Collapse trailing numbered execution instances onto their initiative.
+    ///
+    /// An instance suffix such as `(Ralph iteration 7)` names one execution of work,
+    /// not a distinct initiative. This selects exact suffix families, renames the
+    /// deterministic target to the initiative name, and merges the rest into it.
+    /// Events assigned by hand move with their assignment source; no event is deleted.
+    /// Start with --dry-run.
+    CollapseInstances {
+        /// Report exact families and counts without writing anything.
         #[arg(long)]
         dry_run: bool,
     },

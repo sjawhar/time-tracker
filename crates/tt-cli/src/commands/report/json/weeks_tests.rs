@@ -78,7 +78,8 @@ fn test_weekly_reports_json_shape() {
             "time_delegated_ms": 0,
             "stream_count": 0,
             "unassigned_direct_ms": 0,
-            "unassigned_delegated_ms": 0
+            "unassigned_delegated_ms": 0,
+            "total_tracked_ms": 0
           }
         },
         {
@@ -108,7 +109,8 @@ fn test_weekly_reports_json_shape() {
             "time_delegated_ms": 0,
             "stream_count": 0,
             "unassigned_direct_ms": 0,
-            "unassigned_delegated_ms": 0
+            "unassigned_delegated_ms": 0,
+            "total_tracked_ms": 0
           }
         }
       ]
@@ -171,7 +173,8 @@ fn test_weekly_reports_ordering() {
             "time_delegated_ms": 0,
             "stream_count": 0,
             "unassigned_direct_ms": 0,
-            "unassigned_delegated_ms": 0
+            "unassigned_delegated_ms": 0,
+            "total_tracked_ms": 0
           }
         },
         {
@@ -201,7 +204,8 @@ fn test_weekly_reports_ordering() {
             "time_delegated_ms": 0,
             "stream_count": 0,
             "unassigned_direct_ms": 0,
-            "unassigned_delegated_ms": 0
+            "unassigned_delegated_ms": 0,
+            "total_tracked_ms": 0
           }
         },
         {
@@ -231,7 +235,8 @@ fn test_weekly_reports_ordering() {
             "time_delegated_ms": 0,
             "stream_count": 0,
             "unassigned_direct_ms": 0,
-            "unassigned_delegated_ms": 0
+            "unassigned_delegated_ms": 0,
+            "total_tracked_ms": 0
           }
         }
       ]

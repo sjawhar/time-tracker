@@ -13,6 +13,8 @@ export interface CurrentStream {
   stream_id: string;
   name: string;
   since: string;
+  last_seen: string;
+  active: boolean;
 }
 
 export interface TopTodo {
@@ -132,3 +134,35 @@ export type ProposalTarget =
 export type ProposalScope =
   | { kind: 'session'; count: number }
   | { kind: 'events'; count: number };
+export interface Report {
+  generated_at: string;
+  timezone: string;
+  week_start_day: string;
+  period: {
+    start: string;
+    end: string;
+    type: 'week' | 'day';
+  };
+  by_tag: unknown[];
+  streams: ReportStream[];
+  untagged: unknown;
+  agent_sessions: unknown;
+  totals: ReportTotals;
+}
+
+export interface ReportStream {
+  id: string;
+  name: string | null;
+  time_direct_ms: number;
+  time_delegated_ms: number;
+  tags: string[];
+}
+
+export interface ReportTotals {
+  time_direct_ms: number;
+  time_delegated_ms: number;
+  stream_count: number;
+  unassigned_direct_ms: number;
+  unassigned_delegated_ms: number;
+  total_tracked_ms: number;
+}

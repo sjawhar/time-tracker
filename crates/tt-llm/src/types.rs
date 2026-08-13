@@ -10,7 +10,28 @@ use crate::transport::HttpFailure;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationInput {
+    /// Identifies the work under classification, and keys the fetch budget.
+    ///
+    /// This is **not** always a real session: a window run is a set of focus events with
+    /// no session at all, and passes a synthetic `window:<event_id>`. Consult
+    /// [`Self::has_session`] before treating it as one.
     pub session_id: String,
+    /// Whether [`Self::session_id`] names a session the `SessionDetail` provider can read.
+    ///
+    /// The agentic fetch path is only offered when this is true, and the reason is a
+    /// measured defect rather than tidiness. A window run has no session by design, but it
+    /// was handed the same preamble ("You may look further into the session") and the same
+    /// `session_overview` / `session_messages` tools as a real session. The model duly
+    /// called them, and `SessionDetail` answered `session window:<id> is not indexed` --
+    /// a message that reads as *the system is broken* rather than *this scope has no
+    /// session*. Live, that reached **161 of 518 pending proposals (31%), every one of them
+    /// window-scoped**, and they average **0.491 confidence against 0.597** for the rest of
+    /// the queue. The model was being told a lie about system state and answering more
+    /// cautiously because of it, having also spent fetch calls to learn it.
+    ///
+    /// Declared per input rather than sniffed from the `window:` prefix, because that
+    /// prefix is a format `tt-cli` invents and `tt-llm` must not come to depend on it.
+    pub has_session: bool,
     pub machine: Option<String>,
     pub cwd: Option<String>,
     pub starting_prompt: Option<String>,
@@ -171,15 +192,24 @@ impl TryFrom<ClassificationExtract> for ClassificationOutput {
             // decline rather than invent a container, is that instruction being obeyed.
             // It determines nothing, which is a verdict about this classification and
             // not a defect in it.
-            (None, None) if value.new_stream_description.is_none() => StreamChoice::Undetermined,
-            // A description alone is the dependent half of a choice whose load-bearing
-            // half is missing: the name is what `is_misnamed_stream` judges and what the
-            // stream is filed under. Nothing invites this shape, so it stays an error.
-            (None, None) => {
-                return Err(LlmError::Parse(
-                    "a new stream description names no stream to hang it on".to_owned(),
-                ));
-            }
+            //
+            // A stray `new_stream_description` does not change that. This arm used to
+            // split on it and raise a hard parse error, reasoning that a description is
+            // the dependent half of a choice whose load-bearing half is missing and that
+            // nothing invites the shape. The premise was measured false: the model emits
+            // it in 6% of live classifications (10 of 167 over twelve hours), because the
+            // schema advertises the field and a declining model fills it with prose that
+            // belongs in `reasoning`. The load-bearing half is missing in *both* arms --
+            // there is no name, so no stream can be minted either way -- so the presence
+            // of a field that names nothing cannot be what separates a decline from a
+            // malformation. Erroring instead spent up to `MAX_PARSE_ATTEMPTS` redraws on
+            // a shape no redraw fixes, counted a decline among `errors`, and armed the
+            // failure backoff against a model that was answering as instructed.
+            //
+            // This is the same correction this repo already made for the arm above, applied
+            // to the case it missed. The guard that matters is untouched: creating a stream
+            // still requires a name, and `is_misnamed_stream` still judges it.
+            (None, None) => StreamChoice::Undetermined,
         };
 
         Ok(Self {
@@ -263,7 +293,15 @@ impl Classifier for MockClassifier {
                 .pop_front()
                 .ok_or_else(|| LlmError::Api("no scripted classification result".to_owned()))?;
         };
-        let tools = self.tools.clone().unwrap_or_else(SessionTools::unavailable);
+        // Withheld for a scope with no session, exactly as `RigClassifier` withholds them:
+        // a window run has nothing for a provider to read, and offering the tools anyway
+        // earned 161 live proposals a `not indexed` answer that reads as a broken system.
+        // The mock must model the same rule or no test can catch its absence.
+        let tools = self
+            .tools
+            .clone()
+            .filter(|_| input.has_session)
+            .unwrap_or_else(SessionTools::unavailable);
         // A fresh budget per classification, exactly as `RigClassifier` does.
         let session = tools.begin(&input.session_id);
         let output = brain(input, &session);
@@ -400,15 +438,25 @@ mod tests {
     }
 
     #[test]
-    fn a_described_stream_with_no_name_still_determines_nothing() {
-        // Given: the half that cannot stand alone — a description names no stream.
+    fn a_described_stream_with_no_name_is_a_decline_rather_than_a_failure() {
+        // Given: a declining answer that still filled the description field — the shape
+        // the live model emits in 6% of classifications (10 of 167 over twelve hours),
+        // because the schema advertises the field.
         let extracted = ClassificationExtract {
             new_stream_description: Some("Work on the classifier".to_owned()),
             ..extract()
         };
 
-        // When/Then: nothing to file the work under, so this is still an error.
-        assert!(ClassificationOutput::try_from(extracted).is_err());
+        // When
+        let output = ClassificationOutput::try_from(extracted)
+            .expect("a decline carrying a stray description is still a decline");
+
+        // Then: undetermined, not an error. The load-bearing half — the name — is absent
+        // in this arm and in the all-null one alike, so no stream can be minted either
+        // way and the stray field cannot be what separates a decline from a malformation.
+        // Erroring spent up to `MAX_PARSE_ATTEMPTS` redraws on a shape no redraw fixes,
+        // counted a decline among `errors`, and armed the failure backoff.
+        assert_eq!(output.choice, StreamChoice::Undetermined);
     }
 
     #[test]

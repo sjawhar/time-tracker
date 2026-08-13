@@ -453,6 +453,8 @@ impl Resolver<'_> {
             }
             askable.push((
                 ClassificationInput {
+                    // a real agent session
+                    has_session: true,
                     session_id: session.session_id,
                     machine,
                     cwd: Some(session.project_path),
@@ -576,6 +578,8 @@ impl Resolver<'_> {
                 })
                 .ok();
             let input = ClassificationInput {
+                // a window run is a set of focus events; it has no session
+                has_session: false,
                 session_id: format!("window:{event_id}"),
                 machine: run.machine_id,
                 cwd: None,
@@ -617,6 +621,8 @@ impl Resolver<'_> {
                 continue;
             }
             let input = ClassificationInput {
+                // a real agent session being re-checked
+                has_session: true,
                 session_id: session.session_id,
                 machine,
                 cwd: Some(session.project_path),

@@ -29,10 +29,7 @@ let mouseX = $state(0);
 let mouseY = $state(0);
 let expandedGaps = $state(new SvelteSet<number>());
 
-// `top` is the horizontal-label case; rotated labels need far more vertical room and
-// are clipped without it (see ROTATED_LABEL_HEADROOM).
 const MARGIN = { top: 40, right: 20, bottom: 20, left: 60 };
-const ROTATED_LABEL_HEADROOM = 150;
 
 const COLUMN_GAP = 10;
 
@@ -55,12 +52,7 @@ let columnWidth = $derived(
     : 0,
 );
 
-// Below this width a horizontal label cannot render legibly, so labels rotate.
-const HORIZONTAL_LABEL_MIN_WIDTH = 64;
-let rotateLabels = $derived(columnWidth < HORIZONTAL_LABEL_MIN_WIDTH);
-
-// Scales. Rotated labels claim extra headroom, so the time range starts below them.
-let headerHeight = $derived(rotateLabels ? ROTATED_LABEL_HEADROOM : MARGIN.top);
+let headerHeight = $derived(MARGIN.top);
 
 let yScale = $derived(
   new PiecewiseTimeScale(
@@ -154,8 +146,6 @@ function draw() {
     // Draw events
     streamData.events.forEach((event) => {
       const y = yScale.scale(new Date(event.timestamp));
-      hitTester.addEvent(event, streamData.stream, x + columnWidth / 2, y);
-
       hitTester.addEvent(event, streamData.stream, x + columnWidth / 2, y);
 
       if (event.kind === 'user_message') {
@@ -419,50 +409,6 @@ const formatDay = d3TimeFormat.timeFormat('%b %d');
       {/each}
     </g>
     
-    <!-- Stream Headers. Only rendered once measured (see `measured` above). -->
-    {#if measured}
-      <g transform="translate(0, {headerHeight - 10})">
-        {#each data.streams_active as streamData, i}
-          {@const x = MARGIN.left + i * (columnWidth + COLUMN_GAP)}
-          {@const fullLabel = streamData.stream.slug || streamData.stream.name || 'Unnamed'}
-          {@const label = rotateLabels ? fitRotatedLabel(fullLabel) : fullLabel}
-          <rect
-            {x}
-            y="-20"
-            width={columnWidth}
-            height="24"
-            rx="4"
-            fill={getStreamColor(streamData.stream, i)}
-            opacity="0.2"
-          />
-          <!-- Narrow columns (many concurrent streams) get rotated labels; a centred
-               horizontal label truncates into unreadable stubs below ~64px. -->
-          {#if rotateLabels}
-            <text
-              transform="translate({x + columnWidth / 2}, -24) rotate(-90)"
-              text-anchor="start"
-              dy="0.32em"
-              class="text-xs font-medium fill-[var(--color-text-base)]"
-              style="pointer-events: auto;"
-            >
-              <title>{streamData.stream.name || fullLabel}</title>
-              {label}
-            </text>
-          {:else}
-            <text
-              x={x + columnWidth / 2}
-              y="-4"
-              text-anchor="middle"
-              class="text-xs font-medium fill-[var(--color-text-base)]"
-              style="pointer-events: auto;"
-            >
-              <title>{streamData.stream.name || fullLabel}</title>
-              {label}
-            </text>
-          {/if}
-        {/each}
-      </g>
-    {/if}
   </svg>
   {#if hoveredTarget}
     <div

@@ -1330,6 +1330,46 @@ fn a_session_with_no_tools_and_one_exchange_is_junked_without_an_llm_call() {
 }
 
 #[test]
+fn structurally_junk_sessions_leave_attention_unassigned() {
+    // Given: a structurally junk session carrying agent activity and all three attention types.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    insert_tool_free_session(&db, "session-a", 2);
+    for (event_id, event_type) in [
+        ("event-user-message", EventType::UserMessage),
+        ("event-window-focus", EventType::WindowFocus),
+        ("event-pane-focus", EventType::TmuxPaneFocus),
+    ] {
+        db.insert_event(&event(event_id, Some("session-a"), event_type))
+            .unwrap();
+    }
+    let classifier = scripted(StreamChoice::Undetermined, 0.0);
+
+    // When: automatic classification settles the structurally junk session.
+    let outcome = run_auto(&db, &Config::default(), &classifier).unwrap();
+
+    // Then: only the agent activity is routed to junk; attention remains unassigned.
+    assert_eq!(outcome.errors, 0);
+    let junked = stored_event(&db, "event-session-a");
+    assert_eq!(
+        junked.stream_id.as_deref(),
+        Some(junk_stream_id(&db).as_str())
+    );
+    assert_eq!(junked.assignment_source.as_deref(), Some("junk"));
+    for event_id in [
+        "event-user-message",
+        "event-window-focus",
+        "event-pane-focus",
+    ] {
+        let attention = stored_event(&db, event_id);
+        assert_eq!(attention.stream_id, None, "{event_id} was routed to junk");
+        assert_eq!(
+            attention.assignment_source, None,
+            "{event_id} kept a source"
+        );
+    }
+}
+
+#[test]
 fn a_tool_free_session_with_depth_still_reaches_the_classifier() {
     // Given: no tool calls but six messages — the shape of a contract review or a
     // vendor pricing discussion, which structure cannot judge.
@@ -1510,6 +1550,12 @@ fn a_throwaway_verdict_routes_the_session_to_junk_without_creating_a_stream() {
     // Given: a session structure cannot judge, which the classifier calls trivial.
     let db = tt_db::Database::open_in_memory().unwrap();
     insert_session_candidate(&db, "session-a", &["Are you there?"]);
+    db.insert_event(&event(
+        "event-user-message",
+        Some("session-a"),
+        EventType::UserMessage,
+    ))
+    .unwrap();
     let classifier = scripted(StreamChoice::Throwaway, 0.9);
 
     // When
@@ -1524,6 +1570,9 @@ fn a_throwaway_verdict_routes_the_session_to_junk_without_creating_a_stream() {
         stored_event(&db, "event-a").assignment_source.as_deref(),
         Some("junk")
     );
+    let attention = stored_event(&db, "event-user-message");
+    assert_eq!(attention.stream_id, None);
+    assert_eq!(attention.assignment_source, None);
 }
 
 #[test]
@@ -2363,6 +2412,7 @@ fn a_new_stream_name_matching_a_stream_absent_from_the_roster_still_reuses_it() 
 
     // When
     let input = tt_llm::ClassificationInput {
+        has_session: true,
         session_id: "session-a".to_string(),
         machine: None,
         cwd: None,
@@ -2386,6 +2436,98 @@ fn a_new_stream_name_matching_a_stream_absent_from_the_roster_still_reuses_it() 
     // Then
     assert_eq!(landed_on.as_deref(), Some("planted-later"));
     assert_eq!(db.get_streams().unwrap().len(), 1);
+}
+
+#[test]
+fn a_new_stream_name_naming_an_existing_initiative_reuses_it_rather_than_minting() {
+    // Given: a stream already covering an initiative, and a verdict naming that same work
+    // in slightly different words. This is the ordinary case now that the roster shows 200
+    // of 2,288 streams: the model names work it was never shown, does not reproduce the
+    // wording, and the exact lookup cannot collapse the result precisely because it is not
+    // exact. Every such miss minted a row -- 1,638 streams in August against 143 in May.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    let mut held = stream("held", None);
+    held.name = Some("dojo: smart home ideation + planning".to_string());
+    db.insert_stream(&held).unwrap();
+    insert_dated_session(&db, "session-a", timestamp(0));
+    let classifier = scripted(
+        StreamChoice::New {
+            name: "dojo: smart home automation ideation + planning".to_string(),
+            description: None,
+        },
+        0.95,
+    );
+
+    // When
+    let outcome = run_auto(&db, &Config::default(), &classifier).unwrap();
+
+    // Then: one stream, and the events landed on the one that already existed.
+    assert_eq!(outcome.assigned, 1);
+    assert_eq!(db.get_streams().unwrap().len(), 1);
+    assert_eq!(
+        stored_event(&db, "event-session-a").stream_id.as_deref(),
+        Some("held")
+    );
+}
+
+#[test]
+fn an_exactly_named_stream_wins_over_a_merely_near_one() {
+    // Given: two streams the proposed name could land on -- one carrying it exactly, one
+    // only near it, and the near one created first so a scan would reach it first. Exact
+    // is the one answer that is not a judgement, so it has to win. Both are planted after
+    // the resolver is built, so its roster snapshot cannot answer either lookup and the
+    // ordering being tested is the database's.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    insert_dated_session(&db, "session-a", timestamp(0));
+    let classifier = scripted(
+        StreamChoice::New {
+            name: "dojo: smart home automation ideation + planning".to_string(),
+            description: None,
+        },
+        0.95,
+    );
+    let config = Config::default();
+    let mut resolver = Resolver::new(&db, &config, &classifier).unwrap();
+    for (id, created, name) in [
+        ("near", timestamp(0), "dojo: smart home ideation + planning"),
+        (
+            "exact",
+            timestamp(10),
+            "dojo: smart home automation ideation + planning",
+        ),
+    ] {
+        let mut planted = stream(id, None);
+        planted.name = Some(name.to_string());
+        planted.created_at = created;
+        db.insert_stream(&planted).unwrap();
+    }
+
+    // When
+    let input = tt_llm::ClassificationInput {
+        has_session: true,
+        session_id: "session-a".to_string(),
+        machine: None,
+        cwd: None,
+        starting_prompt: None,
+        user_prompts: vec!["do the work".to_string()],
+        window_titles: Vec::new(),
+        started_at: Some(timestamp(0)),
+    };
+    let output = resolver.classify(&input).expect("the mock answers once");
+    let landed_on = resolver
+        .resolve(
+            output,
+            AssignmentTarget::Session {
+                session_id: "session-a",
+                prompt_count: 1,
+            },
+            input.started_at,
+        )
+        .unwrap();
+
+    // Then
+    assert_eq!(landed_on.as_deref(), Some("exact"));
+    assert_eq!(db.get_streams().unwrap().len(), 2);
 }
 
 #[test]
@@ -2413,6 +2555,7 @@ fn a_stream_minted_mid_pass_carries_the_period_it_was_minted_for() {
 
     // When: the session is classified and the stream is created.
     let input = tt_llm::ClassificationInput {
+        has_session: true,
         session_id: "session-a".to_string(),
         machine: None,
         cwd: None,
@@ -2614,6 +2757,7 @@ fn one_success_clears_the_failure_streak_without_waiting_for_the_pass_to_end() {
     let config = Config::default();
     let mut resolver = Resolver::new(&db, &config, &classifier).unwrap();
     let input = tt_llm::ClassificationInput {
+        has_session: true,
         session_id: "session-a".to_string(),
         machine: None,
         cwd: None,
@@ -2831,6 +2975,7 @@ fn a_stream_id_the_model_spaced_out_still_resolves() {
 
     // When: the session is classified.
     let input = tt_llm::ClassificationInput {
+        has_session: true,
         session_id: "session-a".to_string(),
         machine: None,
         cwd: None,
@@ -2888,6 +3033,7 @@ fn a_stream_id_that_is_merely_short_is_still_refused() {
 
     // When: the session is classified.
     let input = tt_llm::ClassificationInput {
+        has_session: true,
         session_id: "session-a".to_string(),
         machine: None,
         cwd: None,

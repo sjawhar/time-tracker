@@ -211,6 +211,22 @@ fn main() -> Result<()> {
                     };
                     streams::release_pane_focus(&db, mode)?;
                 }
+                StreamsAction::ReleaseJunkAttention { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::ReleaseMode::DryRun
+                    } else {
+                        tt_db::ReleaseMode::Apply
+                    };
+                    streams::release_junk_attention(&db, mode)?;
+                }
+                StreamsAction::BackfillPaneBindings { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::ReleaseMode::DryRun
+                    } else {
+                        tt_db::ReleaseMode::Apply
+                    };
+                    streams::backfill_pane_session_bindings(&db, mode)?;
+                }
                 StreamsAction::Merge {
                     streams: from_refs,
                     into,
@@ -222,6 +238,14 @@ fn main() -> Result<()> {
                         tt_db::MergeMode::Apply
                     };
                     streams::merge(&db, from_refs, into, mode)?;
+                }
+                StreamsAction::CollapseInstances { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::MergeMode::DryRun
+                    } else {
+                        tt_db::MergeMode::Apply
+                    };
+                    streams::collapse_instance_families(&db, mode)?;
                 }
                 StreamsAction::Rename { stream, name } => streams::rename(&db, stream, name)?,
                 StreamsAction::Assign {

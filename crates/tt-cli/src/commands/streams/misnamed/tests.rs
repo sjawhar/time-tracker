@@ -101,6 +101,24 @@ fn flags_a_date_range_and_a_catch_all_with_their_reasons() {
 }
 
 #[test]
+fn flags_an_instance_suffix_with_its_reason() {
+    // Given: an initiative rendered as one numbered execution.
+    let db = Database::open_in_memory().unwrap();
+    db.insert_stream(&stream(
+        "s1",
+        Some("agent-c: reskin implementer (Ralph iteration 7)"),
+        0,
+    ))
+    .unwrap();
+
+    // When: the existing-name report is collected.
+    let misnamed = collect_misnamed(&db).unwrap();
+
+    // Then: the operator receives the instance-specific reason.
+    assert_eq!(misnamed[0].reason, "instance_suffix");
+}
+
+#[test]
 fn reports_event_counts_and_direct_time_per_stream() {
     // Given: a catch-all holding events and carrying materialized direct time.
     let db = Database::open_in_memory().unwrap();

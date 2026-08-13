@@ -168,7 +168,36 @@
 ///
 /// Generations start at 1. Zero is not a generation; it would read as "unstamped", which
 /// is what `NULL` already means for the rows written before this existed.
-pub const CLASSIFIER_GENERATION: u32 = 1;
+///
+/// ## 1 -> 2: the roster stopped showing the model its own duplicates
+///
+/// Two changes to roster construction, either of which alone would warrant this. Name
+/// resolution gained a near-miss fallback, so a name the model proposes for a stream the
+/// capped roster never showed it now reuses that row instead of minting a neighbour. And
+/// 291 duplicate streams were collapsed on the live table, which changes what the 200
+/// rows a prompt actually carries *are*: a run whose work belonged to `dpi: hosted-task
+/// lambda` was previously offered up to sixteen rows spelling that one initiative, and
+/// `agent-c: WO-005 environment typing` existed as 189. Confidence split across
+/// near-identical candidates is exactly the shape that lands under the 0.80 threshold
+/// while the model is not actually confused about the work, so the queued refusals are
+/// worth asking once more against a roster that names each initiative once.
+/// ## 2 -> 3: a window run stopped being told its missing session was a broken system
+///
+/// A material change to fetch behaviour, which is one of the four things this constant
+/// tracks. A window run is a set of focus events with no session at all, yet it was handed
+/// the same preamble ("You may look further into the session") and the same
+/// `session_overview` / `session_messages` tools as a real session, against a synthetic
+/// `window:<event_id>`. The model called them and was answered `session window:<id> is not
+/// indexed` -- a message about system health, not about the scope, and one it paid fetch
+/// calls to receive. Live, that reached **161 of 518 pending proposals, every one of them
+/// window-scoped**, and those average **0.491 confidence against 0.597** for the rest of
+/// the queue.
+///
+/// So every queued window-run refusal was authored by a classifier that had been told a
+/// falsehood about its own inputs, which is exactly the case this constant exists to
+/// re-open: the tools are now withheld for a sessionless scope, and each of those
+/// questions is asked once more without the lie.
+pub const CLASSIFIER_GENERATION: u32 = 3;
 
 mod fetch;
 mod prompt;

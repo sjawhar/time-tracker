@@ -79,8 +79,8 @@ pub struct JsonTotals {
     pub unassigned_direct_ms: i64,
     /// Delegated time on activity not assigned to any stream (subset of `time_delegated_ms`).
     pub unassigned_delegated_ms: i64,
+    pub total_tracked_ms: i64,
 }
-
 /// Formats report data as JSON.
 pub fn format_report_json(data: &ReportData) -> Result<String> {
     let report = build_json_report(data);
@@ -175,6 +175,7 @@ pub fn build_json_report(data: &ReportData) -> JsonReport {
             stream_count: data.streams.len(),
             unassigned_direct_ms: data.unassigned_direct_ms,
             unassigned_delegated_ms: data.unassigned_delegated_ms,
+            total_tracked_ms: data.total_tracked_ms,
         },
     }
 }

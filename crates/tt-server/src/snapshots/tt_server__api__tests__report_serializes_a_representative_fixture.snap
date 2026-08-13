@@ -1,0 +1,65 @@
+---
+source: crates/tt-server/src/api/tests.rs
+expression: rendered
+---
+{
+  "agent_sessions": {
+    "by_source": {
+      "claude": 2
+    },
+    "by_type": {
+      "agent": 1,
+      "subagent": 1
+    },
+    "top_sessions": [
+      {
+        "duration_ms": 120000,
+        "session_id": "linked-session",
+        "source": "claude",
+        "starting_prompt": "",
+        "type": "agent"
+      },
+      {
+        "duration_ms": 0,
+        "session_id": "subagent-session",
+        "source": "claude",
+        "starting_prompt": "",
+        "type": "subagent"
+      }
+    ],
+    "total": 2
+  },
+  "by_tag": [],
+  "generated_at": "[timestamp]",
+  "period": {
+    "end": "[local-date]",
+    "start": "[local-date]",
+    "type": "day"
+  },
+  "streams": [
+    {
+      "id": "alpha",
+      "name": "alpha stream",
+      "tags": [],
+      "time_delegated_ms": 60000,
+      "time_direct_ms": 360000
+    }
+  ],
+  "timezone": "Etc/UTC",
+  "totals": {
+    "stream_count": 1,
+    "time_delegated_ms": 60000,
+    "time_direct_ms": 360000,
+    "total_tracked_ms": 360000,
+    "unassigned_delegated_ms": 0,
+    "unassigned_direct_ms": 0
+  },
+  "untagged": {
+    "streams": [
+      "alpha"
+    ],
+    "time_delegated_ms": 60000,
+    "time_direct_ms": 360000
+  },
+  "week_start_day": "monday"
+}

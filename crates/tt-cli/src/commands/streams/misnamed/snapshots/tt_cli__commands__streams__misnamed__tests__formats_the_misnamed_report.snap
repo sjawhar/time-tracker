@@ -4,7 +4,7 @@ expression: format_misnamed(&sample_report()).unwrap()
 ---
 MISNAMED STREAMS
 
-These names describe an activity, a date, or a leftover bucket rather than the work.
+These names describe an activity, a date, an execution instance, or a leftover bucket rather than the work.
 
 Name                                          ID        Reason           Events    Direct
 ────────────────────────────────────────────  ────────  ─────────────  ────────  ────────

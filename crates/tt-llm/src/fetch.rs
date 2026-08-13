@@ -178,10 +178,33 @@ impl FetchSession {
     ///
     /// Stops cleanly once [`MAX_FETCH_CALLS`] is reached: the provider is not consulted
     /// and no error is raised.
+    /// Every outcome is logged at `debug`, and an exhausted budget at `warn`.
+    ///
+    /// Fetching existed for some time with no instrumentation at all, and the cost was
+    /// not cosmetic: whether the model ever fetches decides whether a high
+    /// `undetermined` count means thin payloads or genuine ambiguity, and that question
+    /// was unanswerable from outside the process. Absence of log lines was mistaken for
+    /// absence of fetching, which is a conclusion the silence could never support.
     pub fn dispatch(&self, request: &FetchRequest) -> FetchOutcome {
-        if self.used.fetch_add(1, Ordering::SeqCst) >= MAX_FETCH_CALLS {
+        let spent = self.used.fetch_add(1, Ordering::SeqCst);
+        if spent >= MAX_FETCH_CALLS {
+            // Not an error -- a verdict reached under a spent budget is still a verdict --
+            // but worth saying, because a session that wanted more than four looks is a
+            // session the fixed payload was far from describing.
+            tracing::warn!(
+                session_id = %self.session_id,
+                budget = MAX_FETCH_CALLS,
+                "fetch budget exhausted; the model must answer from what it has"
+            );
             return FetchOutcome::BudgetExhausted;
         }
+        tracing::debug!(
+            session_id = %self.session_id,
+            call = spent + 1,
+            budget = MAX_FETCH_CALLS,
+            request = ?request,
+            "classifier fetching more of a session"
+        );
         if let Ok(mut log) = self.log.lock() {
             log.push(request.clone());
         }

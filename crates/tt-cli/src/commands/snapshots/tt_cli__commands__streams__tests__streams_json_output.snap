@@ -20,5 +20,6 @@ expression: output
     "start": "2025-01-23",
     "end": "2025-01-29"
   },
-  "times_computed_at": "2025-01-28T09:00:00.000Z"
+  "times_computed_at": "2025-01-28T09:00:00.000Z",
+  "times_computed_oldest_at": "2025-01-28T09:00:00.000Z"
 }

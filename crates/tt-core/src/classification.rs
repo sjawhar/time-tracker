@@ -11,10 +11,10 @@
 //!
 //! # Shape, never substring
 //!
-//! Three name shapes are rejected because they describe a posture, a date, or a
-//! leftover instead of the work: there is no transitional time, and a classifier
-//! that cannot identify the work must leave the session unassigned rather than
-//! invent a container for it.
+//! Four name shapes are rejected because they describe a posture, a date, a
+//! leftover, or an execution instance instead of the work: there is no
+//! transitional time, and a classifier that cannot identify the work must leave
+//! the session unassigned rather than invent a container for it.
 //!
 //! Detecting them by substring destroys real work. A `%nav%` rule written during
 //! remediation matched `agent-c: calendar navigation debugging`, and a bare
@@ -47,8 +47,64 @@ pub enum MisnamedReason {
     ActivityType,
     /// Buckets work into a date — `misc (Jun14-20)`, `infra: recovery (Jun6)`.
     DateRange,
+    /// Buckets work into one execution — `reskin implementer (Ralph iteration 7)`.
+    InstanceSuffix,
     /// Names the leftovers — `misc: stragglers`.
     CatchAll,
+    /// Whitespace has broken the words apart — `2026 -08 -10: mul tip le win dow nav`.
+    ///
+    /// Checked before every other reason, because corruption *defeats* them: that
+    /// example is a `DateRange` and `[u n ide ntified in sla ck int erac tion]` is a
+    /// `CatchAll`, and neither was caught while the spaces hid the tokens. Measured on
+    /// the live table, 14 streams carried such a name over 4,583 events, and 13 more sat
+    /// queued as proposals waiting for a human to mint them.
+    Fragmented,
+}
+
+/// Short tokens that legitimately appear in stream names here, so a real name is not
+/// mistaken for a corrupted one. Without `vs`, `pm`, `pro`, `epm` and `je` this rule
+/// flags `agent-c: VS Code PM dashboard fix` and the `scenario-gen epm` cohorts.
+const KNOWN_SHORT_TOKENS: &[&str] = &[
+    "a", "an", "the", "of", "to", "in", "on", "at", "is", "it", "by", "or", "and", "for", "v2",
+    "v3", "v5", "vs", "pm", "pro", "epm", "je", "e2e", "qa", "ci", "cd", "ui", "ux", "db", "pr",
+    "os", "io", "ai", "ml", "k8s", "mx", "id", "vm", "tt", "go", "js", "ts", "py", "rl", "sw",
+    "hw", "3d", "api", "aws", "eks", "ecr", "mcp", "dns", "ssl", "sow", "hoa", "dpi", "ipi", "gdm",
+    "mdm", "npm", "pup", "pod", "job", "env", "cwd", "log", "app", "web", "cli", "sdk", "llm",
+    "rag", "wip", "ops", "sre", "iac", "vpc", "iam", "kms", "s3", "ec2", "rds", "sqs", "sns",
+    "ssh", "tls", "jwt", "csv", "pdf", "png", "svg", "yml", "tui", "cpu", "gpu", "ram", "rpc",
+    "uri", "url", "xml", "sql", "orm", "dev", "se", "nlp", "ocr", "pii", "sso", "mfa", "gcp",
+    "k3s", "ebs", "efs", "elb", "asg",
+];
+
+/// Whether whitespace has broken a name's words into fragments.
+///
+/// The model emits names with spaces sprinkled through them, the same defect that put
+/// them inside uuids. A name is judged fragmented when it has at least six tokens and at
+/// least five of them are short and not a known abbreviation. Both bounds are calibrated
+/// against the live table: at this setting the rule flags 14 of 2,077 stream names and
+/// every one of those, read individually, is corrupted -- while `agent-c: VS Code PM
+/// dashboard fix` and `oh-my-openagent: Gemini 3.1 Pro tool-declaration validation bug`
+/// pass. Loosening to four fragments admits real names; a purely ratio-based rule found
+/// only 4 of the 14.
+fn is_fragmented(name: &str) -> bool {
+    let tokens: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.len() < 6 {
+        return false;
+    }
+    let fragments = tokens
+        .iter()
+        .filter(|token| {
+            token.len() <= 3
+                && !token.bytes().all(|byte| byte.is_ascii_digit())
+                && !KNOWN_SHORT_TOKENS
+                    .iter()
+                    .any(|known| token.eq_ignore_ascii_case(known))
+        })
+        .count();
+    fragments >= 5
 }
 
 /// Words that name a leftover rather than a subject.
@@ -145,6 +201,9 @@ const MONTH_NAMES: &[&str] = &[
     "dec",
 ];
 
+/// Words that turn a numeric suffix into one execution rather than the initiative.
+const INSTANCE_WORDS: &[&str] = &["iteration", "round", "run", "pass", "attempt"];
+
 /// Returns `true` when a session provably carries no work to attribute.
 ///
 /// Both clauses are required: a session that called a tool did something, and a
@@ -198,9 +257,16 @@ pub fn normalize_stream_name(name: &str) -> String {
 /// See the module docs for why this matches on shape rather than substring.
 #[must_use]
 pub fn is_misnamed_stream(name: &str) -> Option<MisnamedReason> {
+    // First: corruption defeats every check below by hiding the tokens they read.
+    if is_fragmented(name) {
+        return Some(MisnamedReason::Fragmented);
+    }
     let lowered = name.to_ascii_lowercase();
     if contains_date(&lowered) {
         return Some(MisnamedReason::DateRange);
+    }
+    if strip_trailing_instance_qualifier(&lowered).is_some() {
+        return Some(MisnamedReason::InstanceSuffix);
     }
     let mut saw_posture = false;
     for token in strip_namespace_prefix(&lowered).split(|c: char| !c.is_ascii_alphanumeric()) {
@@ -219,6 +285,62 @@ pub fn is_misnamed_stream(name: &str) -> Option<MisnamedReason> {
     } else {
         MisnamedReason::CatchAll
     })
+}
+
+/// Removes a trailing numbered execution qualifier, preserving the initiative name.
+///
+/// The qualifier is either parenthesized (`reskin tester (Ralph iteration #7 — Outlook)`) or
+/// a direct suffix (`reskin tester iteration 7`). A parenthetical may annotate the execution,
+/// but it must contain an explicit execution word and ASCII numeric index, so a word like
+/// `iteration` elsewhere in a real initiative never matches.
+#[must_use]
+pub fn strip_trailing_instance_qualifier(name: &str) -> Option<&str> {
+    let trimmed = name.trim_end();
+    if let Some((base, qualifier)) = trailing_parenthetical(trimmed) {
+        return contains_numbered_instance_qualifier(qualifier).then_some(base.trim_end());
+    }
+    instance_qualifier_start(trimmed).map(|start| trimmed[..start].trim_end())
+}
+
+fn contains_numbered_instance_qualifier(value: &str) -> bool {
+    let mut preceding_instance_word = false;
+    for token in value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        if preceding_instance_word && token.bytes().all(|byte| byte.is_ascii_digit()) {
+            return true;
+        }
+        preceding_instance_word = INSTANCE_WORDS.contains(&token);
+    }
+    false
+}
+
+fn trailing_parenthetical(value: &str) -> Option<(&str, &str)> {
+    let inner = value.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    Some((&inner[..open], inner[open + 1..].trim()))
+}
+
+fn instance_qualifier_start(value: &str) -> Option<usize> {
+    let value = value.trim_end();
+    let number_start = value.rfind(char::is_whitespace)? + 1;
+    let number = value[number_start..]
+        .strip_prefix('#')
+        .unwrap_or_else(|| &value[number_start..]);
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let before_number = value[..number_start].trim_end();
+    let keyword_start = before_number
+        .rfind(char::is_whitespace)
+        .map_or(0, |index| index + 1);
+    let keyword = &before_number[keyword_start..];
+    INSTANCE_WORDS
+        .iter()
+        .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+        .then_some(keyword_start)
 }
 
 /// Drops a leading single-token namespace (`misc:`, `agent-c:`) so the check
@@ -384,6 +506,50 @@ mod tests {
     }
 
     #[test]
+    fn trailing_numbered_instance_qualifiers_are_rejected() {
+        // Given: one initiative rendered as a numbered execution instance. The instance is
+        // not the work, so another run must reuse the initiative rather than mint a sibling.
+        for name in [
+            "foo: bar (Ralph iteration 7)",
+            "foo: bar (round 3)",
+            "foo: bar (run 2)",
+            "foo: bar (pass 1)",
+            "foo: bar (attempt 4)",
+            "foo: bar iteration 5",
+            "agent-c: reskin implementer (Ralph iteration #1 — Outlook)",
+            "agent-c: reskin monitor (Ralph iteration #2)",
+        ] {
+            // When/Then
+            assert_eq!(
+                is_misnamed_stream(name),
+                Some(MisnamedReason::InstanceSuffix),
+                "{name} must be rejected as an instance suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_words_without_a_trailing_numbered_qualifier_are_allowed() {
+        // Given: real work sharing words that also name instances, but not their trailing
+        // numbered shape.
+        for name in [
+            "agent-c: calendar navigation debugging",
+            "misc: webcam troubleshooting",
+            "foo: iteration planning",
+            "foo: runbook 2 implementation",
+            "foo: bar (round two)",
+            "foo: bar (iteration 7) follow-up",
+        ] {
+            // When/Then
+            assert_eq!(
+                is_misnamed_stream(name),
+                None,
+                "{name} is real work and must be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn catch_all_stream_names_are_rejected() {
         // Given: names for leftovers.
         for name in [
@@ -535,5 +701,59 @@ mod tests {
                 "{name} must still be refused after normalization"
             );
         }
+    }
+
+    #[test]
+    fn whitespace_fragmented_names_are_refused() {
+        // Every one of these was live: 14 stream names carrying 4,583 events, plus 13
+        // sitting in the review queue waiting for a human to mint them.
+        for name in [
+            " age nt -c: gra din g mi gra tio n co nfl ict inv est iga tio n",
+            "lut hie n pro xy fea tur e ass ess men t",
+            "op enc ode : Do cke r bu ild en vir onm ent fix es",
+            "m ai l: i nb ox + DK IM c he ck s",
+            "|unk| no w| n st rf id",
+            "red- tea min g: tas k eval uat ion backlo g",
+        ] {
+            assert_eq!(
+                is_misnamed_stream(name),
+                Some(MisnamedReason::Fragmented),
+                "{name} must be refused as fragmented"
+            );
+        }
+    }
+
+    #[test]
+    fn real_names_with_short_tokens_are_not_mistaken_for_fragments() {
+        // The rule reads short tokens, and real names are full of legitimate ones. These
+        // are all live names; flagging any of them would refuse real work.
+        for name in [
+            "agent-c: VS Code PM dashboard fix",
+            "oh-my-openagent: Gemini 3.1 Pro tool-declaration validation bug",
+            "agent-c: scenario-gen epm fraudulent-JE (corp-finance cohort)",
+            "dpi: hosted-task lambda",
+            "hawk: EKS performance forensics (luna-full-max-effort)",
+            "infra: enterprise device + MDM + Fleet access policies",
+        ] {
+            assert!(
+                !matches!(is_misnamed_stream(name), Some(MisnamedReason::Fragmented)),
+                "{name} must not be judged fragmented"
+            );
+        }
+    }
+
+    #[test]
+    fn corruption_is_judged_before_the_reasons_it_would_otherwise_hide() {
+        // This is why the check runs first. Both names are refusable on their own terms --
+        // a date bucket and a catch-all -- and neither was caught while the spaces broke
+        // the tokens their checks read.
+        assert_eq!(
+            is_misnamed_stream("2026 -08 -10: mul tip le win dow nav iga tio n + doc ume nt"),
+            Some(MisnamedReason::Fragmented)
+        );
+        assert_eq!(
+            is_misnamed_stream("[u n ide ntified in sla ck int erac tion]"),
+            Some(MisnamedReason::Fragmented)
+        );
     }
 }

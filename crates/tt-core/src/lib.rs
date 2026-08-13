@@ -23,6 +23,7 @@ pub use allocation::{
 };
 pub use classification::{
     MisnamedReason, is_misnamed_stream, is_structurally_junk, normalize_stream_name,
+    strip_trailing_instance_qualifier,
 };
 pub use event_type::{EventType, UnknownEventType};
 pub use injection::{INJECTION_MARKERS, human_message, is_injected};

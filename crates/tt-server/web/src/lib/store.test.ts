@@ -5,6 +5,7 @@ import type { Verdict } from './types';
 
 vi.mock('./api', () => ({
   fetchStatus: vi.fn(),
+  fetchReport: vi.fn(),
   fetchTimeline: vi.fn(),
   fetchTodos: vi.fn(),
   fetchSessions: vi.fn(),
@@ -49,9 +50,35 @@ describe('createStatusStore', () => {
       idle_gaps: [],
       db_version: 1,
     });
+    vi.mocked(api.fetchReport).mockResolvedValue({
+      generated_at: '2026-07-25T00:00:00Z',
+      timezone: 'Etc/UTC',
+      week_start_day: 'monday',
+      period: { start: '2026-07-25', end: '2026-07-25', type: 'day' },
+      by_tag: [],
+      streams: [],
+      untagged: { time_direct_ms: 0, time_delegated_ms: 0, streams: [] },
+      agent_sessions: {
+        total: 0,
+        by_source: {},
+        by_type: {},
+        top_sessions: [],
+      },
+      totals: {
+        time_direct_ms: 0,
+        time_delegated_ms: 0,
+        stream_count: 0,
+        unassigned_direct_ms: 0,
+        unassigned_delegated_ms: 0,
+        total_tracked_ms: 0,
+      },
+    });
     vi.mocked(api.fetchTodos).mockResolvedValue({ todos: [] });
     vi.mocked(api.fetchSessions).mockResolvedValue({ sessions: [] });
-    vi.mocked(api.fetchProposals).mockResolvedValue({ proposals: [] });
+    vi.mocked(api.fetchProposals).mockResolvedValue({
+      proposals: [],
+      total_pending: 0,
+    });
     vi.mocked(api.subscribeToStatus).mockReturnValue(vi.fn());
 
     const store = createStatusStore();
@@ -68,6 +95,7 @@ describe('createStatusStore', () => {
   it('handles fetch error', async () => {
     vi.mocked(api.fetchStatus).mockRejectedValue(new Error('Network error'));
     vi.mocked(api.fetchTimeline).mockRejectedValue(new Error('Network error'));
+    vi.mocked(api.fetchReport).mockRejectedValue(new Error('Network error'));
     vi.mocked(api.fetchTodos).mockRejectedValue(new Error('Network error'));
     vi.mocked(api.fetchSessions).mockRejectedValue(new Error('Network error'));
     vi.mocked(api.fetchProposals).mockRejectedValue(new Error('Network error'));
