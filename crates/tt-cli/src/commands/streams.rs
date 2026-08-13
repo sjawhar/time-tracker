@@ -23,6 +23,8 @@ mod release_pane_focus;
 pub use release_pane_focus::release_pane_focus;
 mod release_junk_attention;
 pub use release_junk_attention::release_junk_attention;
+mod backfill_pane_bindings;
+pub use backfill_pane_bindings::backfill_pane_session_bindings;
 mod slug;
 pub use slug::set_slug;
 mod misnamed;
@@ -35,6 +37,8 @@ mod assign;
 pub use assign::assign;
 mod instance_families;
 pub use instance_families::collapse_instance_families;
+#[cfg(test)]
+mod backfill_pane_binding_tests;
 
 /// Labels a stream as `name (id-prefix)` for report headers and confirmations.
 fn format_stream_label(name: Option<&str>, id: &str) -> String {
