@@ -6,6 +6,7 @@ import * as d3TimeFormat from 'd3-time-format';
 import { onDestroy, onMount } from 'svelte';
 import { SvelteSet } from 'svelte/reactivity';
 import { fitRotatedLabel } from '../labels';
+import { getVisibleStreams } from '../timeline/columns';
 import { type HitTarget, TimelineHitTester } from '../timeline/hit-test';
 import { getStreamColor } from '../timeline/stream-color';
 import { PiecewiseTimeScale } from '../timeline/time-scale';
@@ -42,13 +43,21 @@ const COLUMN_GAP = 10;
 // every <rect> (`attribute width: A negative value is not valid`).
 let measured = $derived(width > MARGIN.left + MARGIN.right);
 
+let expandedColumns = $state(false);
+
+let visibleData = $derived(
+  // 10 columns keeps the sticky labels readable at dashboard widths; 15 truncated
+  // every name to four characters, which is the unlabeled wall in another form.
+  getVisibleStreams(data.streams_active, 10, expandedColumns),
+);
+
 let columnWidth = $derived(
-  measured && data.streams_active.length > 0
+  measured && visibleData.visible.length > 0
     ? (width -
         MARGIN.left -
         MARGIN.right -
-        (data.streams_active.length - 1) * COLUMN_GAP) /
-        data.streams_active.length
+        (visibleData.visible.length - 1) * COLUMN_GAP) /
+        visibleData.visible.length
     : 0,
 );
 
@@ -93,13 +102,20 @@ function draw() {
   hitTester = new TimelineHitTester();
 
   // Draw streams
-  data.streams_active.forEach((streamData, i) => {
+  visibleData.visible.forEach((streamData, i) => {
     const x = MARGIN.left + i * (columnWidth + COLUMN_GAP);
-    const color = getStreamColor(streamData.stream, i);
+    const color =
+      streamData.stream.id === 'aggregate'
+        ? streamData.stream.color || 'var(--color-text-muted)'
+        : getStreamColor(streamData.stream, i);
 
-    // Draw delegated intervals (faded)
+    const aggregate = streamData.stream.id === 'aggregate';
+
+    // Draw delegated intervals (faded; the aggregate column is a muted presence
+    // strip — 96 streams' events drawn at full strength were a solid white wall
+    // that outshone every real column)
     ctx.fillStyle = color;
-    ctx.globalAlpha = 0.3;
+    ctx.globalAlpha = aggregate ? 0.12 : 0.3;
     streamData.delegated_intervals.forEach((interval) => {
       const yStart = yScale.scale(new Date(interval.end)); // end is top
       const yEnd = yScale.scale(new Date(interval.start)); // start is bottom
@@ -136,12 +152,19 @@ function draw() {
     });
 
     // Draw focus intervals (solid)
-    ctx.globalAlpha = 1.0;
+    ctx.globalAlpha = aggregate ? 0.25 : 1.0;
     streamData.focus_intervals.forEach((interval) => {
       const yStart = yScale.scale(new Date(interval.end));
       const yEnd = yScale.scale(new Date(interval.start));
       ctx.fillRect(x, yStart, columnWidth, yEnd - yStart);
     });
+    ctx.globalAlpha = 1.0;
+
+    // The aggregate column carries no per-event glyphs: it answers "other activity
+    // exists here", and nothing more. Individual dots from 96 streams are noise.
+    if (aggregate) {
+      return;
+    }
 
     // Draw events
     streamData.events.forEach((event) => {
@@ -379,6 +402,34 @@ const formatDay = d3TimeFormat.timeFormat('%b %d');
     style="width: {width}px; height: {height}px;"
   ></canvas>
   
+  <div class="sticky top-0 left-[60px] right-[20px] h-[40px] flex pointer-events-none z-10 bg-[var(--color-bg-base)]/80 backdrop-blur-sm">
+    {#if measured && visibleData.visible.length > 0}
+      {#each visibleData.visible as streamData, i}
+        {@const color = streamData.stream.id === 'aggregate' ? streamData.stream.color! : getStreamColor(streamData.stream, i)}
+        <div 
+          class="absolute top-0 h-full flex items-end pb-1 pointer-events-auto"
+          style="left: {i * (columnWidth + COLUMN_GAP)}px; width: {columnWidth}px;"
+        >
+          {#if streamData.stream.id === 'aggregate'}
+            <button 
+              class="flex items-center gap-1.5 w-full px-1 py-0.5 rounded hover:bg-[var(--color-bg-surface-hover)] transition-colors cursor-pointer"
+              onclick={() => expandedColumns = true}
+              title="Show all streams"
+            >
+              <div class="w-2 h-2 rounded-full shrink-0" style="background-color: {color}"></div>
+              <div class="text-[10px] font-medium text-[var(--color-text-muted)] truncate">{streamData.stream.name}</div>
+            </button>
+          {:else}
+            <div class="flex items-center gap-1.5 w-full px-1" title={streamData.stream.name || streamData.stream.slug || 'Unnamed Stream'}>
+              <div class="w-2 h-2 rounded-full shrink-0" style="background-color: {color}"></div>
+              <div class="text-[10px] leading-tight font-medium text-[var(--color-text-base)] line-clamp-2 break-words">{streamData.stream.name || streamData.stream.slug || 'Unnamed Stream'}</div>
+            </div>
+          {/if}
+        </div>
+      {/each}
+    {/if}
+  </div>
+
   <svg 
     bind:this={svg} 
     class="absolute inset-0 pointer-events-none"

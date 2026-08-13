@@ -7,6 +7,7 @@ import {
   fetchTimeline,
   fetchTodos,
   rejectProposal,
+  setTodoStream,
   subscribeToStatus,
 } from './api';
 import type {
@@ -202,6 +203,18 @@ export function createStatusStore() {
         error = e instanceof Error ? e.message : String(e);
       } finally {
         decidingProposal = null;
+      }
+    },
+    async setTodoStream(todoId: string, streamId: string | null) {
+      try {
+        await setTodoStream(todoId, streamId);
+        const [v, td] = await Promise.all([fetchStatus(), fetchTodos()]);
+        verdict = v;
+        todos = td.todos;
+        error = null;
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
+        throw e;
       }
     },
     init,

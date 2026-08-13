@@ -84,6 +84,14 @@ fn main() -> Result<()> {
                 };
                 ingest::index_sessions(&db, mode)?;
             }
+            IngestEvent::PaneSweep => {
+                let (db, _config) = open_database(cli.config.as_deref())?;
+                let outcome = ingest::sweep_pane_sessions(&db)?;
+                println!(
+                    "Swept {} panes: {} running an agent session, {} bindings recorded",
+                    outcome.panes, outcome.identified, outcome.recorded
+                );
+            }
         },
         Some(Commands::Export { after, since }) => {
             // Export doesn't need config - just reads files and outputs to stdout
@@ -218,6 +226,14 @@ fn main() -> Result<()> {
                         tt_db::ReleaseMode::Apply
                     };
                     streams::release_junk_attention(&db, mode)?;
+                }
+                StreamsAction::ReleaseOutgrownJunk { dry_run } => {
+                    let mode = if *dry_run {
+                        tt_db::ReleaseMode::DryRun
+                    } else {
+                        tt_db::ReleaseMode::Apply
+                    };
+                    streams::release_outgrown_junk(&db, mode)?;
                 }
                 StreamsAction::BackfillPaneBindings { dry_run } => {
                     let mode = if *dry_run {

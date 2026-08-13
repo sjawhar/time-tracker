@@ -1,4 +1,5 @@
 <script lang="ts">
+import { onDestroy, onMount } from 'svelte';
 import type { Proposal } from '../types';
 
 let {
@@ -10,6 +11,72 @@ let {
   deciding?: string | null;
   onDecide: (id: string, decision: 'accept' | 'reject') => void;
 } = $props();
+
+let focusedIndex = $state<number | null>(null);
+
+function handleKeydown(e: KeyboardEvent) {
+  // Suppress if typing in an input or textarea
+  if (
+    e.target instanceof HTMLInputElement ||
+    e.target instanceof HTMLTextAreaElement ||
+    (e.target as HTMLElement).isContentEditable
+  ) {
+    return;
+  }
+
+  if (!proposalsData || proposalsData.items.length === 0) return;
+
+  if (e.key === 'j') {
+    e.preventDefault();
+    if (focusedIndex === null) {
+      focusedIndex = 0;
+    } else if (focusedIndex < proposalsData.items.length - 1) {
+      focusedIndex++;
+    }
+  } else if (e.key === 'k') {
+    e.preventDefault();
+    if (focusedIndex === null) {
+      focusedIndex = proposalsData.items.length - 1;
+    } else if (focusedIndex > 0) {
+      focusedIndex--;
+    }
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    focusedIndex = null;
+  } else if (e.key === 'y' && focusedIndex !== null) {
+    e.preventDefault();
+    const proposal = proposalsData.items[focusedIndex];
+    if (deciding === null) {
+      onDecide(proposal.id, 'accept');
+    }
+  } else if (e.key === 'n' && focusedIndex !== null) {
+    e.preventDefault();
+    const proposal = proposalsData.items[focusedIndex];
+    if (deciding === null) {
+      onDecide(proposal.id, 'reject');
+    }
+  }
+}
+
+onMount(() => {
+  window.addEventListener('keydown', handleKeydown);
+});
+
+onDestroy(() => {
+  window.removeEventListener('keydown', handleKeydown);
+});
+
+// Reset focus if items change and focused index is out of bounds
+$effect(() => {
+  if (
+    proposalsData &&
+    focusedIndex !== null &&
+    focusedIndex >= proposalsData.items.length
+  ) {
+    focusedIndex =
+      proposalsData.items.length > 0 ? proposalsData.items.length - 1 : null;
+  }
+});
 
 function formatConfidence(conf: number): string {
   return `${Math.round(conf * 100)}%`;
@@ -35,12 +102,17 @@ function truncateReasoning(text: string): string {
   
   {#if proposalsData && proposalsData.items.length > 0}
     <div class="flex flex-col gap-2 max-h-[600px] overflow-y-auto pr-1">
-      {#each proposalsData.items as proposal (proposal.id)}
-        <div class="flex flex-col gap-1.5 p-2 rounded bg-[var(--color-bg-base)] border border-[var(--color-border)]">
+      {#each proposalsData.items as proposal, i (proposal.id)}
+        <div class="flex flex-col gap-1.5 p-2 rounded bg-[var(--color-bg-base)] border {focusedIndex === i ? 'border-[var(--color-status-blue)] ring-1 ring-[var(--color-status-blue)]' : 'border-[var(--color-border)]'}">
           <div class="flex justify-between items-start gap-2">
             <div class="text-sm font-medium text-[var(--color-text-base)] line-clamp-2 break-words" title={proposal.target.kind === 'new' ? `New: ${proposal.target.name}` : proposal.target.name}>
+              {#if proposal.scope.kind === 'session'}
+                session → 
+              {:else}
+                {proposal.scope.count} window events → 
+              {/if}
               {#if proposal.target.kind === 'new'}
-                <span class="text-[var(--color-status-blue)]">New:</span> {proposal.target.name}
+                <span class="text-[var(--color-status-blue)]">NEW:</span> {proposal.target.name}
               {:else}
                 {proposal.target.name}
               {/if}
@@ -53,22 +125,8 @@ function truncateReasoning(text: string): string {
           <div class="text-xs text-[var(--color-text-muted)] line-clamp-2" title={proposal.reasoning}>
             {truncateReasoning(proposal.reasoning)}
           </div>
-          
-          <!-- The queue is ordered by the attention each decision resolves, so the
-               magnitude has to be visible: without it a reviewer sees the right order
-               with no way to tell whether item one is worth 104 events or 3, which is
-               the whole basis of the ordering. The CLI has always shown this column. -->
           <div class="flex justify-between items-center gap-2 mt-1 pt-1.5 border-t border-[var(--color-border)]">
-            <div
-              class="text-xs text-[var(--color-text-muted)] shrink-0"
-              title={proposal.scope.kind === 'session'
-                ? `Resolves ${proposal.scope.count} attention event(s) in this session`
-                : `Resolves ${proposal.scope.count} attention event(s)`}
-            >
-              {proposal.scope.count}
-              {proposal.scope.kind === 'session' ? 'in session' : 'events'}
-            </div>
-            <div class="flex justify-end gap-2">
+            <div class="flex justify-end gap-2 w-full">
             <button
               class="text-xs px-2 py-1 rounded bg-[var(--color-bg-surface)] text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               title="Reject this proposal; its events stay unassigned"

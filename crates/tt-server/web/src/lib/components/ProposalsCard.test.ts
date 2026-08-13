@@ -47,14 +47,16 @@ describe('ProposalsCard', () => {
       onDecide: () => {},
     });
 
-    expect(screen.getByText('Alpha Stream')).toBeInTheDocument();
+    expect(screen.getByText('session → Alpha Stream')).toBeInTheDocument();
     expect(screen.getByText('85%')).toBeInTheDocument();
     expect(
       screen.getByText('Matches previous work on alpha.'),
     ).toBeInTheDocument();
 
-    expect(screen.getByText('New:')).toBeInTheDocument();
-    expect(screen.getByText('Beta Feature')).toBeInTheDocument();
+    expect(screen.getByText('NEW:')).toBeInTheDocument();
+    expect(
+      screen.getByText('5 window events → Beta Feature'),
+    ).toBeInTheDocument();
     expect(screen.getByText('65%')).toBeInTheDocument();
     expect(screen.getByText('Looks like a new feature.')).toBeInTheDocument();
   });
@@ -97,5 +99,66 @@ describe('ProposalsCard', () => {
     for (const b of [...screen.getAllByRole('button')]) {
       expect(b).toBeDisabled();
     }
+  });
+  it('handles keyboard navigation and decisions', async () => {
+    const calls: Array<[string, string]> = [];
+    render(ProposalsCard, {
+      proposalsData: { items: mockProposals, total_pending: 2 },
+      onDecide: (id: string, decision: 'accept' | 'reject') => {
+        calls.push([id, decision]);
+      },
+    });
+
+    // Initially no focus
+    await fireEvent.keyDown(window, { key: 'y' });
+    expect(calls).toHaveLength(0);
+
+    // j focuses first item
+    await fireEvent.keyDown(window, { key: 'j' });
+    await fireEvent.keyDown(window, { key: 'y' });
+    expect(calls).toEqual([['1', 'accept']]);
+
+    // j moves to second item
+    await fireEvent.keyDown(window, { key: 'j' });
+    await fireEvent.keyDown(window, { key: 'n' });
+    expect(calls).toEqual([
+      ['1', 'accept'],
+      ['2', 'reject'],
+    ]);
+
+    // k moves back to first item
+    await fireEvent.keyDown(window, { key: 'k' });
+    await fireEvent.keyDown(window, { key: 'y' });
+    expect(calls).toEqual([
+      ['1', 'accept'],
+      ['2', 'reject'],
+      ['1', 'accept'],
+    ]);
+
+    // Escape clears focus
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await fireEvent.keyDown(window, { key: 'y' });
+    expect(calls).toHaveLength(3); // No new calls
+  });
+
+  it('suppresses keyboard shortcuts when typing in inputs', async () => {
+    const calls: Array<[string, string]> = [];
+    render(ProposalsCard, {
+      proposalsData: { items: mockProposals, total_pending: 2 },
+      onDecide: (id: string, decision: 'accept' | 'reject') => {
+        calls.push([id, decision]);
+      },
+    });
+
+    // Focus first item
+    await fireEvent.keyDown(window, { key: 'j' });
+
+    // Create a dummy input and fire keydown on it
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    await fireEvent.keyDown(input, { key: 'y' });
+
+    expect(calls).toHaveLength(0); // Suppressed
+    document.body.removeChild(input);
   });
 });

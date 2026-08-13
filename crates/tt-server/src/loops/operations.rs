@@ -32,6 +32,21 @@ pub async fn ingest_once(database_path: PathBuf) -> Result<usize> {
     .context("ingest task panicked")?
 }
 
+/// Runs one pane-identity sweep.
+///
+/// Enrichment only: the sweep records which agent session runs in each live tmux
+/// pane, so later sessionless focus events inherit an identity at import. Absent
+/// tmux it observes nothing and costs nothing; a failure is the caller's to warn
+/// about and must never fail the ingest tick.
+pub async fn sweep_panes_once(database_path: PathBuf) -> Result<u64> {
+    tokio::task::spawn_blocking(move || {
+        let db = tt_db::Database::open(&database_path)?;
+        Ok(tt_cli::commands::ingest::sweep_pane_sessions(&db)?.recorded)
+    })
+    .await
+    .context("pane sweep task panicked")?
+}
+
 pub async fn sync_once(database_path: PathBuf, backoff: &mut SyncBackoff) -> Result<usize> {
     let remotes = tokio::task::spawn_blocking({
         let database_path = database_path.clone();

@@ -98,3 +98,77 @@ pub(super) async fn handler(
     .map_err(ApiError::Sessions)?;
     Ok(Json(response))
 }
+
+#[derive(serde::Deserialize)]
+pub(super) struct LinkSessionRequest {
+    todo_id: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct LinkSessionResponse {
+    session_id: String,
+    todo_id: String,
+    status: &'static str,
+}
+
+/// Links an agent session to a todo, applying the todo's stream to the session.
+///
+/// The same operation as `tt todo link` with an explicit `--session`: a human's own
+/// mapping, not an inference, which is why the todo's stream may be propagated.
+pub(super) async fn link(
+    State(state): State<ApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(request): Json<LinkSessionRequest>,
+) -> Result<Json<LinkSessionResponse>, ApiError> {
+    let database_path = state.database_path;
+    let config = state.config;
+    let events = state.events;
+    let todo_id = request.todo_id.clone();
+    let session_for_task = session_id.clone();
+    let todo_for_task = todo_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let db = tt_db::Database::open(&database_path)
+            .map_err(|error| ApiError::Sessions(anyhow::Error::new(error).context("open db")))?;
+        tt_cli::commands::todo::run_link(Some(&db), &config, &todo_for_task, Some(session_for_task))
+            // Every failure here names a condition the caller can address (an unknown or
+            // ambiguous todo id), so it comes back as the request's fault, not the server's.
+            .map_err(|error| ApiError::BadRequest(error.to_string()))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::Sessions(anyhow::Error::new(error).context("link session task panicked"))
+    })??;
+    match events.send(crate::ServerEvent::EventsAppended { count: 1 }) {
+        Ok(_) | Err(_) => {}
+    }
+    Ok(Json(LinkSessionResponse {
+        session_id,
+        todo_id,
+        status: "linked",
+    }))
+}
+
+/// Removes an agent-session link from a todo, exactly as `tt todo unlink` does.
+pub(super) async fn unlink(
+    State(state): State<ApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(request): Json<LinkSessionRequest>,
+) -> Result<Json<LinkSessionResponse>, ApiError> {
+    let config = state.config;
+    let todo_id = request.todo_id.clone();
+    let session_for_task = session_id.clone();
+    let todo_for_task = todo_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        tt_cli::commands::todo::run_unlink(&config, &todo_for_task, Some(session_for_task))
+            .map_err(|error| ApiError::BadRequest(error.to_string()))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::Sessions(anyhow::Error::new(error).context("unlink session task panicked"))
+    })??;
+    Ok(Json(LinkSessionResponse {
+        session_id,
+        todo_id,
+        status: "unlinked",
+    }))
+}

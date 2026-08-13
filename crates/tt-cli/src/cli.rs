@@ -313,6 +313,25 @@ pub enum StreamsAction {
         dry_run: bool,
     },
 
+    /// Release junk attribution from sessions that outgrew the junk rule.
+    ///
+    /// A session is judged junk once, from its tool-call and message counts, and
+    /// nothing revisits that verdict: each session gets a single re-check, and a
+    /// junked session's events are no longer unassigned so the classifier never
+    /// selects it again. A session opening with 'Hello' that goes on to make 17
+    /// tool calls therefore stays filed as no attributable work permanently.
+    ///
+    /// Selection is the junk rule inverted, so a session that still satisfies it
+    /// cannot be reached. Released events return to unassigned for the classifier
+    /// to re-reach, and their classification record is forgotten so it will.
+    /// Events a human assigned are never touched, no event is deleted, and the
+    /// junk stream is not retired. Start with --dry-run.
+    ReleaseOutgrownJunk {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Apply recent, observed pane session identities to historical tmux focus events.
     ///
     /// This writes only `session_id`, never a stream or assignment source. A binding is usable
@@ -659,6 +678,15 @@ pub enum IngestEvent {
         #[arg(long)]
         window: Option<u32>,
     },
+
+    /// Record the agent session running in every live tmux pane.
+    ///
+    /// The periodic half of pane identity. Focus-time capture only observes a pane
+    /// when it is switched to — which is exactly when no tool call is usually in
+    /// flight there — so most focus events carry no identity. The daemon runs this
+    /// every ingest tick; run it by hand (or from cron on a capture-only machine)
+    /// to the same effect. Writes only pane→session bindings, never a stream.
+    PaneSweep,
 
     /// Index coding assistant sessions.
     ///

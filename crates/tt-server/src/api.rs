@@ -43,6 +43,8 @@ pub enum ApiError {
     Sessions(#[source] anyhow::Error),
     #[error("proposals unavailable")]
     Proposals(#[source] anyhow::Error),
+    #[error("stream write failed")]
+    Streams(#[source] anyhow::Error),
 }
 
 impl IntoResponse for ApiError {

@@ -7,7 +7,9 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 
 use super::classifier::{ClassifyInputs, classify_loop};
-use super::operations::{compute_status, ingest_once, poll_db_version, read_db_version, sync_once};
+use super::operations::{
+    compute_status, ingest_once, poll_db_version, read_db_version, sweep_panes_once, sync_once,
+};
 use super::{DbVersionWatcher, SyncBackoff};
 use crate::ServerEvent;
 use tt_cli::logging;
@@ -82,6 +84,14 @@ async fn ingest_loop(
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = interval.tick() => {
+                // Observe pane identities before indexing sessions, so a binding
+                // recorded this tick can stamp focus events the same tick imports.
+                let Some(swept) = complete_or_shutdown(&mut shutdown, sweep_panes_once(database_path.clone())).await else {
+                    return;
+                };
+                if let Err(error) = swept {
+                    tracing::warn!(error = %logging::chain(&error), "pane sweep failed");
+                }
                 let Some(result) = complete_or_shutdown(&mut shutdown, ingest_once(database_path.clone())).await else {
                     return;
                 };

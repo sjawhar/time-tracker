@@ -173,7 +173,17 @@ pub fn compute_verdict(db: &Database, config: &Config, now: DateTime<Utc>) -> Re
     let streams = db
         .get_streams()
         .context("failed to load streams for drift verdict")?;
-    let in_flight = in_flight_streams(&allocation.stream_times, &streams);
+    // WIP is "in flight NOW", not "touched inside the drift window": scored over the
+    // 90-minute drift window, a 35-second glance an hour ago still counted, and the
+    // panel read 33 in flight on a machine where the human could name fewer than 15.
+    // The window here is the allocation agent timeout — the system's own definition
+    // of a session still being live — and a stream qualifies on any delegated time
+    // (an agent genuinely ran) or on a minute of attention (a drive-by pane flicker
+    // is not work in progress).
+    let wip_start = now - Duration::milliseconds(allocation_config.agent_timeout_ms);
+    let wip_allocation = allocate_for_period(db, wip_start, now, Some(now), &allocation_config)
+        .context("failed to allocate time for the WIP window")?;
+    let in_flight = in_flight_streams(&wip_allocation.stream_times, &streams);
     let wip_limit = usize::try_from(config.wip_limit).context("WIP limit does not fit in usize")?;
     let wind_down_candidate = (in_flight.len() > wip_limit)
         .then(|| weakest_priority_candidate(&in_flight, &todo_view))
@@ -379,6 +389,9 @@ fn resolved_top_stream_id(db: &Database, top_todo: Option<&TopTodo>) -> Result<O
         .map(|stream| stream.id))
 }
 
+/// A minute of attention inside the WIP window; less is a pane flicker, not work.
+const IN_FLIGHT_DIRECT_FLOOR_MS: i64 = 60_000;
+
 fn in_flight_streams(stream_times: &[StreamTime], streams: &[Stream]) -> Vec<InFlightStream> {
     let streams_by_id = streams
         .iter()
@@ -386,7 +399,9 @@ fn in_flight_streams(stream_times: &[StreamTime], streams: &[Stream]) -> Vec<InF
         .collect::<HashMap<_, _>>();
     let mut in_flight = stream_times
         .iter()
-        .filter(|time| time.time_direct_ms > 0 || time.time_delegated_ms > 0)
+        .filter(|time| {
+            time.time_direct_ms >= IN_FLIGHT_DIRECT_FLOOR_MS || time.time_delegated_ms > 0
+        })
         // Junk is the reserved home for sessions with no attributable work, so it is by
         // definition not work in progress. Counting it inflated WIP against the limit on
         // the dashboard's own panel and made it eligible as a wind-down candidate, which
@@ -722,6 +737,85 @@ mod tests {
         assert!(verdict.dangling_stream_links.is_empty());
         assert!(verdict.stale_event_sources.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn wip_counts_only_streams_active_inside_the_agent_timeout() -> anyhow::Result<()> {
+        // Given: one stream focused 45 minutes ago (inside the 90-minute drift window,
+        // outside the 30-minute agent timeout) and one focused 2 minutes ago. Scoring
+        // WIP over the drift window is how the panel read 33 in flight on a machine
+        // where the human could name fewer than 15.
+        let temp = TempDir::new()?;
+        let config = test_config(&temp, 4);
+        write_todo_store(&config, "alpha", "high", 10, "Ship alpha")?;
+        let db = Database::open_in_memory()?;
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 24, 12, 0, 0)
+            .single()
+            .unwrap();
+        insert_stream(&db, "stream-stale", "stale", "Stale work", now)?;
+        insert_stream(&db, "stream-live", "alpha", "Live work", now)?;
+        insert_focus(
+            &db,
+            "focus-stale",
+            now - Duration::minutes(45),
+            "stream-stale",
+        )?;
+        insert_focus(&db, "focus-live", now - Duration::minutes(2), "stream-live")?;
+
+        // When
+        let verdict = compute_verdict(&db, &config, now)?;
+
+        // Then: only the stream with activity inside the agent timeout is in flight.
+        let in_flight: Vec<_> = verdict
+            .wip
+            .in_flight
+            .iter()
+            .map(|stream| stream.stream_id.as_str())
+            .collect();
+        assert_eq!(in_flight, vec!["stream-live"]);
+        Ok(())
+    }
+
+    #[test]
+    fn in_flight_floor_excludes_glances_but_keeps_any_delegated_time() {
+        // Given: a 30-second glance, a minute of real attention, and a delegated-only
+        // stream. A pane flicker is not work in progress; a running agent is.
+        let times = vec![
+            tt_core::StreamTime {
+                stream_id: "glance".to_string(),
+                time_direct_ms: 30_000,
+                time_delegated_ms: 0,
+                focus_intervals: Vec::new(),
+                delegated_intervals: Vec::new(),
+            },
+            tt_core::StreamTime {
+                stream_id: "attended".to_string(),
+                time_direct_ms: 60_000,
+                time_delegated_ms: 0,
+                focus_intervals: Vec::new(),
+                delegated_intervals: Vec::new(),
+            },
+            tt_core::StreamTime {
+                stream_id: "delegated".to_string(),
+                time_direct_ms: 0,
+                time_delegated_ms: 1,
+                focus_intervals: Vec::new(),
+                delegated_intervals: Vec::new(),
+            },
+        ];
+
+        // When
+        let in_flight = super::in_flight_streams(&times, &[]);
+
+        // Then
+        let ids: Vec<_> = in_flight
+            .iter()
+            .map(|stream| stream.activity.stream_id.as_str())
+            .collect();
+        assert!(!ids.contains(&"glance"), "a 30s glance is not WIP: {ids:?}");
+        assert!(ids.contains(&"attended"));
+        assert!(ids.contains(&"delegated"));
     }
 
     #[test]

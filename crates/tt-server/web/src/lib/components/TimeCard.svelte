@@ -1,5 +1,6 @@
 <script lang="ts">
-import type { Report } from '../types';
+import type { Report, ReportStream } from '../types';
+import StreamDetailPanel from './StreamDetailPanel.svelte';
 
 let {
   report,
@@ -35,13 +36,13 @@ let unattendedStreams = $derived(
   realStreams.filter((s) => s.time_direct_ms === 0),
 );
 
-// Collapse tail: streams under 15m
+// Collapse tail: streams under 15m, but always show top 8
 const MIN_DISPLAY_MS = 15 * 60 * 1000;
 let visibleAttended = $derived(
-  attendedStreams.filter((s) => s.time_direct_ms >= MIN_DISPLAY_MS),
+  attendedStreams.filter((s, i) => i < 8 || s.time_direct_ms >= MIN_DISPLAY_MS),
 );
 let tailAttended = $derived(
-  attendedStreams.filter((s) => s.time_direct_ms < MIN_DISPLAY_MS),
+  attendedStreams.filter((s, i) => i >= 8 && s.time_direct_ms < MIN_DISPLAY_MS),
 );
 
 let tailDirect = $derived(
@@ -60,6 +61,8 @@ let maxDirect = $derived(
 let unattendedDelegated = $derived(
   unattendedStreams.reduce((sum, s) => sum + s.time_delegated_ms, 0),
 );
+
+let selectedStream = $state<ReportStream | null>(null);
 
 // Calculate wall clock time from period
 let wallClockMs = $derived(report.totals.total_tracked_ms);
@@ -90,9 +93,13 @@ let wallClockMs = $derived(report.totals.total_tracked_ms);
     {#each visibleAttended as stream}
       <div class="flex flex-col gap-1">
         <div class="flex items-start justify-between text-sm">
-          <span class="font-medium text-[var(--color-text-base)] line-clamp-2 break-words pr-2" title={stream.name || stream.id}>
+          <button 
+            class="font-medium text-[var(--color-text-base)] line-clamp-2 break-words pr-2 text-left hover:underline cursor-pointer" 
+            title={stream.name || stream.id}
+            onclick={() => selectedStream = stream}
+          >
             {stream.name || stream.id}
-          </span>
+          </button>
           <div class="flex items-center gap-2 shrink-0">
             <span class="font-medium text-[var(--color-text-base)]">{formatDuration(stream.time_direct_ms)}</span>
             {#if stream.time_delegated_ms > 0}
@@ -145,7 +152,6 @@ let wallClockMs = $derived(report.totals.total_tracked_ms);
       </div>
     {/if}
   </div>
-
   <div class="mt-2 pt-3 border-t border-[var(--color-border)] flex flex-col gap-1 text-xs text-[var(--color-text-muted)]">
     <div class="flex justify-between">
       <span>Wall clock</span>
@@ -164,4 +170,16 @@ let wallClockMs = $derived(report.totals.total_tracked_ms);
       <span>{formatLeverage(report.totals.time_direct_ms, report.totals.time_delegated_ms)}</span>
     </div>
   </div>
+
+{#if selectedStream}
+  <StreamDetailPanel 
+    stream={selectedStream} 
+    allStreams={report.streams}
+    onClose={() => selectedStream = null}
+    onUpdate={() => {
+      // The parent component (App.svelte) should refetch the report on SSE events,
+      // but we can also trigger a refetch here if needed. For now, we rely on SSE.
+    }}
+  />
+{/if}
 </div>

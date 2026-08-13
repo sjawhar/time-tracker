@@ -23,6 +23,8 @@ mod release_pane_focus;
 pub use release_pane_focus::release_pane_focus;
 mod release_junk_attention;
 pub use release_junk_attention::release_junk_attention;
+mod release_outgrown_junk;
+pub use release_outgrown_junk::release_outgrown_junk;
 mod backfill_pane_bindings;
 pub use backfill_pane_bindings::backfill_pane_session_bindings;
 mod slug;
