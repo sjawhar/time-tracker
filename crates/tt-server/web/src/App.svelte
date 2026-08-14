@@ -32,11 +32,11 @@ onMount(() => {
         {#if store.report}
           <TimeCard report={store.report} period={store.reportPeriod} onPeriodChange={(p) => store.setReportPeriod(p)} />
         {/if}
-        <TopTodoCard todo={store.verdict.top_todo} />
+        <TopTodoCard todo={store.verdict.top_todo} onSetStream={(id, stream) => store.setTodoStream(id, stream)} />
         <WipCard wip={store.verdict.wip} />
         
         <div class="flex-1 flex flex-col gap-4">
-          <NextTodosCard todos={store.todos} />
+          <NextTodosCard todos={store.todos} onSetStream={(id, stream) => store.setTodoStream(id, stream)} />
           <AgentSessionsCard sessions={store.sessions} />
           <ProposalsCard proposalsData={store.proposals} deciding={store.decidingProposal}
             onDecide={(id, decision) => store.decideProposal(id, decision)} />

@@ -2,6 +2,7 @@ import type {
   Proposal,
   Report,
   Session,
+  Stream,
   TimelineData,
   Todo,
   Verdict,
@@ -28,6 +29,42 @@ export async function fetchReport(period: string = 'week'): Promise<Report> {
   const response = await fetch(`/api/report?period=${period}`);
   if (!response.ok) {
     throw new Error(`Failed to fetch report: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function listStreams(): Promise<{
+  streams: {
+    id: string;
+    name: string | null;
+    slug: string | null;
+    last_active: string | null;
+  }[];
+}> {
+  const response = await fetch('/api/streams');
+  if (!response.ok) {
+    throw new Error(`Failed to fetch streams: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function setTodoStream(
+  todoId: string,
+  stream: string | null,
+): Promise<{ todo_id: string; stream_slug: string | null; status: string }> {
+  const response = await fetch(
+    `/api/todos/${encodeURIComponent(todoId)}/stream`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream }),
+    },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `Failed to set todo stream: ${detail || response.statusText}`,
+    );
   }
   return response.json();
 }
@@ -120,4 +157,114 @@ export function subscribeToStatus(
   return () => {
     eventSource.close();
   };
+}
+
+export interface UpdateStreamPayload {
+  name?: string;
+  description?: string;
+  color?: string;
+  add_tags?: string[];
+  remove_tags?: string[];
+}
+
+export async function updateStream(
+  id: string,
+  payload: UpdateStreamPayload,
+): Promise<Stream & { tags: string[] }> {
+  const response = await fetch(`/api/streams/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `Failed to update stream: ${detail || response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export interface MergeStreamsPayload {
+  sources: string[];
+}
+
+export async function mergeStreams(
+  id: string,
+  payload: MergeStreamsPayload,
+): Promise<unknown> {
+  const response = await fetch(`/api/streams/${encodeURIComponent(id)}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `Failed to merge streams: ${detail || response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export interface AssignEventsPayload {
+  stream_id: string;
+  event_ids: string[];
+}
+
+export async function assignEvents(
+  payload: AssignEventsPayload,
+): Promise<{ stream_id: string; events_assigned: number }> {
+  const response = await fetch('/api/events/assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `Failed to assign events: ${detail || response.statusText}`,
+    );
+  }
+  return response.json();
+}
+
+export async function linkSession(
+  sessionId: string,
+  todoId: string,
+): Promise<{ session_id: string; todo_id: string; status: string }> {
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/link`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ todo_id: todoId }),
+    },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(`Failed to link session: ${detail || response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function unlinkSession(
+  sessionId: string,
+  todoId: string,
+): Promise<{ session_id: string; todo_id: string; status: string }> {
+  const response = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/unlink`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ todo_id: todoId }),
+    },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `Failed to unlink session: ${detail || response.statusText}`,
+    );
+  }
+  return response.json();
 }

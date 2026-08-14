@@ -1,18 +1,36 @@
 <script lang="ts">
 import type { Todo } from '../types';
+import StreamPicker from './StreamPicker.svelte';
 
-let { todos }: { todos: Todo[] | null } = $props();
+let {
+  todos,
+  onSetStream,
+}: {
+  todos: Todo[] | null;
+  onSetStream?: (todoId: string, streamId: string | null) => Promise<void>;
+} = $props();
 
 let expanded = $state(false);
+let pickerOpenFor = $state<string | null>(null);
+let streamError = $state<{ id: string; message: string } | null>(null);
+
+async function handleSetStream(todoId: string, streamId: string | null) {
+  if (!onSetStream) return;
+  try {
+    streamError = null;
+    await onSetStream(todoId, streamId);
+    pickerOpenFor = null;
+  } catch (e) {
+    streamError = {
+      id: todoId,
+      message: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
 
 let displayTodos = $derived(() => {
   if (!todos) return [];
-  return expanded ? todos.slice(0, 12) : todos.slice(0, 3);
-});
-
-let remainingTodos = $derived(() => {
-  if (!todos) return 0;
-  return todos.length - displayTodos().length;
+  return todos;
 });
 </script>
 
@@ -21,30 +39,43 @@ let remainingTodos = $derived(() => {
     <div class="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider">
       Next Todos
     </div>
-    {#if todos && todos.length > 3}
-      <!-- min-h-6/px-1.5 keep this a WCAG 2.2 SC 2.5.8 target (24x24 CSS px minimum).
-           text-xs alone gave it a 16px box, which is the one control on the page that
-           failed that floor -- and it is the only route to the rest of the queue. -->
-      <button
-        class="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors cursor-pointer min-h-6 px-1.5 py-1 -mr-1.5 inline-flex items-center"
-        onclick={() => expanded = !expanded}
-      >
-        {expanded ? 'Show less' : `Show more (${todos.length})`}
-      </button>
-    {/if}
   </div>
   
   {#if todos && todos.length > 0}
-    <div class="flex flex-col gap-2">
+    <div class="flex flex-col gap-2 max-h-[50vh] overflow-y-auto pr-1">
       {#each displayTodos() as todo (todo.id)}
         <div class="flex flex-col gap-1 p-2 rounded bg-[var(--color-bg-base)] border border-[var(--color-border)]">
           <div class="text-sm text-[var(--color-text-base)] break-words" title={todo.text}>
             {todo.text}
           </div>
           <div class="flex items-center justify-between mt-1">
-            <div class="text-xs text-[var(--color-text-muted)] line-clamp-2 break-words max-w-[60%]" title={todo.stream_slug || 'Unassigned'}>
-              {todo.stream_slug || 'Unassigned'}
+            <div class="relative flex items-center gap-1 max-w-[60%]">
+              <button 
+                class="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text-base)] transition-colors line-clamp-2 break-words text-left cursor-pointer"
+                title={todo.stream_slug || 'Unassigned'}
+                onclick={() => pickerOpenFor = pickerOpenFor === todo.id ? null : todo.id}
+              >
+                {todo.stream_slug || 'Unassigned'}
+              </button>
+              {#if todo.stream_slug}
+                <button 
+                  class="text-[var(--color-text-muted)] hover:text-[var(--color-status-red)] transition-colors cursor-pointer px-1"
+                  title="Clear stream"
+                  onclick={() => handleSetStream(todo.id, null)}
+                >
+                  ×
+                </button>
+              {/if}
+              {#if pickerOpenFor === todo.id}
+                <StreamPicker 
+                  onSelect={(streamId) => handleSetStream(todo.id, streamId)}
+                  onClose={() => pickerOpenFor = null}
+                />
+              {/if}
             </div>
+            {#if streamError?.id === todo.id}
+              <div class="text-xs text-[var(--color-status-red)] mt-1">{streamError.message}</div>
+            {/if}
             {#if todo.linked_agent_count > 0}
               <div class="text-xs font-medium text-[var(--color-status-blue)] bg-[var(--color-status-blue)]/10 px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0">
                 <span class="w-1.5 h-1.5 rounded-full bg-[var(--color-status-blue)] animate-pulse"></span>
@@ -54,11 +85,6 @@ let remainingTodos = $derived(() => {
           </div>
         </div>
       {/each}
-      {#if expanded && remainingTodos() > 0}
-        <div class="text-xs text-center text-[var(--color-text-muted)] py-1">
-          + {remainingTodos()} more pending
-        </div>
-      {/if}
     </div>
   {:else}
     <div class="text-sm text-[var(--color-text-muted)] italic py-2 text-center">

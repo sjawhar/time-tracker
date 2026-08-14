@@ -1,5 +1,7 @@
 <script lang="ts">
+import { fetchTodos, linkSession, unlinkSession } from '../api';
 import type { Session } from '../types';
+import TodoPicker from './TodoPicker.svelte';
 
 let { sessions }: { sessions: Session[] | null } = $props();
 
@@ -24,6 +26,47 @@ let displaySessions = $derived(sessions ? sessions.slice(0, 12) : []);
 let remainingSessions = $derived(
   sessions ? sessions.length - displaySessions.length : 0,
 );
+let linkingSessionId = $state<string | null>(null);
+let isLinking = $state(false);
+let linkError = $state<{ id: string; message: string } | null>(null);
+
+async function handleLink(sessionId: string, todoId: string) {
+  if (isLinking) return;
+  isLinking = true;
+  linkError = null;
+  try {
+    await linkSession(sessionId, todoId);
+    linkingSessionId = null;
+  } catch (e) {
+    linkError = {
+      id: sessionId,
+      message: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    isLinking = false;
+  }
+}
+
+async function handleUnlink(sessionId: string, linkedText: string) {
+  if (isLinking) return;
+  isLinking = true;
+  linkError = null;
+  try {
+    const data = await fetchTodos();
+    const todo = data.todos.find((t) => t.text === linkedText);
+    if (!todo) {
+      throw new Error('Cannot unlink: todo not found in open todos');
+    }
+    await unlinkSession(sessionId, todo.id);
+  } catch (e) {
+    linkError = {
+      id: sessionId,
+      message: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    isLinking = false;
+  }
+}
 </script>
 
 <div class="flex flex-col p-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -73,15 +116,46 @@ let remainingSessions = $derived(
           </div>
           
           {#if session.linked_todo_text}
-            <div class="text-xs text-[var(--color-text-muted)] line-clamp-2 break-words border-t border-[var(--color-border)] pt-1.5 mt-0.5" title={session.linked_todo_text}>
-              <span class="opacity-70">↳</span> {session.linked_todo_text}
+            <div class="text-xs text-[var(--color-text-muted)] border-t border-[var(--color-border)] pt-1.5 mt-0.5 flex flex-col gap-1">
+              <div class="flex justify-between items-start gap-2">
+                <div class="line-clamp-2 break-words" title={session.linked_todo_text}>
+                  <span class="opacity-70">↳</span> {session.linked_todo_text}
+                </div>
+                <button 
+                  class="text-[var(--color-text-muted)] hover:text-[var(--color-status-red)] transition-colors cursor-pointer shrink-0 disabled:opacity-50" 
+                  title="Unlink session" 
+                  disabled={isLinking}
+                  onclick={() => handleUnlink(session.session_id, session.linked_todo_text!)}
+                >
+                  Unlink
+                </button>
+              </div>
+              {#if linkError?.id === session.session_id}
+                <div class="text-[var(--color-status-red)]">{linkError.message}</div>
+              {/if}
             </div>
           {:else}
-            <div class="text-xs text-[var(--color-text-muted)] italic border-t border-dashed border-[var(--color-border)] pt-1.5 mt-0.5 flex justify-between items-center">
-              <span>Unlinked</span>
-              <button class="text-[var(--color-text-muted)] transition-colors opacity-50 cursor-not-allowed" title="Linking not yet wired" disabled>
-                Link...
-              </button>
+            <div class="text-xs text-[var(--color-text-muted)] italic border-t border-dashed border-[var(--color-border)] pt-1.5 mt-0.5 flex flex-col gap-1 relative">
+              <div class="flex justify-between items-center">
+                <span>Unlinked</span>
+                <button 
+                  class="text-[var(--color-status-blue)] hover:brightness-125 transition-colors cursor-pointer disabled:opacity-50" 
+                  title="Link to a todo" 
+                  disabled={isLinking}
+                  onclick={() => linkingSessionId = linkingSessionId === session.session_id ? null : session.session_id}
+                >
+                  Link...
+                </button>
+              </div>
+              {#if linkingSessionId === session.session_id}
+                <TodoPicker 
+                  onSelect={(todoId) => handleLink(session.session_id, todoId)}
+                  onClose={() => linkingSessionId = null}
+                />
+              {/if}
+              {#if linkError?.id === session.session_id}
+                <div class="text-[var(--color-status-red)]">{linkError.message}</div>
+              {/if}
             </div>
           {/if}
         </div>

@@ -117,6 +117,34 @@ const ATTENTION_EVENT_TYPES_SQL: &str = "('user_message', 'window_focus', 'tmux_
 /// the count, the preview and the update must select the same rows.
 const UNATTRIBUTABLE_PANE_FOCUS_SQL: &str = "type = 'tmux_pane_focus' AND session_id IS NULL";
 
+/// Junk-assigned events whose session no longer satisfies the junk rule.
+///
+/// `is_structurally_junk` is `tool_call_count = 0 AND message_count <= 2`, and it is
+/// evaluated once. A session that *starts* trivially is routed to junk, and nothing
+/// revisits that verdict when the user keeps working: `get_recheck_candidates` grants each
+/// session exactly one re-check, and once its events carry the junk stream they are no
+/// longer `NULL`, so `unclassified_user_sessions` never selects it again. Measured live,
+/// **4,387 junked sessions violate the rule** and hold **125,968 events** between them --
+/// among them a session whose opening prompt is `Hello` that went on to make 17 tool
+/// calls, and three `/slack-bot` sessions with 11, 15 and 17.
+///
+/// This is the exact inverse of the routing predicate, which is what makes the release
+/// safe: a session that still satisfies the rule cannot match, so correctly-junked work is
+/// unreachable from here. It is deliberately narrower than `tt streams dissolve junk`,
+/// which releases the whole stream.
+///
+/// Subagents whose parent was never indexed are excluded, whatever their counts: their
+/// junk comes from `junk_orphan_subagents`, which reads the missing parent rather than the
+/// counts, so releasing one is churn the daemon's next pass undoes without a model call.
+/// Verified live before the exclusion: a release freed 452 sessions and the classify loop
+/// re-junked 347 of them — every orphan among them — within minutes.
+const OUTGROWN_JUNK_SQL: &str = "stream_id = 'junk' AND session_id IN ( \
+     SELECT s.session_id FROM agent_sessions s \
+     WHERE NOT (s.tool_call_count = 0 AND s.message_count <= 2) \
+       AND (s.parent_session_id IS NULL \
+            OR EXISTS (SELECT 1 FROM agent_sessions p \
+                       WHERE p.session_id = s.parent_session_id)))";
+
 /// Whether a row still carries attribution state a release would clear.
 ///
 /// Both columns, because releasing means both go NULL: a row holding only a stale
@@ -2924,6 +2952,46 @@ impl Database {
         Ok(PaneSessionBindingBackfillOutcome { bound, retained })
     }
 
+    /// Records process-tree-observed pane→session identities.
+    ///
+    /// The write half of the periodic sweep. Capture observes a pane only at focus
+    /// time — exactly when no tool call is usually in flight in the pane just
+    /// switched to — so the stamp rate over ordinary use measured ~10% (17 of 174
+    /// focus events). Observations recorded here are consumed by the paths that
+    /// already exist: [`insert_events`](Self::insert_events)' freshest-binding
+    /// fallback for events that arrive later, and
+    /// [`backfill_pane_session_bindings`](Self::backfill_pane_session_bindings) for
+    /// events that arrived in between. Writes no `stream_id`, no
+    /// `assignment_source`, and does not bump `db_version`: a binding changes no
+    /// assignment of its own, and the import that uses it signals the daemon when
+    /// events actually land.
+    pub fn record_pane_session_bindings(
+        &self,
+        machine_id: &str,
+        observations: &[(String, String)],
+        observed_at: DateTime<Utc>,
+    ) -> Result<u64, DbError> {
+        if observations.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.write_tx()?;
+        let observed = format_timestamp(observed_at);
+        let mut inserted = 0u64;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO pane_session_bindings
+                 (machine_id, pane_id, session_id, observed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (pane_id, session_id) in observations {
+                inserted +=
+                    stmt.execute(params![machine_id, pane_id, session_id, observed])? as u64;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Releases the attribution carried by pane focus that could never have earned it.
     ///
     /// **The selection rule is structural, and it is hardcoded here so this cannot
@@ -3000,6 +3068,85 @@ impl Database {
         )? as u64;
 
         if released > 0 {
+            Self::bump_db_version_in_transaction(&tx)?;
+        }
+
+        match mode {
+            ReleaseMode::Apply => tx.commit()?,
+            ReleaseMode::DryRun => tx.rollback()?,
+        }
+
+        Ok(ReleaseOutcome {
+            released,
+            retained,
+            streams_affected,
+        })
+    }
+
+    /// Releases junk attribution from sessions that have outgrown the junk rule.
+    ///
+    /// The junk verdict is taken once, from `tool_call_count` and `message_count`, and
+    /// nothing revisits it: each session gets a single re-check, and a junked session's
+    /// events are no longer `NULL` so `unclassified_user_sessions` never selects it again. A
+    /// session that opens with `Hello` and then makes 17 tool calls therefore stays filed as
+    /// "no attributable work" permanently.
+    ///
+    /// Selection is [`OUTGROWN_JUNK_SQL`], the routing predicate inverted, so a session that
+    /// still satisfies the rule cannot be reached from here. Released rows go back to
+    /// `stream_id IS NULL` with no `assignment_source`, which is what returns them to the
+    /// classifier's candidate set; nothing is deleted and no stream is retired, because the
+    /// junk stream legitimately holds the sessions that never outgrew the rule.
+    /// `assignment_source = 'user'` is never touched.
+    pub fn release_outgrown_junk(&self, mode: ReleaseMode) -> Result<ReleaseOutcome, DbError> {
+        let tx = self.write_tx()?;
+
+        let retained: u64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM events \
+                 WHERE {OUTGROWN_JUNK_SQL} AND assignment_source = 'user'"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Sessions rather than streams: everything selected here sits on the one junk
+        // stream, so a stream count would always be 1 and say nothing about the blast
+        // radius. How many sessions return to the candidate set is the useful figure.
+        let streams_affected: u64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT session_id) FROM events \
+                 WHERE {OUTGROWN_JUNK_SQL} AND {RELEASABLE_ATTRIBUTION_SQL}"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Ordered before the UPDATE, and this order is load-bearing: `OUTGROWN_JUNK_SQL`
+        // selects on `stream_id = 'junk'`, which the UPDATE is about to null, so afterwards
+        // no session would match and nothing would be forgotten.
+        //
+        // Scoped to sessions that actually hold junk-assigned events. An earlier draft keyed
+        // this on "every session violating the rule", which is nearly every real session on
+        // the machine -- it would have deleted the classification record of thousands of
+        // correctly-classified sessions and sent them all back to the model for no reason.
+        let forgotten = tx.execute(
+            &format!(
+                "DELETE FROM classified_sessions WHERE session_id IN ( \
+                 SELECT DISTINCT session_id FROM events \
+                 WHERE {OUTGROWN_JUNK_SQL} AND {RELEASABLE_ATTRIBUTION_SQL})"
+            ),
+            [],
+        )? as u64;
+
+        let released = tx.execute(
+            &format!(
+                "UPDATE events SET stream_id = NULL, assignment_source = NULL \
+                 WHERE {OUTGROWN_JUNK_SQL} AND {RELEASABLE_ATTRIBUTION_SQL}"
+            ),
+            [],
+        )? as u64;
+
+        if released > 0 || forgotten > 0 {
             Self::bump_db_version_in_transaction(&tx)?;
         }
 
@@ -11361,6 +11508,229 @@ mod tests {
                 streams_affected: 0,
             }
         );
+    }
+
+    /// A junked session, a junked session that outgrew the rule, and a real classified one.
+    fn db_with_outgrown_junk() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_stream(&make_stream("junk", Some("junk")))
+            .unwrap();
+        db.insert_stream(&make_stream("real", Some("real")))
+            .unwrap();
+        let base = Utc::now();
+        // still junk by the rule: no tools, two messages
+        // outgrew it: 17 tool calls
+        // never junked at all, and violates the rule like almost every real session
+        for (session, tools, messages, stream) in [
+            ("still-junk", 0, 2, "junk"),
+            ("outgrown", 17, 20, "junk"),
+            ("real-work", 9, 12, "real"),
+        ] {
+            let s = tt_core::session::AgentSession {
+                session_id: session.to_owned(),
+                source: tt_core::session::SessionSource::Claude,
+                parent_session_id: None,
+                session_type: tt_core::session::SessionType::User,
+                project_path: "/home/sami/p".to_owned(),
+                project_name: "p".to_owned(),
+                start_time: base,
+                end_time: None,
+                message_count: messages,
+                summary: None,
+                user_prompts: Vec::new(),
+                starting_prompt: None,
+                assistant_message_count: 0,
+                tool_call_count: tools,
+                user_message_timestamps: Vec::new(),
+                tool_call_timestamps: Vec::new(),
+            };
+            db.upsert_agent_session(&s, None).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO classified_sessions (session_id, classified_at, prompt_count, \
+                     rechecked) VALUES (?1, ?2, 1, 0)",
+                    params![session, format_timestamp(base)],
+                )
+                .unwrap();
+            for (n, source) in ["inferred", "user"].into_iter().enumerate() {
+                let offset = i64::try_from(n).expect("two elements fit in i64");
+                let mut e = make_event(
+                    &format!("{session}-{source}"),
+                    base + chrono::Duration::seconds(offset),
+                    tt_core::EventType::AgentToolUse,
+                );
+                e.session_id = Some(session.to_owned());
+                e.stream_id = Some(stream.to_owned());
+                e.assignment_source = Some((*source).to_owned());
+                db.insert_event(&e).unwrap();
+            }
+        }
+        db
+    }
+
+    #[test]
+    fn release_outgrown_junk_frees_only_the_session_that_outgrew_the_rule() {
+        // Given: one session still junk by the rule, one that outgrew it, one real.
+        let db = db_with_outgrown_junk();
+
+        // When
+        let outcome = db.release_outgrown_junk(ReleaseMode::Apply).unwrap();
+
+        // Then: only the outgrown session's non-`user` event is released.
+        assert_eq!(outcome.released, 1, "released: {outcome:?}");
+        assert_eq!(
+            outcome.retained, 1,
+            "a human's assignment is never released"
+        );
+        assert_eq!(
+            outcome.streams_affected, 1,
+            "one session returned to the pool"
+        );
+
+        let stream_of = |id: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT stream_id FROM events WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(stream_of("outgrown-inferred"), None, "outgrown is released");
+        assert_eq!(
+            stream_of("outgrown-user").as_deref(),
+            Some("junk"),
+            "a human's verdict survives even here"
+        );
+        assert_eq!(
+            stream_of("still-junk-inferred").as_deref(),
+            Some("junk"),
+            "a session that still satisfies the rule is correctly junked and untouchable"
+        );
+        assert_eq!(
+            stream_of("real-work-inferred").as_deref(),
+            Some("real"),
+            "a real classification is not junk and must not be reached"
+        );
+    }
+
+    #[test]
+    fn release_outgrown_junk_leaves_orphan_subagents_to_the_orphan_rule() {
+        // Given: a subagent with real tool calls whose parent was never indexed. Its
+        // junk comes from `junk_orphan_subagents`, which reads the missing parent and
+        // not the counts, so the daemon's next pass re-junks any release instantly.
+        let db = db_with_outgrown_junk();
+        let mut orphan = tt_core::session::AgentSession {
+            session_id: "orphan".to_owned(),
+            source: tt_core::session::SessionSource::Claude,
+            parent_session_id: Some("never-ingested".to_owned()),
+            session_type: tt_core::session::SessionType::Subagent,
+            project_path: "/home/sami/p".to_owned(),
+            project_name: "p".to_owned(),
+            start_time: Utc::now(),
+            end_time: None,
+            message_count: 20,
+            summary: None,
+            user_prompts: Vec::new(),
+            starting_prompt: None,
+            assistant_message_count: 0,
+            tool_call_count: 17,
+            user_message_timestamps: Vec::new(),
+            tool_call_timestamps: Vec::new(),
+        };
+        db.upsert_agent_session(&orphan, None).unwrap();
+        let mut e = make_event(
+            "orphan-inferred",
+            Utc::now(),
+            tt_core::EventType::AgentToolUse,
+        );
+        e.session_id = Some("orphan".to_owned());
+        e.stream_id = Some("junk".to_owned());
+        e.assignment_source = Some("junk".to_owned());
+        db.insert_event(&e).unwrap();
+
+        // When
+        let outcome = db.release_outgrown_junk(ReleaseMode::Apply).unwrap();
+
+        // Then: the orphan's event stays junked; only the indexed-parent world releases.
+        let orphan_stream: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT stream_id FROM events WHERE id = 'orphan-inferred'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_stream.as_deref(),
+            Some("junk"),
+            "an orphan subagent is the orphan rule's to junk, not this release's to free"
+        );
+        assert_eq!(
+            outcome.released, 1,
+            "the outgrown user session still releases"
+        );
+
+        // And: a subagent whose parent IS indexed still releases when it outgrew the rule.
+        orphan.session_id = "linked-subagent".to_owned();
+        orphan.parent_session_id = Some("real-work".to_owned());
+        db.upsert_agent_session(&orphan, None).unwrap();
+        let mut linked = make_event(
+            "linked-inferred",
+            Utc::now(),
+            tt_core::EventType::AgentToolUse,
+        );
+        linked.session_id = Some("linked-subagent".to_owned());
+        linked.stream_id = Some("junk".to_owned());
+        linked.assignment_source = Some("junk".to_owned());
+        db.insert_event(&linked).unwrap();
+        let second = db.release_outgrown_junk(ReleaseMode::Apply).unwrap();
+        assert_eq!(
+            second.released, 1,
+            "a subagent with an indexed parent is releasable: {second:?}"
+        );
+    }
+
+    #[test]
+    fn release_outgrown_junk_forgets_only_the_released_sessions_bookkeeping() {
+        // Given: three classified sessions, two of which violate the junk rule.
+        let db = db_with_outgrown_junk();
+
+        // When
+        db.release_outgrown_junk(ReleaseMode::Apply).unwrap();
+
+        // Then: only the outgrown session is forgotten, so it returns to the candidate set.
+        // An earlier draft keyed the delete on "every session violating the rule", which is
+        // nearly every real session -- `real-work` proves that scope was wrong, because it
+        // violates the rule too and its classification must survive.
+        let remembered = |id: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM classified_sessions WHERE session_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(remembered("outgrown"), 0, "released, so re-askable");
+        assert_eq!(
+            remembered("still-junk"),
+            1,
+            "correctly junked, stays settled"
+        );
+        assert_eq!(
+            remembered("real-work"),
+            1,
+            "correctly classified, stays settled"
+        );
+    }
+
+    #[test]
+    fn release_outgrown_junk_dry_run_writes_nothing() {
+        let db = db_with_outgrown_junk();
+        let preview = db.release_outgrown_junk(ReleaseMode::DryRun).unwrap();
+        let applied = db.release_outgrown_junk(ReleaseMode::Apply).unwrap();
+        assert_eq!(preview, applied, "a preview reports what a run would do");
     }
 
     /// Builds two streams: `into` with `into_sources`, `from` with `from_sources`.

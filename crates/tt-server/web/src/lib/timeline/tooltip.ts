@@ -33,8 +33,8 @@ export function buildTooltipContent(target: HitTarget): string {
     const kindLabel = KIND_LABELS[target.event.kind];
 
     let html = `
-      <div class="font-medium text-sm text-[var(--color-text-base)]">${kindLabel}</div>
-      <div class="text-xs text-[var(--color-text-muted)] mt-1">${streamName}</div>
+      <div class="font-medium text-sm text-[var(--color-text-base)]">${streamName}</div>
+      <div class="text-xs text-[var(--color-text-muted)] mt-1">${kindLabel}</div>
       <div class="text-xs text-[var(--color-text-muted)]">${time}</div>
     `;
 

@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use tt_core::project::ProjectIdentity;
 
 mod pane_session;
+mod pane_sweep;
+
+pub use pane_sweep::{PaneSweepOutcome, sweep_pane_sessions};
 
 use crate::commands::import;
 
