@@ -110,6 +110,9 @@ impl<M> AgentHook<M> for WithdrawSpentTools
 where
     M: CompletionModel,
 {
+    // The trait requires `async fn`; clippy 1.98 flags the missing .await.
+    #[allow(unknown_lints)] // older local clippy predates the 1.98 lint below
+    #[allow(clippy::unused_async_trait_impl)]
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         if matches!(event, StepEvent::CompletionCall { .. }) && self.withdraws() {
             return Flow::patch_request(RequestPatch::new().active_tools(Vec::<String>::new()));

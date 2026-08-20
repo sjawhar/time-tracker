@@ -369,7 +369,7 @@ fn contains_date(lowered: &str) -> bool {
         || starts().filter(|&at| is_iso_date_at(bytes, at)).count() >= 2
 }
 
-fn is_word_start(bytes: &[u8], at: usize) -> bool {
+const fn is_word_start(bytes: &[u8], at: usize) -> bool {
     at == 0 || !bytes[at - 1].is_ascii_alphanumeric()
 }
 
