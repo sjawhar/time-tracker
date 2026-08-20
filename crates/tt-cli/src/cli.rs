@@ -690,9 +690,9 @@ pub enum IngestEvent {
 
     /// Index coding assistant sessions.
     ///
-    /// Scans Claude Code (~/.claude/projects/) and `OpenCode`
-    /// (~/.local/share/opencode/) session stores and stores metadata in the
-    /// database.
+    /// Scans Claude Code (~/.claude/projects/), `OpenCode`
+    /// (~/.local/share/opencode/), and omp (~/.omp/agent/sessions/) session
+    /// stores and stores metadata in the database.
     ///
     /// Only sessions touched since the last successful scan are re-derived.
     Sessions {
@@ -700,7 +700,7 @@ pub enum IngestEvent {
         ///
         /// Needed after a change to what the extractor derives (corrected rows only
         /// appear for sessions actually re-read), or if the cursor is suspected of
-        /// having drifted. Costs a full pass over both transcript stores.
+        /// having drifted. Costs a full pass over every transcript store.
         #[arg(long)]
         full: bool,
     },

@@ -1,6 +1,6 @@
 # tt-core — Domain Logic
 
-Core algorithms and types for time tracking. Pure computation + session parsing (file I/O for Claude, SQLite for OpenCode).
+Core algorithms and types for time tracking. Pure computation + session parsing (file I/O for Claude and omp, SQLite for OpenCode).
 
 ## Modules
 
@@ -9,6 +9,7 @@ Core algorithms and types for time tracking. Pure computation + session parsing 
 | `allocation.rs` | ~2300 | Time allocation algorithm (direct + delegated) |
 | `session.rs` | ~1130 | Claude Code session scanning/parsing |
 | `opencode.rs` | ~1720 | OpenCode session scanning. Reads `session` from monolithic `opencode.db`; reads `message`/`part` from per-session shard at `sessions/<id>.db` when present, else from monolithic. |
+| `omp.rs` | ~730 | omp (oh-my-pi) session scanning/parsing |
 | `injection.rs` | ~250 | `is_injected` — denylist telling harness-injected text apart from human input |
 | `classification.rs` | ~500 | `is_structurally_junk` + `is_misnamed_stream` + `normalize_stream_name` — what the classifier is asked, what it may answer, and when two answers are one answer |
 | `attribution.rs` | ~550 | `is_terminal_focus` + `resolve_terminal_focus` (temporal, terminals only); `artifact_in_title` + `artifact_refs_in_text` + `resolve_artifact_focus` (content binding, browsers) — attributing `window_focus` events, which carry no `cwd` |
@@ -78,9 +79,9 @@ There is no mechanical signature for it, exactly as there is none for a bucket t
 
 `TestEvent` struct with builder methods: `tmux_focus()`, `afk_change()`, `agent_session()`, `agent_tool_use()`, `user_message()`, `window_focus()`, `browser_tab()`. 34 test cases cover edge cases (gaps, capping, concurrent agents, AFK retroactive, user message focus).
 
-## Session Scanning (`session.rs` + `opencode.rs`)
+## Session Scanning (`session.rs` + `opencode.rs` + `omp.rs`)
 
-Parses Claude Code (`~/.claude/projects/`) JSONL session files and OpenCode (`~/.local/share/opencode/opencode.db`) SQLite database. The user's OpenCode fork shards messages/parts into per-session SQLite files at `~/.local/share/opencode/sessions/<id>.db`; `build_agent_session` opens the shard when present and falls back to the monolithic connection when not (schema is identical between the two). Corrupt or non-SQLite shards trigger a logged warning and the same fallback.
+Parses Claude Code (`~/.claude/projects/`) JSONL session files, OpenCode (`~/.local/share/opencode/opencode.db`) SQLite database, and omp (`~/.omp/agent/sessions/`) JSONL session files. The user's OpenCode fork shards messages/parts into per-session SQLite files at `~/.local/share/opencode/sessions/<id>.db`; `build_agent_session` opens the shard when present and falls back to the monolithic connection when not (schema is identical between the two). Corrupt or non-SQLite shards trigger a logged warning and the same fallback. omp's own line shapes — a session having no fixed "text"/"toolCall" line types, subagent nesting, title resolution across format versions — are documented in `omp.rs`'s module doc comment rather than duplicated here.
 
 **An empty session is an expected condition, not a parse failure.** An agent session aborted before its first message leaves nothing to parse, and both scanners used to warn about it on every pass — `tt-serve` ingests every ~30s, so two local shards and 31 on devbox filled the daemon log forever. `SessionError::EmptySession` names that state, and both `scan_claude_sessions` and `scan_opencode_sessions` log it at `debug` while every other variant still warns.
 
@@ -92,15 +93,15 @@ The two sources detect it differently, and in both cases the discriminator is st
 ### Key Types
 
 - `AgentSession` — parsed session: `session_id`, `source`, `parent_session_id`, `session_type`, `project_path`, `start_time`, `end_time`, `message_count`, `user_prompts`, etc.
-- `SessionSource` — enum: `Claude` | `OpenCode`
-- `SessionType` — enum: `User` | `Agent` | `Subagent`. In `session.rs` inferred from session_id format; in `opencode.rs` `Subagent` is set when `parent_id` is present.
+- `SessionSource` — enum: `Claude` | `OpenCode` | `Omp`
+- `SessionType` — enum: `User` | `Agent` | `Subagent`. In `session.rs` inferred from session_id format; in `opencode.rs` and `omp.rs`, `Subagent` is set when `parent_id` is present.
 
 ### Parsing Rules
 
 - `user_prompts`: max 5, each truncated to `MAX_PROMPT_LENGTH` bytes (currently 2000), UTF-8 boundary safe
 - `user_message_timestamps`: max 1000
 - `message_count`, `assistant_message_count`, `tool_call_count` are `i32` and saturate at `i32::MAX`
-- Parent session ID extracted from directory structure (Claude) or session metadata (OpenCode)
+- Parent session ID extracted from directory structure (Claude, omp) or session metadata (OpenCode)
 - Empty/whitespace-only user prompts are skipped
 - Harness-injected messages (`injection::is_injected`) are skipped entirely: no prompt, no timestamp, no contribution to the user-message count. The session's start/end times still advance across them — an injection proves the session was alive, just unattended. See root `AGENTS.md`, "Injected text is not attention".
 

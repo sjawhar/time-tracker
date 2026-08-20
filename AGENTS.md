@@ -32,7 +32,7 @@ Two consequences worth stating, because both look like omissions:
 
 Coding agents put everything on the user turn into the transcript as a user message, including text the harness wrote itself: background-task notices, `<pty_exited>` blocks, continuation directives, agent-to-agent notifications, compaction banners. A `user_message` event opens a 5-minute attention window exactly like a pane focus, so counting those fabricates direct time — they once filled a whole night with attention on a day nobody was awake.
 
-`tt_core::injection::is_injected` is the single arbiter. **Every code path that turns a transcript message into a `user_message` must gate on it**, and there are three: `tt-core/src/opencode.rs`, `tt-core/src/session.rs`, and the independent Claude JSONL parser in `tt-cli/src/commands/export.rs`. Miss one and injections keep arriving from whichever machine uses that path.
+`tt_core::injection::is_injected` is the single arbiter. **Every code path that turns a transcript message into a `user_message` must gate on it**, and there are four: `tt-core/src/opencode.rs`, `tt-core/src/session.rs`, `tt-core/src/omp.rs`, and the independent Claude JSONL parser in `tt-cli/src/commands/export.rs`. Miss one and injections keep arriving from whichever machine uses that path.
 
 The matching rule is a **denylist checked against the message's leading token** (after leading whitespace and Markdown rules). Both halves are load-bearing:
 
@@ -87,7 +87,7 @@ Async tokio/axum process. `LoopRuntime::run` spawns four independent loops (supe
 
 | Loop | Cadence | Job |
 |------|---------|-----|
-| ingest | ~30s | Scan Claude/OpenCode sessions into the DB, **incrementally** — only sessions touched since `meta.session_scan_cursor`; arm classification if anything imported |
+| ingest | ~30s | Scan Claude/OpenCode/omp sessions into the DB, **incrementally** — only sessions touched since `meta.session_scan_cursor`; arm classification if anything imported |
 | sync | ~60s | Pull events from remote machines; per-remote `SyncBackoff` on failure |
 | classify | 5s debounce, then back-to-back while draining | Auto-classify unassigned activity via `tt-llm` (only runs when a classifier is configured) |
 | db_version | 2s | Poll `meta.db_version`; on change recompute the status verdict and push an SSE event |
@@ -139,7 +139,7 @@ The classify loop **drains**: a pass is bounded at 200 sessions, so when one fin
 | Stop a pass paying to re-ask a question it already answered | `tt_llm::CLASSIFIER_GENERATION` + `tt_db::has_pending_proposal_for_events_at_generation` (the gate in `classify_window_runs`) + `stamp_pending_proposals` in `classify_auto/target.rs` | Skip a window run only when *this* classifier authored the queued answer. Bump the constant when the prompt, roster, model or fetch changes materially. See "Re-asking is conditional" below |
 | Priority drift / status verdict | `tt-cli/src/drift.rs` | `compute_verdict` feeds both `tt status` and `/api/status`. A `streams.md` link naming a dissolved stream is skipped and reported on `Verdict.dangling_stream_links`, never fatal |
 | Notice a local capture daemon has died | `STALE_LOCAL_SOURCE_HOURS` + `MONITORED_LOCAL_SOURCES` + `stale_event_sources` in `tt-cli/src/drift.rs` + `tt_db::last_local_event_per_type` | Reported on `Verdict.stale_event_sources`, never fatal. A type is only expected once this machine has produced one, so a server that never ran a watcher is never flagged. See "A dead input must announce itself" below |
-| Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode) | Claude: parse JSONL from `~/.claude/`, skipping files whose mtime predates `since`. OpenCode: query SQLite via rusqlite, filtered on `session.time_updated`. Both have a `_incremental` form returning `ScanOutcome`, which reports whether the store could be read *in full* — see "An ingest tick re-derives only what changed" |
+| Session scanning | `tt-core/src/session.rs` (Claude), `tt-core/src/opencode.rs` (OpenCode), `tt-core/src/omp.rs` (omp) | Claude: parse JSONL from `~/.claude/`, skipping files whose mtime predates `since`. OpenCode: query SQLite via rusqlite, filtered on `session.time_updated`. omp: parse JSONL from `~/.omp/agent/sessions/`, same mtime skip as Claude. All three have a `_incremental` form returning `ScanOutcome`, which reports whether the store could be read *in full* — see "An ingest tick re-derives only what changed" |
 | Harness-injected text | `tt-core/src/injection.rs` | `is_injected` denylist. Every user-message emitter must gate on it — see "Injected text is not attention" |
 | Make ingest cheap / the scan cursor | `SCAN_OVERLAP_MINUTES`, `ScanMode`, `IngestPaths`, `scan_since`, `advance_scan_cursor` in `tt-cli/src/commands/ingest.rs` | The incremental machinery. `index_sessions_in` takes the store paths so ingest is testable against a fixture corpus; `tt-cli/tests/ingest_incremental.rs` pins the cursor's behaviour. Force a full re-derivation with `tt ingest sessions --full` |
 | Ingest's attribution passes | `attribute_unassigned_events` in `tt-cli/src/commands/ingest.rs` | The complete list of passes `tt ingest sessions` runs over unassigned events, in order: session membership, then terminal focus, then artifact reference. Exactly three. Adding a fourth is the decision documented under "A folder is not a project" |
@@ -404,7 +404,7 @@ State:  ~/.local/state/time-tracker/ (hook.log, claude-manifest.json)
 | `ClassifierHealth` / `ClassifierHealthState` | tt-db | Persisted classifier state (ready / unconfigured / failing + backoff) |
 | `AllocatableEvent` | tt-core | Trait for events that participate in time allocation |
 | `AllocationConfig` | tt-core | Tunables: attention_window (default 5min), agent_timeout (30min) |
-| `AgentSession` | tt-core | Parsed Claude/OpenCode session metadata |
+| `AgentSession` | tt-core | Parsed Claude/OpenCode/omp session metadata |
 | `ArtifactRef` / `ArtifactMention` | tt-core | A pull request or issue named by a window title, and one reference to it found in classified work. Owner is `Option` so a bare `#123` binds within its project while two known-and-different owners (forks) never do |
 | `StreamChoice` | tt-llm | A verdict: `Existing` / `New` / `Throwaway` (junk, taken at face value) / `Undetermined` (answered, identified nothing; left unassigned) / `TurnsExhausted` (spent every model call without answering; left unassigned) |
 | `MisnamedReason` | tt-core | What a stream name describes instead of work: `ActivityType` / `DateRange` / `CatchAll` |

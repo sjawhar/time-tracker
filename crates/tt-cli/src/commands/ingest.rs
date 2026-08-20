@@ -451,6 +451,7 @@ pub fn ingest_scroll(
 
 // ========== Sessions Indexing ==========
 use tt_core::ScanOutcome;
+use tt_core::omp::scan_omp_sessions_incremental;
 use tt_core::opencode::scan_opencode_sessions_incremental;
 use tt_core::session::{AgentSession, scan_claude_sessions_incremental};
 use tt_db::StoredEvent;
@@ -459,6 +460,7 @@ use tt_db::StoredEvent;
 pub struct IngestReport {
     pub claude: usize,
     pub opencode: usize,
+    pub omp: usize,
     indexed_events: usize,
     imported_events: usize,
     drained_events: usize,
@@ -470,6 +472,7 @@ pub struct IngestReport {
     projects: Vec<(String, usize)>,
     scanned_claude: bool,
     scanned_opencode: bool,
+    scanned_omp: bool,
 }
 
 impl IngestReport {
@@ -516,6 +519,7 @@ pub enum ScanMode {
 pub struct IngestPaths {
     pub claude_projects: PathBuf,
     pub opencode_db: PathBuf,
+    pub omp_sessions: PathBuf,
     pub data_dir: PathBuf,
 }
 
@@ -525,6 +529,7 @@ impl IngestPaths {
         Ok(Self {
             claude_projects: get_claude_projects_dir(),
             opencode_db: get_opencode_db_path()?,
+            omp_sessions: get_omp_sessions_dir(),
             data_dir: default_data_dir(),
         })
     }
@@ -551,7 +556,11 @@ pub fn index_sessions(db: &tt_db::Database, mode: ScanMode) -> Result<()> {
         println!("Scanning OpenCode sessions...");
         println!("  Found {} {scope} OpenCode sessions", report.opencode);
     }
-    if report.claude + report.opencode == 0 {
+    if report.scanned_omp {
+        println!("Scanning omp sessions...");
+        println!("  Found {} {scope} omp sessions", report.omp);
+    }
+    if report.claude + report.opencode + report.omp == 0 {
         println!("No {scope} sessions found.");
         return Ok(());
     }
@@ -563,7 +572,7 @@ pub fn index_sessions(db: &tt_db::Database, mode: ScanMode) -> Result<()> {
     }
     println!(
         "Indexed {} sessions ({} events)",
-        report.claude + report.opencode,
+        report.claude + report.opencode + report.omp,
         report.indexed_events
     );
     println!("\nSessions by project:");
@@ -607,12 +616,18 @@ pub fn index_sessions(db: &tt_db::Database, mode: ScanMode) -> Result<()> {
 }
 
 /// Sessions discovered on this machine, and which sources were present to scan.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent presence flag per transcript store plus the orthogonal `complete` outcome; a state machine would obscure that each store is scanned regardless of the others"
+)]
 struct ScannedSessions {
     sessions: Vec<AgentSession>,
     claude: usize,
     opencode: usize,
+    omp: usize,
     scanned_claude: bool,
     scanned_opencode: bool,
+    scanned_omp: bool,
     /// Whether every store present could be read in full.
     ///
     /// False means some part of a store was unreadable, so the sessions returned are
@@ -641,21 +656,33 @@ fn scan_all_sessions(paths: &IngestPaths, since: Option<DateTime<Utc>>) -> Resul
         ScanOutcome::complete(Vec::new())
     };
 
-    // One cursor covers both stores, so it may only advance when both were read in
-    // full. Holding it back for a store that succeeded costs one cheap re-scan of a
-    // small window; advancing it for a store that failed loses that window for good.
-    let complete = claude.complete && opencode.complete;
+    let scanned_omp = paths.omp_sessions.exists();
+    let omp = if scanned_omp {
+        scan_omp_sessions_incremental(&paths.omp_sessions, since)
+            .context("failed to scan omp sessions")?
+    } else {
+        ScanOutcome::complete(Vec::new())
+    };
+
+    // One cursor covers all stores, so it may only advance when every present store
+    // was read in full. Holding it back for a store that succeeded costs one cheap
+    // re-scan of a small window; advancing it for a store that failed loses that
+    // window for good.
+    let complete = claude.complete && opencode.complete && omp.complete;
 
     Ok(ScannedSessions {
         claude: claude.sessions.len(),
         opencode: opencode.sessions.len(),
+        omp: omp.sessions.len(),
         sessions: claude
             .sessions
             .into_iter()
             .chain(opencode.sessions)
+            .chain(omp.sessions)
             .collect(),
         scanned_claude,
         scanned_opencode,
+        scanned_omp,
         complete,
     })
 }
@@ -705,8 +732,10 @@ pub fn index_sessions_in(
         sessions: all_sessions,
         claude,
         opencode,
+        omp,
         scanned_claude,
         scanned_opencode,
+        scanned_omp,
         complete,
     } = scan_all_sessions(paths, since)?;
 
@@ -718,6 +747,7 @@ pub fn index_sessions_in(
         return Ok(IngestReport {
             claude,
             opencode,
+            omp,
             indexed_events: 0,
             imported_events: 0,
             drained_events: 0,
@@ -729,6 +759,7 @@ pub fn index_sessions_in(
             projects: Vec::new(),
             scanned_claude,
             scanned_opencode,
+            scanned_omp,
         });
     }
 
@@ -795,6 +826,7 @@ pub fn index_sessions_in(
     Ok(IngestReport {
         claude,
         opencode,
+        omp,
         indexed_events,
         imported_events: inserted_events + drained,
         drained_events: drained,
@@ -806,6 +838,7 @@ pub fn index_sessions_in(
         projects,
         scanned_claude,
         scanned_opencode,
+        scanned_omp,
     })
 }
 
@@ -1073,6 +1106,19 @@ fn get_opencode_db_path() -> Result<PathBuf> {
     Ok(dirs::data_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?
         .join("opencode/opencode.db"))
+}
+
+/// Get the omp (oh-my-pi) sessions directory path.
+///
+/// Honors `PI_CODING_AGENT_DIR` if set (sessions live at
+/// `$PI_CODING_AGENT_DIR/sessions`), otherwise falls back to `~/.omp/agent/sessions`.
+fn get_omp_sessions_dir() -> PathBuf {
+    std::env::var("PI_CODING_AGENT_DIR")
+        .map_or_else(
+            |_| home_dir().unwrap_or_default().join(".omp/agent"),
+            PathBuf::from,
+        )
+        .join("sessions")
 }
 
 /// Reads all events from the events file in the specified data directory.
@@ -2310,6 +2356,7 @@ fn ingest_report_counts_new_session_and_local_events() {
     let report = IngestReport {
         claude: 2,
         opencode: 3,
+        omp: 1,
         indexed_events: 7,
         imported_events: 5,
         drained_events: 0,
@@ -2321,6 +2368,7 @@ fn ingest_report_counts_new_session_and_local_events() {
         projects: Vec::new(),
         scanned_claude: true,
         scanned_opencode: true,
+        scanned_omp: true,
     };
 
     // When
