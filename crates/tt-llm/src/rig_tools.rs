@@ -56,6 +56,9 @@ impl Tool for OverviewTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
 
+    // The trait requires `async fn`; clippy 1.98 flags the missing .await.
+    #[allow(unknown_lints)] // older local clippy predates the 1.98 lint below
+    #[allow(clippy::unused_async_trait_impl)]
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(self
             .session
@@ -115,6 +118,9 @@ impl Tool for MessagesTool {
         })
     }
 
+    // The trait requires `async fn`; clippy 1.98 flags the missing .await.
+    #[allow(unknown_lints)] // older local clippy predates the 1.98 lint below
+    #[allow(clippy::unused_async_trait_impl)]
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(self
             .session
