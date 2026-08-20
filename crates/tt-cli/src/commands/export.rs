@@ -1,7 +1,8 @@
 //! Export command for syncing events to local machine.
 //!
 //! This module reads events from `events.jsonl` (tmux events), Claude Code
-//! session logs, and `OpenCode` sessions, outputting a combined JSONL stream.
+//! session logs, `OpenCode` sessions, and omp (oh-my-pi) sessions, outputting a
+//! combined JSONL stream.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -240,6 +241,24 @@ fn default_opencode_db_path() -> PathBuf {
         .join("opencode/opencode.db")
 }
 
+/// Returns the default omp (oh-my-pi) sessions directory.
+///
+/// Respects `PI_CODING_AGENT_DIR` if set (sessions live at
+/// `$PI_CODING_AGENT_DIR/sessions`), otherwise falls back to
+/// `~/.omp/agent/sessions`.
+fn default_omp_sessions_dir() -> PathBuf {
+    std::env::var("PI_CODING_AGENT_DIR")
+        .map_or_else(
+            |_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".omp/agent")
+            },
+            PathBuf::from,
+        )
+        .join("sessions")
+}
+
 fn parse_after_timestamp(after: Option<&str>) -> Option<DateTime<Utc>> {
     let rest = after?.splitn(4, ':').nth(3)?;
     let timestamp = rest.get(..24)?;
@@ -268,6 +287,7 @@ pub fn run(after: Option<&str>, since: Option<&str>) -> Result<()> {
         &default_claude_dir(),
         &state_dir,
         Some(&default_opencode_db_path()),
+        Some(&default_omp_sessions_dir()),
         &identity.machine_id,
         after,
         since_dt.as_ref(),
@@ -285,6 +305,7 @@ fn run_impl(
     claude_dir: &Path,
     state_dir: &Path,
     opencode_db: Option<&Path>,
+    omp_sessions_dir: Option<&Path>,
     machine_id: &str,
     after: Option<&str>,
     since: Option<&chrono::DateTime<chrono::Utc>>,
@@ -305,6 +326,12 @@ fn run_impl(
     if let Some(oc_db) = opencode_db {
         if oc_db.exists() {
             export_opencode_events(oc_db, machine_id, since, output)?;
+        }
+    }
+
+    if let Some(omp_dir) = omp_sessions_dir {
+        if omp_dir.exists() {
+            export_omp_events(omp_dir, machine_id, since, output)?;
         }
     }
 
@@ -604,6 +631,129 @@ fn export_opencode_events(
                 data: serde_json::to_value(AgentSessionData {
                     action: "ended".to_string(),
                     agent: "opencode".to_string(),
+                    session_id: session.session_id.clone(),
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&end_event)?)?;
+        }
+
+        // Emit session metadata record inline
+        let metadata = SessionMetadataExport::from_agent_session(&session, Some(machine_id));
+        writeln!(output, "{}", serde_json::to_string(&metadata)?)?;
+    }
+
+    Ok(())
+}
+
+/// Exports events from omp (oh-my-pi) session transcripts.
+///
+/// Mirrors `export_opencode_events` exactly — both are thin translations from a
+/// `tt-core` scanner's `AgentSession` output into the export event stream, so the
+/// injection filtering (`crate::injection::is_injected`) that `tt_core::omp`
+/// already applies to `user_message_timestamps` is inherited here for free rather
+/// than re-implemented, the same way it is for `OpenCode`.
+fn export_omp_events(
+    omp_sessions_dir: &Path,
+    machine_id: &str,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let sessions = tt_core::omp::scan_omp_sessions_incremental(omp_sessions_dir, since.copied())
+        .with_context(|| {
+            format!(
+                "failed to scan omp sessions from {}",
+                omp_sessions_dir.display()
+            )
+        })?
+        .sessions;
+
+    for session in sessions {
+        let start_ts = session
+            .start_time
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let start_event = ExportEvent {
+            id: format!(
+                "{machine_id}:remote.agent:agent_session:{start_ts}:{}:started",
+                session.session_id
+            ),
+            timestamp: start_ts,
+            source: "remote.agent".to_string(),
+            event_type: "agent_session".to_string(),
+            data: serde_json::to_value(AgentSessionData {
+                action: "started".to_string(),
+                agent: "omp".to_string(),
+                session_id: session.session_id.clone(),
+                cwd: Some(session.project_path.clone()),
+            })?,
+        };
+        writeln!(output, "{}", serde_json::to_string(&start_event)?)?;
+
+        let mut user_ids_seen: HashMap<String, usize> = HashMap::new();
+        for user_ts in &session.user_message_timestamps {
+            let timestamp = user_ts.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let base_id = format!(
+                "{machine_id}:remote.agent:user_message:{timestamp}:{}",
+                session.session_id
+            );
+            let counter = user_ids_seen.entry(base_id.clone()).or_insert(0);
+            let id = if *counter == 0 {
+                base_id
+            } else {
+                format!("{base_id}:{counter}")
+            };
+            *counter += 1;
+
+            let event = ExportEvent {
+                id,
+                timestamp,
+                source: "remote.agent".to_string(),
+                event_type: "user_message".to_string(),
+                data: serde_json::to_value(UserMessageData {
+                    agent: "omp".to_string(),
+                    session_id: session.session_id.clone(),
+                    length: 0,
+                    has_image: false,
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&event)?)?;
+        }
+
+        for (index, tool_ts) in session.tool_call_timestamps.iter().enumerate() {
+            let timestamp = tool_ts.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let event = ExportEvent {
+                id: format!(
+                    "{machine_id}:remote.agent:agent_tool_use:{timestamp}:{}:{index}",
+                    session.session_id
+                ),
+                timestamp,
+                source: "remote.agent".to_string(),
+                event_type: "agent_tool_use".to_string(),
+                data: serde_json::to_value(AgentToolUseData {
+                    agent: "omp".to_string(),
+                    session_id: session.session_id.clone(),
+                    tool: "unknown".to_string(),
+                    file: None,
+                    cwd: Some(session.project_path.clone()),
+                })?,
+            };
+            writeln!(output, "{}", serde_json::to_string(&event)?)?;
+        }
+
+        if let Some(end_time) = session.end_time {
+            let end_ts = end_time.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let end_event = ExportEvent {
+                id: format!(
+                    "{machine_id}:remote.agent:agent_session:{end_ts}:{}:ended",
+                    session.session_id
+                ),
+                timestamp: end_ts,
+                source: "remote.agent".to_string(),
+                event_type: "agent_session".to_string(),
+                data: serde_json::to_value(AgentSessionData {
+                    action: "ended".to_string(),
+                    agent: "omp".to_string(),
                     session_id: session.session_id.clone(),
                     cwd: Some(session.project_path.clone()),
                 })?,
@@ -961,6 +1111,7 @@ mod tests {
     use rusqlite::Connection;
     use std::io::Cursor;
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     const TEST_MACHINE_ID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1074,6 +1225,62 @@ mod tests {
         .unwrap();
     }
 
+    /// A synthetic `"session"` line, matching the shape `tt_core::omp` parses.
+    fn omp_session_line(uuid: &str, timestamp: &str, cwd: &str) -> String {
+        format!(
+            r#"{{"type":"session","version":3,"id":"{uuid}","timestamp":"{timestamp}","cwd":"{cwd}"}}"#
+        )
+    }
+
+    /// A synthetic `"message"` line with `role: "user"`.
+    fn omp_user_message_line(text: &str, timestamp: &str) -> String {
+        format!(
+            r#"{{"type":"message","id":"a","parentId":null,"timestamp":"{timestamp}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// A synthetic `"message"` line with `role: "assistant"`, carrying `tool_calls`
+    /// `toolCall` content blocks.
+    fn omp_assistant_message_line(timestamp: &str, tool_calls: usize) -> String {
+        let mut blocks = vec![r#"{"type":"text","text":"done"}"#.to_string()];
+        for i in 0..tool_calls {
+            blocks.push(format!(
+                r#"{{"type":"toolCall","id":"tc{i}","name":"read","arguments":{{}}}}"#
+            ));
+        }
+        format!(
+            r#"{{"type":"message","id":"b","parentId":"a","timestamp":"{timestamp}","message":{{"role":"assistant","content":[{}]}}}}"#,
+            blocks.join(",")
+        )
+    }
+
+    /// Writes an omp transcript under `<sessions_dir>/-tmp-proj/<ts_stem>_<uuid>.jsonl`,
+    /// matching the real on-disk layout `tt_core::omp::scan_omp_sessions_incremental`
+    /// walks.
+    fn write_omp_session(
+        sessions_dir: &Path,
+        uuid: &str,
+        ts_stem: &str,
+        lines: &[String],
+    ) -> PathBuf {
+        let cwd_dir = sessions_dir.join("-tmp-proj");
+        fs::create_dir_all(&cwd_dir).unwrap();
+        let path = cwd_dir.join(format!("{ts_stem}_{uuid}.jsonl"));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    /// Sets a file's mtime, so `scan_omp_sessions_incremental`'s `since` filter can
+    /// be exercised deterministically instead of racing the real clock.
+    fn touch_omp_file(path: &Path, time: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
     #[test]
     fn test_empty_data_directory() {
         let (_temp, data_dir, claude_dir) = setup_test_dirs();
@@ -1083,6 +1290,7 @@ mod tests {
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1107,6 +1315,7 @@ mod tests {
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1136,6 +1345,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1162,6 +1372,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1194,6 +1405,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1243,6 +1455,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1287,6 +1500,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1322,6 +1536,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1404,6 +1619,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1439,6 +1655,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1479,6 +1696,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1513,6 +1731,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1543,6 +1762,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1604,6 +1824,7 @@ not valid json
             &claude_dir1,
             &data_dir1,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1616,6 +1837,7 @@ not valid json
             &data_dir2,
             &claude_dir2,
             &data_dir2,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -1652,6 +1874,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1676,6 +1899,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(opencode_db.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1746,6 +1970,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(opencode_db.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1801,6 +2026,202 @@ not valid json
     }
 
     #[test]
+    fn test_omp_export_session_events() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let omp_dir = data_dir.join("omp-sessions");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let uuid = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        write_omp_session(
+            &omp_dir,
+            uuid,
+            "2026-02-02T10-00-00-000Z",
+            &[
+                omp_session_line(uuid, "2026-02-02T10:00:00.000Z", "/home/user/project-a"),
+                omp_user_message_line("hello", "2026-02-02T10:00:10.000Z"),
+                omp_assistant_message_line("2026-02-02T10:00:20.000Z", 2),
+            ],
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            Some(&omp_dir),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let events: Vec<Value> = output_str
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        // started, user_message, 2x agent_tool_use, ended, session_metadata
+        assert_eq!(events.len(), 6);
+
+        assert_eq!(events[0]["type"], "agent_session");
+        assert_eq!(events[0]["action"], "started");
+        assert_eq!(events[0]["agent"], "omp");
+        assert_eq!(events[0]["session_id"], uuid);
+        assert_eq!(events[0]["cwd"], "/home/user/project-a");
+
+        assert_eq!(events[1]["type"], "user_message");
+        assert_eq!(events[1]["agent"], "omp");
+        assert_eq!(events[1]["session_id"], uuid);
+
+        assert_eq!(events[2]["type"], "agent_tool_use");
+        assert_eq!(events[2]["agent"], "omp");
+        assert_eq!(events[2]["tool"], "unknown");
+        assert_eq!(events[3]["type"], "agent_tool_use");
+
+        assert_eq!(events[4]["type"], "agent_session");
+        assert_eq!(events[4]["action"], "ended");
+        assert_eq!(events[4]["agent"], "omp");
+
+        assert_eq!(events[5]["type"], "session_metadata");
+        assert_eq!(events[5]["session_id"], uuid);
+        assert_eq!(events[5]["source"], "omp");
+        assert_eq!(events[5]["machine_id"], TEST_MACHINE_ID);
+        assert_eq!(events[5]["message_count"], 2);
+        assert_eq!(events[5]["assistant_message_count"], 1);
+        assert_eq!(events[5]["tool_call_count"], 2);
+    }
+
+    /// The remote export path reuses `tt_core::omp::scan_omp_sessions_incremental`
+    /// directly, so the injection gate it applies inside the scanner must hold on
+    /// the export path too — otherwise injections keep arriving on the machine
+    /// that syncs from this one. Mirrors
+    /// `test_claude_injected_user_message_is_not_exported`.
+    #[test]
+    fn test_omp_injected_user_message_is_not_exported() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let omp_dir = data_dir.join("omp-sessions");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let uuid = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        write_omp_session(
+            &omp_dir,
+            uuid,
+            "2026-02-02T10-00-00-000Z",
+            &[
+                omp_session_line(uuid, "2026-02-02T10:00:00.000Z", "/home/user/project-a"),
+                omp_user_message_line(
+                    "<system-reminder>Continue.</system-reminder>",
+                    "2026-02-02T10:00:10.000Z",
+                ),
+                omp_user_message_line("please fix the bug", "2026-02-02T10:00:20.000Z"),
+            ],
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            Some(&omp_dir),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let output_str = String::from_utf8(output.into_inner()).unwrap();
+        let events: Vec<Value> = output_str
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let user_message_count = events
+            .iter()
+            .filter(|e| e["type"] == "user_message")
+            .count();
+        assert_eq!(
+            user_message_count, 1,
+            "the injected turn must not be exported as a user_message event"
+        );
+
+        let metadata = events
+            .iter()
+            .find(|e| e["type"] == "session_metadata")
+            .expect("session_metadata record present");
+        assert_eq!(
+            metadata["message_count"], 1,
+            "the injected turn must not count toward message_count either"
+        );
+    }
+
+    /// Given an omp transcript whose file mtime predates `since`, When export
+    /// runs, Then it is skipped — the same incremental contract
+    /// `scan_omp_sessions_incremental` documents for Claude and that
+    /// `test_since_parameter_threading` exercises weakly for `OpenCode`.
+    #[test]
+    fn test_omp_export_since_excludes_unmodified_session() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let omp_dir = data_dir.join("omp-sessions");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let uuid = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        let path = write_omp_session(
+            &omp_dir,
+            uuid,
+            "2026-02-02T10-00-00-000Z",
+            &[
+                omp_session_line(uuid, "2026-02-02T10:00:00.000Z", "/home/user/project-a"),
+                omp_user_message_line("hello", "2026-02-02T10:00:10.000Z"),
+            ],
+        );
+        touch_omp_file(&path, SystemTime::now() - Duration::from_secs(3600));
+
+        let since = Utc::now();
+        let mut excluded = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            Some(&omp_dir),
+            TEST_MACHINE_ID,
+            None,
+            Some(&since),
+            &mut excluded,
+        )
+        .unwrap();
+        let excluded_str = String::from_utf8(excluded.into_inner()).unwrap();
+        assert!(
+            !excluded_str.contains(uuid),
+            "a transcript unmodified since the cursor must be skipped unopened"
+        );
+
+        let mut included = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            Some(&omp_dir),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut included,
+        )
+        .unwrap();
+        let included_str = String::from_utf8(included.into_inner()).unwrap();
+        assert!(
+            included_str.contains(uuid),
+            "without a since bound the transcript must be exported"
+        );
+    }
+
+    #[test]
     fn test_opencode_export_deterministic_ids() {
         let temp1 = TempDir::new().unwrap();
         let data_dir1 = temp1.path().join(".time-tracker");
@@ -1852,6 +2273,7 @@ not valid json
             &claude_dir1,
             &data_dir1,
             Some(opencode_db1.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1865,6 +2287,7 @@ not valid json
             &claude_dir2,
             &data_dir2,
             Some(opencode_db2.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1922,6 +2345,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(opencode_db.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -1955,6 +2379,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2038,6 +2463,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2078,6 +2504,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2125,6 +2552,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2145,6 +2573,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2200,6 +2629,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2234,6 +2664,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2264,6 +2695,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2303,6 +2735,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2325,6 +2758,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2364,6 +2798,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2396,6 +2831,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2436,6 +2872,7 @@ not valid json
             &claude_dir,
             &data_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2449,6 +2886,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2477,6 +2915,7 @@ not valid json
             &data_dir,
             &claude_dir,
             &data_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             None,
@@ -2556,6 +2995,7 @@ not valid json
             &temp.path().join(".claude/projects"),
             &state_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             Some(&after_id),
             None,
@@ -2598,6 +3038,7 @@ not valid json
             &data_dir,
             &temp.path().join(".claude/projects"),
             &state_dir,
+            None,
             None,
             TEST_MACHINE_ID,
             Some(&agent_after_id),
@@ -2648,6 +3089,7 @@ not valid json
             &temp.path().join(".claude/projects"),
             &state_dir,
             None,
+            None,
             TEST_MACHINE_ID,
             Some(&missing_after_id),
             None,
@@ -2693,6 +3135,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(opencode_db.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2755,6 +3198,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(opencode_db.as_path()),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
@@ -2869,6 +3313,7 @@ not valid json
             &claude_dir,
             &data_dir,
             Some(&db_path),
+            None,
             TEST_MACHINE_ID,
             None,
             None,
