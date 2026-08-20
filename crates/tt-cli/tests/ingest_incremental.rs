@@ -33,6 +33,31 @@ fn plant_claude_session(projects: &Path, session_id: &str, age: Duration) {
     touch(&path, age);
 }
 
+/// An omp transcript whose mtime is `age` before now.
+fn plant_omp_session(sessions_dir: &Path, uuid: &str, age: Duration) {
+    let cwd_dir = sessions_dir.join("-tmp-proj");
+    std::fs::create_dir_all(&cwd_dir).expect("create omp cwd dir");
+    let path = cwd_dir.join(format!("2026-02-02T10-00-00-000Z_{uuid}.jsonl"));
+    let mut file = File::create(&path).expect("create omp transcript");
+    writeln!(
+        file,
+        r#"{{"type":"session","version":3,"id":"{uuid}","timestamp":"2026-02-02T10:00:00.000Z","cwd":"/tmp/proj"}}"#
+    )
+    .expect("write omp transcript");
+    writeln!(
+        file,
+        r#"{{"type":"message","id":"a","parentId":null,"timestamp":"2026-02-02T10:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"do the thing"}}]}}}}"#
+    )
+    .expect("write omp transcript");
+    writeln!(
+        file,
+        r#"{{"type":"message","id":"b","parentId":"a","timestamp":"2026-02-02T10:00:02.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}]}}}}"#
+    )
+    .expect("write omp transcript");
+    drop(file);
+    touch(&path, age);
+}
+
 /// Stamps a file's mtime to `age` before now.
 fn touch(path: &Path, age: Duration) {
     File::options()
@@ -60,6 +85,7 @@ impl Fixture {
             claude_projects: temp.path().join("claude/projects"),
             // Absent by default: an absent store is skipped, not a failure.
             opencode_db: temp.path().join("opencode/opencode.db"),
+            omp_sessions: temp.path().join("omp/sessions"),
             data_dir: temp.path().join("data"),
         };
         std::fs::create_dir_all(&paths.claude_projects).expect("create claude dir");
@@ -69,6 +95,10 @@ impl Fixture {
 
     fn claude(&self) -> &Path {
         &self.paths.claude_projects
+    }
+
+    fn omp(&self) -> &Path {
+        &self.paths.omp_sessions
     }
 
     /// Replaces the `OpenCode` store with a file that exists but will not open.
@@ -284,6 +314,49 @@ fn first_ever_pass_scans_the_whole_corpus() {
     assert_eq!(report.claude, 1, "a cold cursor means a full scan");
 }
 
+/// Given an omp transcript, When ingest runs, Then it lands in `agent_sessions`
+/// with `source = 'omp'`.
+#[test]
+fn omp_session_is_ingested_with_source_omp() {
+    let fixture = Fixture::new();
+    let uuid = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+    plant_omp_session(fixture.omp(), uuid, settled());
+    let db = open_db();
+
+    let report = fixture.ingest(&db, ScanMode::Incremental);
+
+    assert_eq!(report.omp, 1, "the omp transcript must be derived");
+    let (session, _machine_id) = db
+        .get_agent_session(uuid)
+        .expect("read session")
+        .expect("session row present");
+    assert_eq!(session.source, tt_core::session::SessionSource::Omp);
+    assert_eq!(session.message_count, 2);
+}
+
+/// Given an omp corpus that has not changed, When ingest runs a second time, Then
+/// the unchanged transcript is skipped, matching the Claude and `OpenCode`
+/// incremental contract.
+#[test]
+fn omp_cursor_skips_unchanged_files() {
+    let fixture = Fixture::new();
+    plant_omp_session(
+        fixture.omp(),
+        "01a0082b-2c9d-7000-b52c-10ef998c3061",
+        settled(),
+    );
+    let db = open_db();
+
+    let first = fixture.ingest(&db, ScanMode::Incremental);
+    let second = fixture.ingest(&db, ScanMode::Incremental);
+
+    assert_eq!(first.omp, 1, "first pass derives the omp session");
+    assert_eq!(
+        second.omp, 0,
+        "an unchanged omp transcript must cost no re-derivation"
+    );
+}
+
 /// The production path resolves real store locations without panicking.
 #[test]
 fn ingest_paths_resolve_from_env() {
@@ -291,5 +364,6 @@ fn ingest_paths_resolve_from_env() {
 
     assert!(paths.claude_projects.is_absolute() || paths.claude_projects.as_os_str().is_empty());
     assert!(paths.opencode_db.ends_with("opencode/opencode.db"));
+    assert!(paths.omp_sessions.ends_with("sessions"));
     let _: &PathBuf = &paths.data_dir;
 }

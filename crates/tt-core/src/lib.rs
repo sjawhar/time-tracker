@@ -11,6 +11,7 @@ pub mod attribution;
 pub mod classification;
 pub mod event_type;
 pub mod injection;
+pub mod omp;
 pub mod opencode;
 pub mod project;
 pub mod session;
@@ -27,5 +28,6 @@ pub use classification::{
 };
 pub use event_type::{EventType, UnknownEventType};
 pub use injection::{INJECTION_MARKERS, human_message, is_injected};
+pub use omp::{scan_omp_sessions, scan_omp_sessions_incremental};
 pub use opencode::{scan_opencode_sessions, scan_opencode_sessions_incremental};
 pub use session::{AgentSession, ScanOutcome, SessionSource, SessionType};

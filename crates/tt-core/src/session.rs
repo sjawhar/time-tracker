@@ -17,6 +17,8 @@ pub enum SessionSource {
     Claude,
     #[serde(rename = "opencode")]
     OpenCode,
+    #[serde(rename = "omp")]
+    Omp,
 }
 
 impl SessionSource {
@@ -25,6 +27,7 @@ impl SessionSource {
         match self {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Omp => "omp",
         }
     }
 }
@@ -42,6 +45,7 @@ impl std::str::FromStr for SessionSource {
         match s {
             "claude" => Ok(Self::Claude),
             "opencode" => Ok(Self::OpenCode),
+            "omp" => Ok(Self::Omp),
             _ => Err(format!("invalid session source: {s}")),
         }
     }
@@ -119,7 +123,7 @@ pub(crate) const MAX_PROMPT_LENGTH: usize = 2000;
 /// Prevents unbounded memory growth for very long sessions.
 pub(crate) const MAX_USER_MESSAGE_TIMESTAMPS: usize = 1000;
 
-const MAX_TOOL_CALLS_PER_MESSAGE: usize = 100;
+pub(crate) const MAX_TOOL_CALLS_PER_MESSAGE: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -445,22 +449,22 @@ struct SessionFile {
 /// `clean` is false only for a *defective* file. A file that simply held nothing to
 /// index is clean: that is an expected state, and treating it as a defect would hold
 /// the scan cursor still forever.
-struct ParsedFile {
-    session: Option<AgentSession>,
-    clean: bool,
+pub(crate) struct ParsedFile {
+    pub(crate) session: Option<AgentSession>,
+    pub(crate) clean: bool,
 }
 
 impl ParsedFile {
-    const NOTHING_TO_INDEX: Self = Self {
+    pub(crate) const NOTHING_TO_INDEX: Self = Self {
         session: None,
         clean: true,
     };
-    const DEFECTIVE: Self = Self {
+    pub(crate) const DEFECTIVE: Self = Self {
         session: None,
         clean: false,
     };
 
-    const fn yielded(session: AgentSession) -> Self {
+    pub(crate) const fn yielded(session: AgentSession) -> Self {
         Self {
             session: Some(session),
             clean: true,
@@ -473,7 +477,7 @@ impl ParsedFile {
 /// Reads mtime off the directory entry the walk already holds, so a skipped file is
 /// never opened. A metadata read that fails answers `false`: when the filter cannot
 /// be evaluated, parse the file.
-fn unchanged_since(entry: &std::fs::DirEntry, since: Option<DateTime<Utc>>) -> bool {
+pub(crate) fn unchanged_since(entry: &std::fs::DirEntry, since: Option<DateTime<Utc>>) -> bool {
     let Some(since) = since else {
         return false;
     };
@@ -1290,7 +1294,11 @@ mod tests {
 
     #[test]
     fn test_session_source_roundtrip() {
-        for src in [SessionSource::Claude, SessionSource::OpenCode] {
+        for src in [
+            SessionSource::Claude,
+            SessionSource::OpenCode,
+            SessionSource::Omp,
+        ] {
             let s = src.as_str();
             let parsed: SessionSource = s.parse().unwrap();
             assert_eq!(parsed, src);
@@ -1302,7 +1310,11 @@ mod tests {
     fn test_session_source_serde_matches_as_str() {
         // Verify serde serialization produces the same string as as_str().
         // This prevents inconsistency between JSON export and DB storage.
-        for src in [SessionSource::Claude, SessionSource::OpenCode] {
+        for src in [
+            SessionSource::Claude,
+            SessionSource::OpenCode,
+            SessionSource::Omp,
+        ] {
             let serde_value = serde_json::to_value(src).unwrap();
             assert_eq!(
                 serde_value.as_str().unwrap(),
