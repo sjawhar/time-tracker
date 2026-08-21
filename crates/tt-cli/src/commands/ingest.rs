@@ -1969,6 +1969,43 @@ fn test_debounce_file_corruption_recovery() {
 
 #[test]
 fn test_git_identity_extraction_from_jj_directory() {
+    // `get_git_identity` shells out to `jj git remote list` / `jj workspace
+    // list` / `jj root` against `cwd`, and those subprocesses inherit
+    // whatever `$HOME` this test process has. A directory that merely
+    // contains a `.jj` marker is exactly the shape of fixture other tests
+    // build for `tt`, so this reproduces the call as its own subprocess
+    // with `$HOME` pointed at a scratch "developer home" carrying a
+    // sentinel `.gitconfig`, and proves the sentinel comes back
+    // byte-identical: the jj invocation must never read *or write* the
+    // real developer's global git identity.
+    const CHILD_MARKER: &str = "TT_TEST_GIT_IDENTITY_CHILD";
+    const CWD_ENV: &str = "TT_TEST_GIT_IDENTITY_CWD";
+    const DATA_DIR_ENV: &str = "TT_TEST_GIT_IDENTITY_DATA_DIR";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let cwd_with_jj = std::env::var(CWD_ENV).expect("parent sets cwd env");
+        let data_dir =
+            PathBuf::from(std::env::var(DATA_DIR_ENV).expect("parent sets data dir env"));
+
+        let result = ingest_pane_focus_impl(
+            &data_dir,
+            TEST_MACHINE_ID,
+            "%1",
+            "main",
+            None,
+            &cwd_with_jj,
+            None,
+        );
+        assert!(result.is_ok(), "Ingest should succeed");
+
+        let events = read_events_from(&data_dir).unwrap();
+        assert_eq!(events.len(), 1);
+        // git_project is extracted from the directory name when jj is present
+        // but no git remote is configured
+        assert_eq!(events[0].git_project, Some("my-project".to_string()));
+        return;
+    }
+
     let temp_dir = tempfile::tempdir().unwrap();
     let data_dir = temp_dir.path().join(".time-tracker");
 
@@ -1977,24 +2014,42 @@ fn test_git_identity_extraction_from_jj_directory() {
     fs::create_dir_all(&cwd_with_jj).unwrap();
     fs::create_dir_all(cwd_with_jj.join(".jj")).unwrap();
 
-    let result = ingest_pane_focus_impl(
-        &data_dir,
-        TEST_MACHINE_ID,
-        "%1",
-        "main",
-        None,
-        cwd_with_jj.to_str().unwrap(),
-        None,
+    // The scratch "developer home": a sentinel `.gitconfig` that must
+    // survive the child's jj invocation untouched.
+    let fake_home = tempfile::tempdir().unwrap();
+    let sentinel = fake_home.path().join(".gitconfig");
+    let sentinel_bytes =
+        b"[user]\n\temail = real-dev@example.com\n\tname = Real Developer\n".to_vec();
+    fs::write(&sentinel, &sentinel_bytes).unwrap();
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("commands::ingest::test_git_identity_extraction_from_jj_directory")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .env(CWD_ENV, cwd_with_jj.to_str().unwrap())
+        .env(DATA_DIR_ENV, &data_dir)
+        .env("HOME", fake_home.path())
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            fake_home.path().join("sandboxed.gitconfig"),
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "child test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    // Should succeed
-    assert!(result.is_ok(), "Ingest should succeed");
-
-    let events = read_events_from(&data_dir).unwrap();
-    assert_eq!(events.len(), 1);
-    // git_project is extracted from the directory name when jj is present
-    // but no git remote is configured
-    assert_eq!(events[0].git_project, Some("my-project".to_string()));
+    let after = fs::read(&sentinel).unwrap();
+    assert_eq!(
+        after, sentinel_bytes,
+        "get_git_identity's jj subprocess must never touch the developer's real ~/.gitconfig"
+    );
 }
 
 #[test]

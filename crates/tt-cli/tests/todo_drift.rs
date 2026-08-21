@@ -8,6 +8,9 @@ use tt_cli::commands::report::{Period, get_period_boundaries};
 use tt_core::EventType;
 use tt_db::{Database, StoredEvent, Stream};
 
+mod common;
+use common::CommandExt;
+
 const PRIORITIES: &str = "- [ ] Alpha <!-- tt-priority:{\"slug\":\"alpha\",\"value\":3,\"status\":\"active\"} -->\n- [ ] Beta <!-- tt-priority:{\"slug\":\"beta\",\"value\":1,\"status\":\"active\"} -->\n";
 const STREAMS: &str = "- Alpha Stream <!-- tt-stream:{\"priority\":\"alpha\"} -->\n- Beta Stream <!-- tt-stream:{\"priority\":\"beta\"} -->\n";
 
@@ -83,6 +86,7 @@ fn todo_drift_without_stream_links_puts_all_time_in_unattributed_bucket() {
 
 fn run_drift_json(config: &PathBuf) -> Value {
     let output = Command::new(tt_binary())
+        .sandboxed_home(config.parent().unwrap())
         .arg("--config")
         .arg(config)
         .args(["todo", "drift", "--json"])

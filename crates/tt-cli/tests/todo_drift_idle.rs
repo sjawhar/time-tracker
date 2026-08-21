@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tt_db::{Database, Stream};
 
+mod common;
+use common::CommandExt;
+
 fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
@@ -50,6 +53,7 @@ fn todo_drift_skips_an_unresolved_stream_link_and_names_it() {
 
     // When: drift is computed over both links.
     let output = Command::new(tt_binary())
+        .sandboxed_home(config.parent().unwrap())
         .arg("--config")
         .arg(&config)
         .args(["todo", "drift", "--json"])
@@ -95,6 +99,7 @@ fn todo_drift_reports_existing_idle_linked_stream_as_zero_percent() {
 
 fn run_drift_json(config: &PathBuf) -> Value {
     let output = Command::new(tt_binary())
+        .sandboxed_home(config.parent().unwrap())
         .arg("--config")
         .arg(config)
         .args(["todo", "drift", "--json"])

@@ -1,9 +1,22 @@
+use std::path::Path;
 use std::process::Command;
 
 use tempfile::TempDir;
 
+mod common;
+use common::CommandExt;
+
 fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
+}
+
+fn run_tt(store: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(tt_binary())
+        .sandboxed_home(store.parent().unwrap())
+        .env("TT_TODO_STORE_PATH", store)
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -15,12 +28,7 @@ fn todo_next_rejects_sync_conflict_files() {
     std::fs::write(store.join("todos.sync-conflict-20260623.md"), "conflict").unwrap();
 
     // When: the read-only next command is run against that store.
-    let output = Command::new(tt_binary())
-        .env("TT_TODO_STORE_PATH", &store)
-        .arg("todo")
-        .arg("next")
-        .output()
-        .unwrap();
+    let output = run_tt(&store, &["todo", "next"]);
 
     // Then: the command fails before parsing and lists the conflict path.
     assert!(
@@ -45,12 +53,7 @@ fn todo_ls_keeps_idless_todo_file_byte_identical() {
     std::fs::write(&todos_path, original).unwrap();
 
     // When: the read-only list command renders the store.
-    let output = Command::new(tt_binary())
-        .env("TT_TODO_STORE_PATH", &store)
-        .arg("todo")
-        .arg("ls")
-        .output()
-        .unwrap();
+    let output = run_tt(&store, &["todo", "ls"]);
 
     // Then: the item is surfaced with a diagnostic and the file bytes are unchanged.
     assert!(

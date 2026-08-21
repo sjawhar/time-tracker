@@ -4,12 +4,16 @@ use std::process::Command;
 use tempfile::TempDir;
 use tt_core::todos::{parse_priorities, parse_todos};
 
+mod common;
+use common::CommandExt;
+
 fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
 
 fn run_tt(store: &Path, args: &[&str]) -> std::process::Output {
     Command::new(tt_binary())
+        .sandboxed_home(store.parent().unwrap())
         .env("TT_TODO_STORE_PATH", store)
         .args(args)
         .output()

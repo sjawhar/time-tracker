@@ -6,6 +6,9 @@ use tempfile::TempDir;
 use tt_core::todos::{StreamFileItem, parse_streams};
 use tt_db::{Database, Stream};
 
+mod common;
+use common::CommandExt;
+
 fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
@@ -47,6 +50,7 @@ fn insert_stream(db_path: &Path, fixture: StreamFixture<'_>) {
 
 fn run_tt(config_path: &Path, store: &Path, args: &[&str]) -> Output {
     Command::new(tt_binary())
+        .sandboxed_home(config_path.parent().unwrap())
         .arg("--config")
         .arg(config_path)
         .env("TT_TODO_STORE_PATH", store)
