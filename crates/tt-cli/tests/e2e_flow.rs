@@ -8,6 +8,9 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
+mod common;
+use common::CommandExt;
+
 fn tt_binary() -> String {
     env!("CARGO_BIN_EXE_tt").to_string()
 }
@@ -15,6 +18,7 @@ fn tt_binary() -> String {
 fn configured_command(config_path: &std::path::Path) -> Command {
     let mut command = Command::new(tt_binary());
     command
+        .sandboxed_home(config_path.parent().unwrap())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OPENCODE_SESSION_ID")
         .arg("--config")
@@ -37,7 +41,7 @@ fn write_stdin(child: &mut std::process::Child, input: &str) {
 /// Required before any `ingest` command.
 fn init_machine(temp: &std::path::Path) {
     let output = Command::new(tt_binary())
-        .env("HOME", temp)
+        .sandboxed_home(temp)
         .arg("init")
         .output()
         .expect("failed to run tt init");
@@ -58,7 +62,7 @@ fn test_ingest_debouncing() {
     // Rapid-fire ingest calls for the same pane (within debounce window)
     for _ in 0..5 {
         let _ = Command::new(tt_binary())
-            .env("HOME", temp.path())
+            .sandboxed_home(temp.path())
             .arg("ingest")
             .arg("pane-focus")
             .arg("--pane")
@@ -93,7 +97,7 @@ fn test_ingest_different_panes_not_debounced() {
     // Rapid-fire ingest calls for different panes
     for pane in ["%1", "%2", "%3"] {
         let _ = Command::new(tt_binary())
-            .env("HOME", temp.path())
+            .sandboxed_home(temp.path())
             .arg("ingest")
             .arg("pane-focus")
             .arg("--pane")
@@ -132,7 +136,7 @@ fn an_unusable_pane_pid_still_records_the_focus_event() {
     // format resolving to nothing, junk, and a number too large for a pid.
     for (pane, pane_pid) in [("%1", ""), ("%2", "not-a-pid"), ("%3", "99999999999999")] {
         let output = Command::new(tt_binary())
-            .env("HOME", temp.path())
+            .sandboxed_home(temp.path())
             .arg("ingest")
             .arg("pane-focus")
             .arg("--pane")
@@ -167,7 +171,7 @@ fn test_export_incremental() {
 
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
@@ -175,7 +179,7 @@ fn test_export_incremental() {
 
     // First ingest
     let _ = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
@@ -190,7 +194,7 @@ fn test_export_incremental() {
 
     // First export
     let output1 = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
@@ -205,7 +209,7 @@ fn test_export_incremental() {
 
     // Second export without new events
     let output2 = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
@@ -224,7 +228,7 @@ fn test_export_incremental() {
     // Add new event after debounce window
     std::thread::sleep(std::time::Duration::from_millis(600));
     let _ = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("ingest")
         .arg("pane-focus")
@@ -239,7 +243,7 @@ fn test_export_incremental() {
 
     // Third export should have both events
     let output3 = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
@@ -273,6 +277,7 @@ fn test_import_invalid_json() {
     let invalid_data = "not valid json\n{\"also\":\"incomplete\n";
 
     let mut child = Command::new(tt_binary())
+        .sandboxed_home(temp.path())
         .arg("--config")
         .arg(&config_file)
         .arg("import")
@@ -324,6 +329,7 @@ fn test_import_missing_required_fields() {
 "#;
 
     let mut child = Command::new(tt_binary())
+        .sandboxed_home(temp.path())
         .arg("--config")
         .arg(&config_file)
         .arg("import")
@@ -361,7 +367,7 @@ fn test_export_empty_events_file() {
 
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
@@ -371,7 +377,7 @@ fn test_export_empty_events_file() {
     std::fs::write(data_dir.join("events.jsonl"), "").unwrap();
 
     let output = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
@@ -399,6 +405,7 @@ fn test_import_empty_stdin() {
     .unwrap();
 
     let mut child = Command::new(tt_binary())
+        .sandboxed_home(temp.path())
         .arg("--config")
         .arg(&config_file)
         .arg("import")
@@ -426,7 +433,7 @@ fn test_export_large_number_of_events() {
 
     // Initialize machine identity (required by export)
     let _ = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("init")
         .output()
@@ -440,7 +447,7 @@ fn test_export_large_number_of_events() {
         }
 
         let _ = Command::new(tt_binary())
-            .env("HOME", temp.path())
+            .sandboxed_home(temp.path())
             .env_remove("CLAUDE_CONFIG_DIR")
             .arg("ingest")
             .arg("pane-focus")
@@ -455,7 +462,7 @@ fn test_export_large_number_of_events() {
     }
 
     let output = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .env_remove("CLAUDE_CONFIG_DIR")
         .arg("export")
         .output()
@@ -493,6 +500,7 @@ fn test_import_ignores_stream_id() {
 "#;
 
     let mut child = Command::new(tt_binary())
+        .sandboxed_home(temp.path())
         .arg("--config")
         .arg(&config_file)
         .arg("import")
@@ -535,7 +543,7 @@ fn test_concurrent_ingest_no_data_loss() {
         let handle = thread::spawn(move || {
             // Different panes to avoid debouncing
             let _ = Command::new(tt_binary())
-                .env("HOME", temp_clone.path())
+                .sandboxed_home(temp_clone.path())
                 .arg("ingest")
                 .arg("pane-focus")
                 .arg("--pane")
@@ -591,7 +599,7 @@ fn test_readonly_events_file_error_handling() {
 
     // Try to ingest - should fail gracefully
     let output = Command::new(tt_binary())
-        .env("HOME", temp.path())
+        .sandboxed_home(temp.path())
         .arg("ingest")
         .arg("pane-focus")
         .arg("--pane")

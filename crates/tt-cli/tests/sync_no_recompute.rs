@@ -9,6 +9,9 @@ use serde_json::json;
 use tempfile::TempDir;
 use tt_db::{Database, StoredEvent, Stream};
 
+mod common;
+use common::CommandExt;
+
 /// Times seeded on the stream before syncing. Recomputation would overwrite
 /// these with the values its allocation produces, so they double as a tripwire.
 const SEEDED_DIRECT_MS: i64 = 111;
@@ -67,7 +70,7 @@ impl Fixture {
             std::env::var("PATH").unwrap_or_default()
         );
         Command::new(tt_binary())
-            .env("HOME", self.home.path())
+            .sandboxed_home(self.home.path())
             .env("PATH", path)
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
