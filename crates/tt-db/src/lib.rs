@@ -60,6 +60,13 @@ const SCHEMA_VERSION: i32 = 14;
 /// 30-minute agent timeout rather than being reused indefinitely.
 const PANE_SESSION_BINDING_FRESHNESS_MINUTES: i64 = 30;
 
+/// Minimum age of a pane's newest same-session binding before the sweep records another.
+///
+/// The sweep re-observes every agent pane on the daemon's ~30s tick; recording each
+/// repeat appends ~23k redundant rows/day/machine, while one observation per third of
+/// the freshness window loses nothing any reader consumes.
+const PANE_SESSION_BINDING_THROTTLE_MINUTES: i64 = 10;
+
 /// `meta` key recording that `normalize_stream_timestamps` has already run.
 ///
 /// A data repair, not a schema change, so it is tracked here instead of by
@@ -2965,6 +2972,14 @@ impl Database {
     /// `assignment_source`, and does not bump `db_version`: a binding changes no
     /// assignment of its own, and the import that uses it signals the daemon when
     /// events actually land.
+    ///
+    /// A repeat is skipped only while the pane's **latest** in-window binding names
+    /// the same session — the sweep re-observes every pane on the daemon's ~30s
+    /// tick, and recording each repeat appends tens of thousands of redundant rows
+    /// a day. Keying the guard on mere same-session *existence* inside the window
+    /// was wrong: an A→B→A pane switch left A's return suppressed by A's earlier
+    /// row, so the freshest binding said B and stamped A's focus events as B. The
+    /// latest-row rule records a switch — in either direction — immediately.
     pub fn record_pane_session_bindings(
         &self,
         machine_id: &str,
@@ -2976,16 +2991,36 @@ impl Database {
         }
         let tx = self.write_tx()?;
         let observed = format_timestamp(observed_at);
+        let throttle_floor = format_timestamp(
+            observed_at - chrono::Duration::minutes(PANE_SESSION_BINDING_THROTTLE_MINUTES),
+        );
         let mut inserted = 0u64;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO pane_session_bindings
                  (machine_id, pane_id, session_id, observed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 SELECT ?1, ?2, ?3, ?4
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM (
+                         SELECT session_id FROM pane_session_bindings
+                         WHERE machine_id = ?1
+                           AND pane_id = ?2
+                           AND observed_at <= ?4
+                           AND observed_at >= ?5
+                         ORDER BY observed_at DESC
+                         LIMIT 1
+                     ) latest
+                     WHERE latest.session_id = ?3
+                 )",
             )?;
             for (pane_id, session_id) in observations {
-                inserted +=
-                    stmt.execute(params![machine_id, pane_id, session_id, observed])? as u64;
+                inserted += stmt.execute(params![
+                    machine_id,
+                    pane_id,
+                    session_id,
+                    observed,
+                    throttle_floor
+                ])? as u64;
             }
         }
         tx.commit()?;
@@ -12346,6 +12381,115 @@ mod tests {
         assert_eq!(later.session_id.as_deref(), Some("session-a"));
         assert_eq!(later.stream_id, None);
         assert_eq!(later.assignment_source, None);
+    }
+
+    #[test]
+    fn a_same_session_repeat_inside_the_throttle_is_not_recorded() {
+        // Given: the sweep observed a pane's session.
+        let db = Database::open_in_memory().unwrap();
+        let observation = [("%1".to_string(), "session-a".to_string())];
+        assert_eq!(
+            db.record_pane_session_bindings("m1", &observation, ts(0))
+                .unwrap(),
+            1
+        );
+
+        // When/Then: the next few sweeps re-observe the same pairing and record nothing.
+        assert_eq!(
+            db.record_pane_session_bindings(
+                "m1",
+                &observation,
+                ts(0) + chrono::Duration::seconds(30)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.record_pane_session_bindings(
+                "m1",
+                &observation,
+                ts(0) + chrono::Duration::minutes(PANE_SESSION_BINDING_THROTTLE_MINUTES - 1)
+            )
+            .unwrap(),
+            0
+        );
+
+        // And: past the throttle the pairing is recorded again, so the freshness
+        // window every reader depends on never runs dry.
+        assert_eq!(
+            db.record_pane_session_bindings(
+                "m1",
+                &observation,
+                ts(0) + chrono::Duration::minutes(PANE_SESSION_BINDING_THROTTLE_MINUTES + 1)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_session_switch_in_a_pane_is_recorded_immediately() {
+        // Given: a pane bound to one session seconds ago.
+        let db = Database::open_in_memory().unwrap();
+        db.record_pane_session_bindings(
+            "m1",
+            &[("%1".to_string(), "session-a".to_string())],
+            ts(0),
+        )
+        .unwrap();
+
+        // When: the next sweep sees a different session in the same pane (omp `/new`).
+        let recorded = db
+            .record_pane_session_bindings(
+                "m1",
+                &[("%1".to_string(), "session-b".to_string())],
+                ts(0) + chrono::Duration::seconds(30),
+            )
+            .unwrap();
+
+        // Then: the throttle keys on the session, so the switch is not suppressed.
+        assert_eq!(recorded, 1);
+    }
+
+    #[test]
+    fn a_pane_returning_to_a_prior_session_is_recorded_immediately() {
+        // A -> B -> A inside the throttle window: the guard keys on the pane's
+        // LATEST binding, so the return to A must record — suppressing it would
+        // leave B as the freshest binding and stamp A's focus events as B.
+        let db = Database::open_in_memory().unwrap();
+        db.record_pane_session_bindings(
+            "m1",
+            &[("%1".to_string(), "session-a".to_string())],
+            ts(0),
+        )
+        .unwrap();
+        db.record_pane_session_bindings(
+            "m1",
+            &[("%1".to_string(), "session-b".to_string())],
+            ts(0) + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+
+        let recorded = db
+            .record_pane_session_bindings(
+                "m1",
+                &[("%1".to_string(), "session-a".to_string())],
+                ts(0) + chrono::Duration::minutes(2),
+            )
+            .unwrap();
+
+        assert_eq!(recorded, 1);
+        let freshest: String = db
+            .conn
+            .query_row(
+                "SELECT session_id FROM pane_session_bindings
+                 WHERE machine_id = 'm1' AND pane_id = '%1'
+                 ORDER BY observed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(freshest, "session-a");
     }
 
     #[test]
