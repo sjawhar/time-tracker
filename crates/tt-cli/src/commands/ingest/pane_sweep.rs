@@ -3,10 +3,13 @@
 //! Capture walks a pane's process tree only at focus time — exactly when no tool
 //! call is usually in flight in the pane just switched to — so most focus events
 //! carry no identity: measured over ordinary use, 17 of 174 (~10%). The sweep walks
-//! every live tmux pane on a timer instead, recording the same environment-variable
+//! every live tmux pane on a timer instead, recording the same process-tree
 //! identity into `pane_session_bindings`, where the existing import fallback and
 //! backfill already consume it. Identity, never inference: nothing here reads a
 //! title or a cwd, and nothing here writes a stream.
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -21,7 +24,8 @@ pub struct PaneSweepOutcome {
     pub panes: usize,
     /// Panes whose process tree carried an agent session id.
     pub identified: usize,
-    /// Bindings newly recorded (a repeat observation in the same second is ignored).
+    /// Bindings newly recorded. A same-session repeat inside the recording
+    /// throttle is not new — see `Database::record_pane_session_bindings`.
     pub recorded: u64,
 }
 
@@ -30,13 +34,36 @@ pub struct PaneSweepOutcome {
 /// The pure half, so tests can drive it with a fake process tree. A pane whose walk
 /// finds nothing is skipped silently: a plain shell has no session, and per the
 /// capture doctrine every failure leaves the world exactly as it was.
-fn resolve_panes<S: ProcessSource>(source: &S, panes: &[(String, u32)]) -> Vec<(String, String)> {
-    panes
-        .iter()
-        .filter_map(|(pane_id, pid)| {
-            resolve_pane_session(source, *pid).map(|session| (pane_id.clone(), session))
-        })
-        .collect()
+///
+/// Pane ids are unique only per tmux server and the sweep enumerates every server,
+/// so the same id can carry two different sessions; the binding table has no server
+/// column, so conflicting same-id observations are refused whole and matching ones
+/// collapse to one. Output is sorted for determinism.
+fn resolve_panes<S: ProcessSource>(
+    source: &S,
+    panes: &[(String, u32)],
+    omp_sessions_dir: &Path,
+) -> Vec<(String, String)> {
+    let mut identity_by_pane: HashMap<String, Option<String>> = HashMap::new();
+    for (pane_id, pid) in panes {
+        let Some(session) = resolve_pane_session(source, *pid, omp_sessions_dir) else {
+            continue;
+        };
+        identity_by_pane
+            .entry(pane_id.clone())
+            .and_modify(|existing| {
+                if existing.as_deref() != Some(session.as_str()) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(session));
+    }
+    let mut observations: Vec<(String, String)> = identity_by_pane
+        .into_iter()
+        .filter_map(|(pane_id, session)| Some((pane_id, session?)))
+        .collect();
+    observations.sort();
+    observations
 }
 
 /// Lists the unix socket paths of every live tmux server on this machine.
@@ -110,7 +137,7 @@ fn list_tmux_panes() -> Vec<(String, u32)> {
 pub fn sweep_pane_sessions(db: &Database) -> Result<PaneSweepOutcome> {
     let identity = crate::machine::require_machine_identity()?;
     let panes = list_tmux_panes();
-    let observations = resolve_panes(&ProcFs, &panes);
+    let observations = resolve_panes(&ProcFs, &panes, &super::get_omp_sessions_dir());
     let recorded =
         db.record_pane_session_bindings(&identity.machine_id, &observations, Utc::now())?;
     Ok(PaneSweepOutcome {
@@ -180,7 +207,7 @@ mod tests {
         ];
 
         // When
-        let observations = resolve_panes(&tree, &panes);
+        let observations = resolve_panes(&tree, &panes, Path::new("/home/x/.omp/agent/sessions"));
 
         // Then: the shells contribute nothing and the agents are paired to their panes.
         assert_eq!(
@@ -189,6 +216,42 @@ mod tests {
                 ("%1".to_string(), "ses_alpha".to_string()),
                 ("%2".to_string(), "ses_beta".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn conflicting_same_pane_ids_across_servers_are_refused() {
+        // Two tmux servers can each own a "%1". The binding table has no server
+        // column, so recording either observation would stamp the other server's
+        // focus events; the conflict is refused whole while other panes survive.
+        let tree = FakeTree::new()
+            .with_agent(100, 101, "ses_alpha")
+            .with_agent(200, 201, "ses_beta")
+            .with_agent(300, 301, "ses_gamma");
+        let panes = vec![
+            ("%1".to_string(), 100),
+            ("%1".to_string(), 200),
+            ("%2".to_string(), 300),
+        ];
+
+        let observations = resolve_panes(&tree, &panes, Path::new("/home/x/.omp/agent/sessions"));
+
+        assert_eq!(
+            observations,
+            vec![("%2".to_string(), "ses_gamma".to_string())]
+        );
+    }
+
+    #[test]
+    fn agreeing_duplicate_pane_observations_collapse_to_one() {
+        let tree = FakeTree::new().with_agent(100, 101, "ses_alpha");
+        let panes = vec![("%1".to_string(), 100), ("%1".to_string(), 100)];
+
+        let observations = resolve_panes(&tree, &panes, Path::new("/home/x/.omp/agent/sessions"));
+
+        assert_eq!(
+            observations,
+            vec![("%1".to_string(), "ses_alpha".to_string())]
         );
     }
 

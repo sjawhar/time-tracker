@@ -1,26 +1,29 @@
 //! Resolving a focused tmux pane to the agent session running inside it.
 //!
-//! A `tmux_pane_focus` event carries no window title, no `window_app_id` and no
-//! session id, so nothing in the pipeline could ever attribute one. What it does
-//! have is a process tree, and a pane hosting an interactive agent holds that
-//! agent's session id in that tree persistently — measured at 101 of 101
-//! observations, against 0% for every plain shell pane.
+//! A `tmux_pane_focus` event carries no title, no `window_app_id` and no session
+//! id; the pane's process tree identifies the session through two channels:
 //!
-//! This is an **identity**, not an inference: the pane being looked at *is*
-//! running that session. So nothing here derives a stream. It records only which
-//! session the focused pane was running, and the already-trusted session→stream
-//! path (`Database::assign_events_by_session_id`, run when the session is
-//! classified) does the rest.
+//! - **An environment variable.** `OpenCode` and Claude Code stamp their session
+//!   id on their own process.
+//! - **An open transcript.** omp stamps no variable; it holds its current
+//!   session's transcript open, and the filename carries the session id
+//!   (`<sessions_dir>/<cwd-slug>/<ISO-8601-timestamp>_<uuid>.jsonl`, the naming
+//!   `tt_core::omp` derives ids from). `OMP_SESSION_ID` is deliberately not
+//!   read: a runtime `process.env` mutation is visible only in child processes,
+//!   where a long-lived child keeps a stale copy across a session switch.
+//!
+//! Either way this is an **identity**, not an inference: nothing here derives a
+//! stream. It records which session the focused pane was running; the trusted
+//! session→stream path does the rest. See root `AGENTS.md`, "A pane's process
+//! tree is an identity" and "An identity channel is per-harness".
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The environment variables an agent harness stamps on its own process.
-///
-/// Exactly two, and the list is closed. An agent process's environment holds
-/// credentials, so the walk extracts these values and drops every other byte it
-/// read — see [`session_id_in_environ`].
+/// A closed list, matched by entry name — see [`session_id_in_environ`].
 const SESSION_ENV_NAMES: [&[u8]; 2] = [b"OPENCODE_SESSION_ID", b"CLAUDE_CODE_SESSION_ID"];
 
 /// Processes whose environment may be read for one lookup.
@@ -28,6 +31,9 @@ const MAX_PROCESSES: usize = 64;
 
 /// Generations walked below the pane's own process.
 const MAX_DEPTH: u32 = 8;
+
+/// File descriptors examined per process (a live omp process held 85).
+const MAX_FDS: usize = 256;
 
 /// The process facts the walk needs, injectable so it can be driven without
 /// real processes.
@@ -39,6 +45,13 @@ pub trait ProcessSource {
     /// `pid`'s raw NUL-separated environment block, or `None` when it cannot be
     /// read (permission denied, or the process exited mid-walk).
     fn environ(&self, pid: u32) -> Option<Vec<u8>>;
+
+    /// Paths of `pid`'s open descriptors targeting a `.jsonl` file **held open
+    /// for writing**. Writable is the contract: the harness writing its
+    /// transcript is running that session; a reader (`less`, backup) is not.
+    fn open_file_paths(&self, _pid: u32) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// Extracts an agent session id from one process's raw environment block.
@@ -68,24 +81,61 @@ fn session_id_in_environ(raw: &[u8]) -> Option<String> {
     })
 }
 
+/// Extracts an omp session id from one process's open transcripts.
+///
+/// Only a `.jsonl` exactly two components below `sessions_dir` qualifies
+/// (deeper files are subagent transcripts), and the uuid check mirrors
+/// `tt_core::omp::fallback_session_id` (36 chars, four dashes), which also
+/// rejects `/proc`'s ` (deleted)` suffix. Two different qualifying sessions in
+/// one process are refused as ambiguous. Paths are dropped after matching.
+fn omp_session_in_open_files(paths: &[PathBuf], omp_sessions_dir: &Path) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for path in paths {
+        let Ok(relative) = path.strip_prefix(omp_sessions_dir) else {
+            continue;
+        };
+        if relative.components().count() != 2 {
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some((_, uuid)) = stem.rsplit_once('_') else {
+            continue;
+        };
+        if uuid.len() != 36 || uuid.matches('-').count() != 4 {
+            continue;
+        }
+        match found {
+            Some(existing) if existing != uuid => return None,
+            _ => found = Some(uuid),
+        }
+    }
+    found.map(str::to_string)
+}
+
 /// Walks a pane's process tree breadth-first for the session running in it.
 ///
-/// Breadth-first because the harness sits a fixed few generations below the
-/// pane's shell (measured at depth 3 on this machine) while a busy pane's tree is
-/// wide, so the nearest process is the likeliest holder. First match wins.
-///
-/// Bounded twice, because this runs on every pane focus — thousands of times a
-/// day: [`MAX_PROCESSES`] environments are read at most, and no generation past
-/// [`MAX_DEPTH`] is expanded. Observed trees are 2–8 processes at depth ≤ 5, so
-/// both bounds sit well above real work and exist to cap pathology.
-///
-/// Every failure is silent and total: an unreadable process is skipped rather
-/// than aborting the walk, and a pane with no agent returns `None` — which is the
-/// correct answer for a plain shell, measured at 0% across every such pane.
-pub fn resolve_pane_session<S: ProcessSource>(source: &S, pane_process_id: u32) -> Option<String> {
+/// The whole bounded tree is visited: two *different* identities under one pane
+/// refuse as ambiguous rather than resolve by visit order. Within one process
+/// the environment outranks open files. The sessions dir is canonicalized
+/// because `/proc/<pid>/fd` reports resolved targets. Bounded by
+/// [`MAX_PROCESSES`], [`MAX_DEPTH`] and [`MAX_FDS`]; every failure is silent,
+/// and a pane with no agent returns `None`.
+pub fn resolve_pane_session<S: ProcessSource>(
+    source: &S,
+    pane_process_id: u32,
+    omp_sessions_dir: &Path,
+) -> Option<String> {
+    let omp_sessions_dir =
+        fs::canonicalize(omp_sessions_dir).unwrap_or_else(|_| omp_sessions_dir.to_path_buf());
     let mut queue = VecDeque::from([(pane_process_id, 0_u32)]);
     let mut seen = HashSet::from([pane_process_id]);
     let mut examined = 0_usize;
+    let mut found: Option<String> = None;
 
     while let Some((pid, depth)) = queue.pop_front() {
         if examined >= MAX_PROCESSES {
@@ -93,9 +143,15 @@ pub fn resolve_pane_session<S: ProcessSource>(source: &S, pane_process_id: u32) 
         }
         examined += 1;
 
-        if let Some(raw) = source.environ(pid) {
-            if let Some(session_id) = session_id_in_environ(&raw) {
-                return Some(session_id);
+        let candidate = source
+            .environ(pid)
+            .as_deref()
+            .and_then(session_id_in_environ)
+            .or_else(|| omp_session_in_open_files(&source.open_file_paths(pid), &omp_sessions_dir));
+        if let Some(candidate) = candidate {
+            match &found {
+                Some(existing) if *existing != candidate => return None,
+                _ => found = Some(candidate),
             }
         }
 
@@ -109,7 +165,7 @@ pub fn resolve_pane_session<S: ProcessSource>(source: &S, pane_process_id: u32) 
         }
     }
 
-    None
+    found
 }
 
 /// The real process tree, read from `/proc`.
@@ -145,6 +201,44 @@ impl ProcessSource for ProcFs {
     fn environ(&self, pid: u32) -> Option<Vec<u8>> {
         fs::read(format!("/proc/{pid}/environ")).ok()
     }
+
+    /// Readlinks `/proc/<pid>/fd/*` (capped at [`MAX_FDS`]), keeping `.jsonl`
+    /// targets whose descriptor is open for writing per `fdinfo` — read only
+    /// for targets that pass the extension check, and failing closed when
+    /// unreadable, so a transcript *reader* never becomes a pane identity.
+    fn open_file_paths(&self, pid: u32) -> Vec<PathBuf> {
+        let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return Vec::new();
+        };
+        descriptors
+            .flatten()
+            .take(MAX_FDS)
+            .filter_map(|descriptor| {
+                let target = fs::read_link(descriptor.path()).ok()?;
+                if target.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                    return None;
+                }
+                let fd_name = descriptor.file_name();
+                let fdinfo =
+                    fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd_name.to_string_lossy()))
+                        .ok()?;
+                fdinfo_is_writable(&fdinfo).then_some(target)
+            })
+            .collect()
+    }
+}
+
+/// Whether an `fdinfo` block says its descriptor is open for writing.
+///
+/// The `flags:` line carries the open flags in octal; `O_ACCMODE` (3) masks the
+/// access mode, where `O_RDONLY` is 0. Unparseable input is not writable — the
+/// caller uses this to exclude transcript readers, so it fails closed.
+fn fdinfo_is_writable(fdinfo: &str) -> bool {
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+        .is_some_and(|flags| flags & 0o3 != 0)
 }
 
 /// Asks tmux for a pane's process id.
@@ -177,7 +271,7 @@ pub fn session_for_pane(pane_id: &str, pane_process_id: Option<&str>) -> Option<
     let pane_process_id = pane_process_id
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .or_else(|| pane_pid_from_tmux(pane_id))?;
-    resolve_pane_session(&ProcFs, pane_process_id)
+    resolve_pane_session(&ProcFs, pane_process_id, &super::get_omp_sessions_dir())
 }
 
 #[cfg(test)]
@@ -206,12 +300,25 @@ mod tests {
         raw
     }
 
+    /// The sessions directory every walk test resolves against.
+    fn sessions_dir() -> &'static Path {
+        Path::new("/home/user/.omp/agent/sessions")
+    }
+
+    /// A top-level omp transcript path for `uuid` inside [`sessions_dir`].
+    fn transcript(uuid: &str) -> PathBuf {
+        sessions_dir().join(format!(
+            "-Code-project/2026-08-30T16-55-24-400Z_{uuid}.jsonl"
+        ))
+    }
+
     /// A scripted process tree. A pid absent from `environs` models one whose
     /// environment cannot be read: permission denied, or the process exited
     /// mid-walk.
     struct FakeTree {
         children: HashMap<u32, Vec<u32>>,
         environs: HashMap<u32, Vec<u8>>,
+        open_files: HashMap<u32, Vec<PathBuf>>,
         examined: RefCell<Vec<u32>>,
     }
 
@@ -220,6 +327,7 @@ mod tests {
             Self {
                 children: HashMap::new(),
                 environs: HashMap::new(),
+                open_files: HashMap::new(),
                 examined: RefCell::new(Vec::new()),
             }
         }
@@ -231,6 +339,11 @@ mod tests {
 
         fn with_environ(mut self, pid: u32, entries: &[&str]) -> Self {
             self.environs.insert(pid, environ_blob(entries));
+            self
+        }
+
+        fn with_open_files(mut self, pid: u32, paths: &[PathBuf]) -> Self {
+            self.open_files.insert(pid, paths.to_vec());
             self
         }
 
@@ -247,6 +360,10 @@ mod tests {
         fn environ(&self, pid: u32) -> Option<Vec<u8>> {
             self.examined.borrow_mut().push(pid);
             self.environs.get(&pid).cloned()
+        }
+
+        fn open_file_paths(&self, pid: u32) -> Vec<PathBuf> {
+            self.open_files.get(&pid).cloned().unwrap_or_default()
         }
     }
 
@@ -333,7 +450,7 @@ mod tests {
     fn a_session_id_on_the_pane_process_itself_is_found() {
         let tree = FakeTree::new().with_environ(500, &["OPENCODE_SESSION_ID=ses_root"]);
         assert_eq!(
-            resolve_pane_session(&tree, 500),
+            resolve_pane_session(&tree, 500, sessions_dir()),
             Some("ses_root".to_string())
         );
     }
@@ -344,7 +461,7 @@ mod tests {
         // harness three generations below it.
         let tree = chain(64_344, 3, "ses_0210f2ed2ffedhF4");
         assert_eq!(
-            resolve_pane_session(&tree, 64_344),
+            resolve_pane_session(&tree, 64_344, sessions_dir()),
             Some("ses_0210f2ed2ffedhF4".to_string())
         );
     }
@@ -355,7 +472,7 @@ mod tests {
             .with_children(600, &[601])
             .with_environ(600, &SECRETS)
             .with_environ(601, &SECRETS);
-        assert_eq!(resolve_pane_session(&tree, 600), None);
+        assert_eq!(resolve_pane_session(&tree, 600, sessions_dir()), None);
     }
 
     #[test]
@@ -367,7 +484,7 @@ mod tests {
             .with_environ(700, &SECRETS)
             .with_environ(702, &["OPENCODE_SESSION_ID=ses_sibling"]);
         assert_eq!(
-            resolve_pane_session(&tree, 700),
+            resolve_pane_session(&tree, 700, sessions_dir()),
             Some("ses_sibling".to_string())
         );
     }
@@ -375,7 +492,7 @@ mod tests {
     #[test]
     fn an_unreadable_pane_process_yields_no_session() {
         let tree = FakeTree::new();
-        assert_eq!(resolve_pane_session(&tree, 999), None);
+        assert_eq!(resolve_pane_session(&tree, 999, sessions_dir()), None);
     }
 
     #[test]
@@ -390,7 +507,7 @@ mod tests {
         // Beyond the budget, so it must not be reached.
         tree = tree.with_environ(1_200, &["OPENCODE_SESSION_ID=ses_beyond_budget"]);
 
-        assert_eq!(resolve_pane_session(&tree, 1_000), None);
+        assert_eq!(resolve_pane_session(&tree, 1_000, sessions_dir()), None);
         assert_eq!(tree.examined_count(), MAX_PROCESSES);
     }
 
@@ -398,7 +515,7 @@ mod tests {
     fn a_session_id_at_the_depth_bound_is_still_found() {
         let tree = chain(2_000, MAX_DEPTH, "ses_at_bound");
         assert_eq!(
-            resolve_pane_session(&tree, 2_000),
+            resolve_pane_session(&tree, 2_000, sessions_dir()),
             Some("ses_at_bound".to_string())
         );
     }
@@ -406,7 +523,7 @@ mod tests {
     #[test]
     fn a_session_id_below_the_depth_bound_is_not_reached() {
         let tree = chain(3_000, MAX_DEPTH + 1, "ses_too_deep");
-        assert_eq!(resolve_pane_session(&tree, 3_000), None);
+        assert_eq!(resolve_pane_session(&tree, 3_000, sessions_dir()), None);
     }
 
     #[test]
@@ -416,7 +533,7 @@ mod tests {
             .with_children(4_001, &[4_000, 4_001])
             .with_environ(4_000, &SECRETS)
             .with_environ(4_001, &SECRETS);
-        assert_eq!(resolve_pane_session(&tree, 4_000), None);
+        assert_eq!(resolve_pane_session(&tree, 4_000, sessions_dir()), None);
         assert_eq!(tree.examined_count(), 2);
     }
 
@@ -486,5 +603,169 @@ mod tests {
         let _ = child.wait();
 
         assert_eq!(found, Some("ses_real_proc".to_string()));
+    }
+
+    const OMP_UUID: &str = "01a05398-e5f0-7000-a23d-362dc282c9df";
+    const OTHER_UUID: &str = "01a0448c-641d-7000-ad02-75ed95a69f0a";
+
+    #[test]
+    fn an_open_omp_transcript_identifies_the_session() {
+        let tree = FakeTree::new()
+            .with_environ(500, &SECRETS)
+            .with_open_files(500, &[transcript(OMP_UUID)]);
+        assert_eq!(
+            resolve_pane_session(&tree, 500, sessions_dir()),
+            Some(OMP_UUID.to_string())
+        );
+    }
+
+    #[test]
+    fn an_open_transcript_on_a_descendant_is_found() {
+        // The measured shape: the pane's shell at depth 0, omp one generation below.
+        let tree = FakeTree::new()
+            .with_children(600, &[601])
+            .with_environ(600, &SECRETS)
+            .with_environ(601, &SECRETS)
+            .with_open_files(601, &[transcript(OMP_UUID)]);
+        assert_eq!(
+            resolve_pane_session(&tree, 600, sessions_dir()),
+            Some(OMP_UUID.to_string())
+        );
+    }
+
+    #[test]
+    fn a_stamped_variable_wins_over_an_open_transcript() {
+        // Within one process the environment is the harness's own claim about
+        // itself; an open file is one step more inferred, so it must not shadow.
+        let tree = FakeTree::new()
+            .with_environ(700, &["OPENCODE_SESSION_ID=ses_env"])
+            .with_open_files(700, &[transcript(OMP_UUID)]);
+        assert_eq!(
+            resolve_pane_session(&tree, 700, sessions_dir()),
+            Some("ses_env".to_string())
+        );
+    }
+
+    #[test]
+    fn a_subagent_transcript_is_not_an_identity() {
+        // Three components below the sessions dir: a subagent transcript. Its stem
+        // carries no session id, and the parent's own transcript is the identity.
+        let subagent = sessions_dir().join("-Code-project/2026-08-30T16-55-24-400Z_x/Scout.jsonl");
+        let tree = FakeTree::new()
+            .with_environ(800, &SECRETS)
+            .with_open_files(800, &[subagent]);
+        assert_eq!(resolve_pane_session(&tree, 800, sessions_dir()), None);
+    }
+
+    #[test]
+    fn files_that_are_not_top_level_transcripts_are_ignored() {
+        let noise = [
+            // Outside the sessions dir entirely, uuid-shaped name or not.
+            PathBuf::from(format!(
+                "/home/user/notes/2026-08-30T00-00-00-000Z_{OMP_UUID}.jsonl"
+            )),
+            PathBuf::from("/home/user/.omp/agent/agent.db"),
+            // Right depth, wrong extension: the .log and .md omp writes beside
+            // every transcript, and /proc's rendering of an unlinked transcript.
+            sessions_dir().join(format!(
+                "-Code-project/2026-08-30T00-00-00-000Z_{OMP_UUID}.log"
+            )),
+            sessions_dir().join(format!(
+                "-Code-project/2026-08-30T00-00-00-000Z_{OMP_UUID}.jsonl (deleted)"
+            )),
+            // Right place and extension, stem naming no session.
+            sessions_dir().join("-Code-project/notes.jsonl"),
+            sessions_dir().join("-Code-project/2026-08-30T00-00-00-000Z_not-a-uuid.jsonl"),
+        ];
+        let tree = FakeTree::new()
+            .with_environ(900, &SECRETS)
+            .with_open_files(900, &noise);
+        assert_eq!(resolve_pane_session(&tree, 900, sessions_dir()), None);
+    }
+
+    #[test]
+    fn two_different_open_sessions_are_refused_as_ambiguous() {
+        let tree = FakeTree::new()
+            .with_environ(1_000, &SECRETS)
+            .with_open_files(1_000, &[transcript(OMP_UUID), transcript(OTHER_UUID)]);
+        assert_eq!(resolve_pane_session(&tree, 1_000, sessions_dir()), None);
+    }
+
+    #[test]
+    fn the_same_transcript_open_twice_still_resolves() {
+        let tree = FakeTree::new()
+            .with_environ(1_100, &SECRETS)
+            .with_open_files(1_100, &[transcript(OMP_UUID), transcript(OMP_UUID)]);
+        assert_eq!(
+            resolve_pane_session(&tree, 1_100, sessions_dir()),
+            Some(OMP_UUID.to_string())
+        );
+    }
+
+    #[test]
+    fn two_agents_under_one_pane_are_refused_as_ambiguous() {
+        // A backgrounded harness beside a foreground one: env var in one process,
+        // an omp transcript in a sibling. BFS visit order is not an identity
+        // signal, so neither candidate may win.
+        let tree = FakeTree::new()
+            .with_children(1_200, &[1_201, 1_202])
+            .with_environ(1_200, &SECRETS)
+            .with_environ(1_201, &["OPENCODE_SESSION_ID=ses_background"])
+            .with_environ(1_202, &SECRETS)
+            .with_open_files(1_202, &[transcript(OMP_UUID)]);
+        assert_eq!(resolve_pane_session(&tree, 1_200, sessions_dir()), None);
+    }
+
+    #[test]
+    fn the_same_session_seen_in_two_processes_still_resolves() {
+        // A harness and its worker both carry the one identity: agreement is not
+        // ambiguity.
+        let tree = FakeTree::new()
+            .with_children(1_300, &[1_301, 1_302])
+            .with_environ(1_300, &SECRETS)
+            .with_open_files(1_301, &[transcript(OMP_UUID)])
+            .with_open_files(1_302, &[transcript(OMP_UUID)]);
+        assert_eq!(
+            resolve_pane_session(&tree, 1_300, sessions_dir()),
+            Some(OMP_UUID.to_string())
+        );
+    }
+
+    /// Pins [`ProcFs::open_file_paths`] against a real process: a transcript-shaped
+    /// file this test holds open **for writing** appears among its own readlinked
+    /// descriptors, and the same file held open read-only does not — a `less` or a
+    /// backup job reading a transcript is not the harness writing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_open_file_is_listed_through_proc_only_when_writable() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir
+            .path()
+            .join(format!("2026-08-30T16-55-24-400Z_{OMP_UUID}.jsonl"));
+        let held_writable = std::fs::File::create(&path).expect("create transcript");
+
+        let listed = ProcFs.open_file_paths(std::process::id());
+        assert!(
+            listed.contains(&path),
+            "writable transcript {path:?} not among {listed:?}"
+        );
+
+        drop(held_writable);
+        let _held_readonly = std::fs::File::open(&path).expect("reopen read-only");
+        let listed = ProcFs.open_file_paths(std::process::id());
+        assert!(
+            !listed.contains(&path),
+            "read-only transcript {path:?} must not be listed, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn fdinfo_flags_decide_writability() {
+        assert!(fdinfo_is_writable(
+            "pos:\t0\nflags:\t0100001\nmnt_id:\t29\n"
+        )); // O_WRONLY
+        assert!(fdinfo_is_writable("pos:\t0\nflags:\t02100002\n")); // O_RDWR | O_APPEND
+        assert!(!fdinfo_is_writable("pos:\t0\nflags:\t0100000\n")); // O_RDONLY
+        assert!(!fdinfo_is_writable("")); // unparseable fails closed
     }
 }
