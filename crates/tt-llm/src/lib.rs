@@ -14,7 +14,7 @@
 //! byte-identical prompt `The following tool was executed by the user`, and 566 distinct
 //! summaries between them. From the payload alone those 601 are one string.
 //!
-//! Three pieces make that work while keeping this crate free of internal dependencies
+//! Four pieces make that work while keeping this crate free of internal dependencies
 //! (see the dependency graph in the root `AGENTS.md`):
 //!
 //! - [`SessionDetail`] declares *what* may be fetched. This crate cannot read the
@@ -22,22 +22,22 @@
 //! - [`SessionTools`] binds a provider to an [`InjectionFilter`], and [`FetchSession`]
 //!   is one classification's budget. Every fetch passes through both, so neither the
 //!   live model nor a test can route around them.
-//! - The rig tools are a thin adapter over that session, which is why [`MockClassifier`]
-//!   — driving the same [`FetchSession`] from a scripted brain — exercises the same
-//!   budget and the same filter with no network.
+//! - [`ContextProvider`] declares read-only knowledge lookup. `tt-cli` implements it
+//!   over an optional operator-configured command, and [`ContextLookupSession`] gives it
+//!   an independent, bounded allowance.
+//! - The rig tools are thin adapters over those sessions, which is why
+//!   [`MockClassifier`] can drive their budgets from a scripted brain without a network.
 //!
-//! Fetching is bounded ([`MAX_FETCH_CALLS`]), filtered, and optional: a payload that
-//! already names the work costs exactly what it cost before.
+//! Session fetching is filtered; both tool families are bounded and optional. A classifier
+//! without a context provider retains the exact prompt and tool set it had before lookup
+//! support was added.
 //!
-//! The bound is enforced twice, and the second half was missing at first. Inside a turn,
-//! a call past the budget answers [`FetchOutcome::BudgetExhausted`]. Between turns, the
-//! tools are withdrawn from the request entirely. Only the first existed to begin with,
-//! and it is a tool *result* rather than a stop: the model read it, called again anyway,
-//! and each extra call spent one of rig's `max_turns` until the run hard-errored as
-//! `MaxTurnsError`. On a live daemon that read `classifier_last_error: PromptError:
-//! MaxTurnsError: reached max turns` with four consecutive failures behind it, and the
-//! backoff those failures armed had cut the drain from 1.67 to 0.17 classifications a
-//! minute against a 3,900-session backlog.
+//! Each bound is enforced twice. Inside a turn, a call past its allowance answers
+//! [`FetchOutcome::BudgetExhausted`] or [`ContextOutcome::BudgetExhausted`]. Between turns,
+//! the spent tools are withdrawn from the request entirely. A tool result is not itself a
+//! stop: the model can read it and call an advertised tool again, spending rig model turns
+//! until the run hard-errors as `MaxTurnsError`. Withdrawing it makes the budget a property
+//! of the request rather than advice the model may decline.
 //!
 //! # The roster is a selection, and reuse is the default
 //!
@@ -129,7 +129,7 @@
 //! | bound | scope | value |
 //! |---|---|---|
 //! | `REQUEST_TIMEOUT` | one HTTP request | 120 s |
-//! | `MAX_MODEL_TURNS` | requests per attempt | 6 |
+//! | `MAX_MODEL_TURNS` | requests per attempt | 10 |
 //! | `transport::MAX_CLASSIFICATION_MS` | wall clock per classification | 300 s |
 //!
 //! The middle row is why the outer one is needed: bounding a request does not bound a
@@ -197,8 +197,17 @@
 /// falsehood about its own inputs, which is exactly the case this constant exists to
 /// re-open: the tools are now withheld for a sessionless scope, and each of those
 /// questions is asked once more without the lie.
-pub const CLASSIFIER_GENERATION: u32 = 3;
+///
+/// ## 3 -> 4: optional knowledge lookup and stricter initiative names
+///
+/// An operator-configured provider gives an agent up to four read-only lookups to resolve
+/// unfamiliar people, organizations, projects, and codenames. Its prompt also tightens stream
+/// taxonomy around one initiative and reuse of the existing roster. Both changes can turn a
+/// previously refused question into a placement, so every queued proposal is asked once more
+/// with this generation.
+pub const CLASSIFIER_GENERATION: u32 = 4;
 
+mod context_provider;
 mod fetch;
 mod prompt;
 mod rig_classifier;
@@ -207,6 +216,10 @@ mod session_detail;
 mod transport;
 mod types;
 
+pub use context_provider::{
+    ContextLookupOutcome, ContextLookupRequest, ContextLookupSession, ContextProvider,
+    ContextProviderError, ContextProviderTools, MAX_CONTEXT_LOOKUP_CALLS,
+};
 pub use fetch::{
     FetchOutcome, FetchRequest, FetchSession, InjectionFilter, MAX_FETCH_CALLS,
     MAX_MESSAGES_PER_PAGE, SessionTools,

@@ -202,7 +202,7 @@ fn by_session(answers: Vec<(&str, Result<ClassificationOutput, LlmError>)>) -> M
             .collect(),
     );
     MockClassifier {
-        brain: Some(Box::new(move |input, _fetch| {
+        brain: Some(Box::new(move |input, _fetch, _context| {
             answers
                 .lock()
                 .unwrap()
@@ -225,7 +225,7 @@ fn by_session(answers: Vec<(&str, Result<ClassificationOutput, LlmError>)>) -> M
 /// order the calls arrive in.
 fn always(choice: StreamChoice, confidence: f64) -> MockClassifier {
     MockClassifier {
-        brain: Some(Box::new(move |_input, _fetch| {
+        brain: Some(Box::new(move |_input, _fetch, _context| {
             Ok(ClassificationOutput {
                 choice: choice.clone(),
                 confidence,
@@ -1074,7 +1074,7 @@ fn a_session_started_today_is_classified_before_one_from_last_month() {
     // The first chunk's answers name one stream and everything after it names another.
     let calls = AtomicUsize::new(0);
     let classifier = MockClassifier {
-        brain: Some(Box::new(move |_input, _fetch| {
+        brain: Some(Box::new(move |_input, _fetch, _context| {
             let stream_id = if calls.fetch_add(1, Ordering::Relaxed) < CLASSIFY_CONCURRENCY {
                 "stream-first"
             } else {
@@ -1157,7 +1157,7 @@ fn a_chunks_calls_all_run_at_the_same_time() {
     let classifier = MockClassifier {
         brain: Some(Box::new({
             let arrivals = Arc::clone(&arrivals);
-            move |_input, _fetch| {
+            move |_input, _fetch, _context| {
                 if !every_call_arrived(&arrivals) {
                     return Err(LlmError::Api("call ran alone".to_string()));
                 }
@@ -1285,7 +1285,7 @@ fn a_panicking_worker_costs_its_own_session_and_no_other() {
     insert_dated_session(&db, "panicking", timestamp(10));
     insert_dated_session(&db, "third", timestamp(20));
     let classifier = MockClassifier {
-        brain: Some(Box::new(|input, _fetch| {
+        brain: Some(Box::new(|input, _fetch, _context| {
             assert_ne!(input.session_id, "panicking", "deliberate test panic");
             Ok(ClassificationOutput {
                 choice: StreamChoice::Existing {

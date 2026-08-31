@@ -37,6 +37,7 @@ use resolver::Resolver;
 use target::AssignmentTarget;
 use window_runs::{build_unassigned_window_runs, newest_first};
 
+pub mod context_provider;
 mod resolver;
 pub mod session_detail;
 mod target;

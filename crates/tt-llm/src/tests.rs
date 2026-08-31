@@ -12,9 +12,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
-    ClassificationInput, ClassificationOutput, Classifier, FetchOutcome, FetchRequest, LlmError,
-    MAX_FETCH_CALLS, MessagePage, MockBrain, MockClassifier, SessionDetail, SessionDetailError,
-    SessionOverview, SessionTools, StreamChoice,
+    ClassificationInput, ClassificationOutput, Classifier, ContextLookupOutcome,
+    ContextLookupRequest, ContextProvider, ContextProviderError, ContextProviderTools,
+    FetchOutcome, FetchRequest, LlmError, MAX_CONTEXT_LOOKUP_CALLS, MAX_FETCH_CALLS, MessagePage,
+    MockBrain, MockClassifier, SessionDetail, SessionDetailError, SessionOverview, SessionTools,
+    StreamChoice,
 };
 
 /// A session the classifier can look into, counting every read.
@@ -64,6 +66,19 @@ impl SessionDetail for FakeSession {
     }
 }
 
+/// A context provider whose reads are observable.
+#[derive(Default)]
+struct FakeContextProvider {
+    lookups: AtomicUsize,
+}
+
+impl ContextProvider for FakeContextProvider {
+    fn lookup(&self, _query: &str) -> Result<String, ContextProviderError> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        Ok("Apollo is the customer migration program".to_owned())
+    }
+}
+
 fn is_injected(message: &str) -> bool {
     message.trim_start().starts_with("<system-reminder>")
 }
@@ -85,7 +100,7 @@ const CANNOT_DETERMINE: f64 = 0.1;
 /// terminates the moment the subject appears. It deliberately tries more times than
 /// the budget allows, so a test can tell the budget apart from the loop bound.
 fn keyword_brain() -> MockBrain {
-    Box::new(|input, session| {
+    Box::new(|input, session, _context| {
         let mut seen = visible_text(input);
         let mut next_offset = 0;
         for attempt in 0..MAX_FETCH_CALLS + 3 {
@@ -115,6 +130,25 @@ fn keyword_brain() -> MockBrain {
             return Ok(verdict(STREAM, 0.9));
         }
         Ok(verdict("", CANNOT_DETERMINE))
+    })
+}
+
+/// Decides from context lookup only when the real classifier would offer that tool.
+fn context_lookup_brain() -> MockBrain {
+    Box::new(|_input, _session, context_lookup| {
+        let Some(context_lookup) = context_lookup else {
+            return Ok(verdict("", CANNOT_DETERMINE));
+        };
+        match context_lookup.dispatch(&ContextLookupRequest {
+            query: "Apollo".to_owned(),
+        }) {
+            ContextLookupOutcome::Fetched(text) if text.contains("Apollo") => {
+                Ok(verdict("apollo", 0.9))
+            }
+            ContextLookupOutcome::Fetched(_)
+            | ContextLookupOutcome::BudgetExhausted
+            | ContextLookupOutcome::Unavailable(_) => Ok(verdict("", CANNOT_DETERMINE)),
+        }
     })
 }
 
@@ -165,6 +199,75 @@ fn input(starting_prompt: &str) -> ClassificationInput {
         window_titles: Vec::new(),
         started_at: None,
     }
+}
+
+#[test]
+fn context_lookup_budget_stops_cleanly_after_its_own_limit() {
+    // Given: a provider that records every lookup it is allowed to answer.
+    let provider = Arc::new(FakeContextProvider::default());
+    let session =
+        ContextProviderTools::new(Arc::clone(&provider) as Arc<dyn ContextProvider>).begin();
+    let request = ContextLookupRequest {
+        query: "Apollo".to_owned(),
+    };
+
+    // When: the classifier spends the entire lookup allowance, then asks once more.
+    let served: Vec<_> = (0..MAX_CONTEXT_LOOKUP_CALLS)
+        .map(|_| session.dispatch(&request))
+        .collect();
+    let over_budget = session.dispatch(&request);
+
+    // Then: the final call is a clean tool response, not a classification error, and
+    // the provider is not asked past the limit.
+    assert!(
+        served
+            .iter()
+            .all(|outcome| matches!(outcome, ContextLookupOutcome::Fetched(_))),
+        "calls inside the context-lookup budget must be served: {served:?}"
+    );
+    assert_eq!(over_budget, ContextLookupOutcome::BudgetExhausted);
+    assert_eq!(
+        provider.lookups.load(Ordering::SeqCst),
+        MAX_CONTEXT_LOOKUP_CALLS
+    );
+    assert_eq!(session.calls_used(), MAX_CONTEXT_LOOKUP_CALLS);
+}
+
+#[test]
+fn mock_context_lookup_is_offered_only_when_a_provider_is_wired() {
+    // Given: a sessionless scope — external knowledge is still meaningful here — and a
+    // provider whose result identifies the initiative.
+    let provider = Arc::new(FakeContextProvider::default());
+    let configured = MockClassifier {
+        brain: Some(context_lookup_brain()),
+        context_provider: Some(ContextProviderTools::new(
+            Arc::clone(&provider) as Arc<dyn ContextProvider>
+        )),
+        ..MockClassifier::default()
+    };
+    let no_provider = MockClassifier {
+        brain: Some(context_lookup_brain()),
+        ..MockClassifier::default()
+    };
+    let window_run = ClassificationInput {
+        has_session: false,
+        ..input("unfamiliar project codename")
+    };
+
+    // When
+    let configured_output = configured.classify(&window_run, &[]).unwrap();
+    let unconfigured_output = no_provider.classify(&window_run, &[]).unwrap();
+
+    // Then: the mock follows `RigClassifier`'s provider gate. It never invents a fake
+    // unavailable lookup session, and it still offers real context on a sessionless run.
+    assert_eq!(
+        configured_output.choice,
+        StreamChoice::Existing {
+            stream_id: "apollo".to_owned(),
+        }
+    );
+    assert_eq!(provider.lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(unconfigured_output.choice, StreamChoice::Undetermined);
 }
 
 /// Test 1, control arm: the payload alone genuinely cannot answer this.

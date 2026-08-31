@@ -83,7 +83,27 @@ pub const ROSTER_LIMIT: usize = 200;
 /// clause does that; the rest is detail the model does not need to match on.
 pub const ROSTER_DESCRIPTION_BUDGET: usize = 160;
 
+/// Builds the classifier prompt without optional context lookup.
+///
+/// This is intentionally the original rendering path: without a context provider, both
+/// the prompt bytes and available tools stay exactly as they were before lookup support.
 pub fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
+    build_inner(input, roster, false)
+}
+
+/// Builds the classifier prompt for an agent with a context provider.
+pub fn build_with_context_provider(
+    input: &ClassificationInput,
+    roster: &[StreamSummary],
+) -> String {
+    build_inner(input, roster, true)
+}
+
+fn build_inner(
+    input: &ClassificationInput,
+    roster: &[StreamSummary],
+    has_context_provider: bool,
+) -> String {
     let mut prompt = String::new();
     let _ = writeln!(prompt, "Session ID: {}", input.session_id);
     append_option(&mut prompt, "Machine", input.machine.as_deref());
@@ -128,7 +148,24 @@ pub fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
          Whenever you can identify the work, name a choice even when you are unsure of it, \
          and say how sure you are in confidence. Confidence must be within 0..1."
     );
+    if has_context_provider {
+        append_context_lookup_grounding(&mut prompt);
+    }
+
     prompt
+}
+
+fn append_context_lookup_grounding(prompt: &mut String) {
+    let _ = writeln!(
+        prompt,
+        "Grounding and stream taxonomy: You MAY resolve unfamiliar people, organizations, \
+         projects, codenames, and their relationships through an operator-configured knowledge \
+         lookup before choosing. A stream names ONE initiative: a deliverable, customer, or \
+         program. NEVER name a stream after a session, a dispatch mechanism, an activity \
+         (navigation, ops, admin, coordination, or meetings), a date range, or a catch-all. \
+         Name a stream \"A + B\" only when A and B are facets of one deliverable. Strongly \
+         prefer reusing an existing roster stream over minting a near-duplicate."
+    );
 }
 
 /// Writes the streams the model may choose from, closest to the session's moment first.
@@ -205,7 +242,7 @@ fn append_option(prompt: &mut String, label: &str, value: Option<&str>) {
 mod tests {
     use chrono::Utc;
 
-    use super::{ROSTER_DESCRIPTION_BUDGET, ROSTER_LIMIT, build};
+    use super::{ROSTER_DESCRIPTION_BUDGET, ROSTER_LIMIT, build, build_with_context_provider};
     use crate::{ClassificationInput, StreamSummary};
 
     fn at(minutes: i64) -> chrono::DateTime<Utc> {
@@ -578,5 +615,24 @@ mod tests {
         let lowered = prompt.to_lowercase();
         assert!(lowered.contains("closest to this session"));
         assert!(lowered.contains("not every stream"));
+    }
+
+    #[test]
+    fn context_lookup_is_the_only_prompt_change_when_a_provider_is_wired() {
+        // Given: identical classification evidence, with and without the optional
+        // provider. Leaving it unwired must retain the byte-for-byte prompt that was
+        // already in production.
+        let input = input(vec!["Identify the customer for project Apollo".to_owned()]);
+        let roster = roster();
+
+        // When / Then
+        insta::assert_snapshot!(
+            "classification_prompt_without_context_provider",
+            build(&input, &roster)
+        );
+        insta::assert_snapshot!(
+            "classification_prompt_with_context_provider",
+            build_with_context_provider(&input, &roster)
+        );
     }
 }

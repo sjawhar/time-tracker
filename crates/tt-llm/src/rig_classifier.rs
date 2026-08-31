@@ -7,11 +7,17 @@ use rig_core::completion::CompletionModel;
 use rig_core::completion::request::{PromptError, StructuredOutputError, TypedPrompt};
 use rig_core::extractor::ExtractionError;
 use rig_core::providers::anthropic;
+use rig_core::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::context_provider::{
+    ContextLookupSession, ContextProviderTools, MAX_CONTEXT_LOOKUP_CALLS,
+};
 use crate::fetch::{FetchSession, MAX_FETCH_CALLS, SessionTools};
-use crate::rig_tools::{MessagesTool, OverviewTool, preamble};
+use crate::rig_tools::{
+    ContextLookupTool, MessagesTool, OverviewTool, preamble, preamble_with_context_lookup,
+};
 use crate::transport::{AttemptFailure, HttpFailure, MAX_CLASSIFICATION_MS, retrying};
 use crate::{
     ClassificationExtract, ClassificationInput, ClassificationOutput, Classifier, LlmError,
@@ -43,66 +49,90 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Model calls one classification *attempt* may make.
 ///
-/// Six: one per fetch the budget allows, one to answer with, and one spare. The
-/// accounting is what makes the spare enough rather than a guess. A turn ends either by
-/// calling tools — which spends at least one fetch, since Anthropic may pack several
-/// calls into a single turn — or by answering, which ends the run. So the longest
-/// honest attempt is [`MAX_FETCH_CALLS`] tool turns plus the turn that answers: five.
+/// Ten: one turn for every session fetch and context lookup the two independent budgets
+/// allow, one to answer with, and one spare. A turn ends either by calling tools — which
+/// spends at least one call from one budget, since Anthropic may pack several calls into a
+/// turn — or by answering, which ends the run. So the longest honest attempt consumes both
+/// allowances and then answers.
 ///
-/// The spare used to be the only thing between an over-fetching model and rig's hard
-/// `MaxTurnsError`, and it was not enough. An exhausted fetch budget answered with
-/// *text* ([`crate::FetchOutcome::BudgetExhausted`]), which the model was free to read
-/// and then call again anyway; that call spent the spare, the next one crossed the
-/// bound, and the run errored. [`WithdrawSpentTools`] removes the possibility rather
-/// than paying for it: once the budget is spent the request advertises no tools at all,
-/// so the spare can no longer be spent on a fetch and is left for a turn rig consumes
-/// for reasons of its own. Raising the bound instead would have bought the same
-/// non-answer for more model calls.
+/// A tool budget's exhausted response is text, not a stop: a model can read it and call an
+/// advertised tool again. [`WithdrawSpentTools`] removes each spent tool family from the next
+/// request instead, preserving the spare for rig's own turn accounting rather than buying a
+/// non-answer with more model calls.
 ///
-/// Per attempt, not per classification: a retry is a fresh conversation with a fresh
-/// fetch budget, so the bounds in [`crate::transport`] decide how many of these a
+/// Per attempt, not per classification: a retry is a fresh conversation with fresh session
+/// and context budgets, so the bounds in [`crate::transport`] decide how many of these a
 /// single classification can cost.
-const MAX_MODEL_TURNS: usize = MAX_FETCH_CALLS + 2;
+const MAX_MODEL_TURNS: usize = MAX_FETCH_CALLS + MAX_CONTEXT_LOOKUP_CALLS + 2;
 
-/// The turn bound has to leave room for the whole fetch budget and the turn that answers.
+/// The turn bound has to leave room for both whole tool budgets and the turn that answers.
 ///
-/// A compile error rather than a test, because it is a property of two constants and not
-/// of any run: below this a model that spends its budget can never speak, and the only
-/// thing it could then produce is the `MaxTurnsError` all of the above exists to prevent.
-const _: () = assert!(MAX_MODEL_TURNS > MAX_FETCH_CALLS);
+/// A compile error rather than a test, because it is a property of constants and not of any
+/// run: below this a model that spends both budgets can never speak, and the only thing it
+/// could then produce is the `MaxTurnsError` all of the above exists to prevent.
+const _: () = assert!(MAX_MODEL_TURNS > MAX_FETCH_CALLS + MAX_CONTEXT_LOOKUP_CALLS);
 
-/// Withdraws the fetch tools from every turn after the budget is spent.
+/// Withdraws every spent tool family from the next model turn.
 ///
-/// The fetch budget's own stop is a *tool result*, not a stop: the model reads
-/// [`crate::FetchOutcome::BudgetExhausted`], sees the same two tools still advertised,
-/// and calls one again. Each such call spends a model turn until rig's own backstop
-/// raises `MaxTurnsError` — which is how a live daemon came to read
-/// `classifier_last_error: PromptError: MaxTurnsError: reached max turns` with four
-/// consecutive failures behind it. Mapping that error to a verdict-less outcome stops
-/// it throttling the drain; this stops it happening.
+/// A budget's own stop is a *tool result*, not a stop: the model can read
+/// [`crate::FetchOutcome::BudgetExhausted`] or [`crate::ContextOutcome::BudgetExhausted`],
+/// see the same tool still advertised, and call it again. rig resolves the advertised tool
+/// set per turn from a [`StepEvent::CompletionCall`] hook's [`RequestPatch`], so removing
+/// names makes the budget a property of the request rather than advice the model may decline.
 ///
-/// rig resolves the advertised tool set per turn from a [`StepEvent::CompletionCall`]
-/// hook's [`RequestPatch`], and the Anthropic request omits `tools` altogether when the
-/// set is empty — so a spent budget stops being advice the model may decline and
-/// becomes a property of the request it cannot see around. The in-process guard in
-/// [`FetchSession::dispatch`] stays: a single turn may still emit several tool calls at
-/// once, and the last of those can still cross the budget.
-///
-/// No `tool_choice` is patched alongside it. The agent sets none, so the empty
-/// allow-list simply advertises nothing; naming a tool choice here would make rig fail
-/// the request closed against the very tools this withdraws.
+/// The in-process guards remain necessary: one turn can emit several tool calls, and the
+/// final one can cross a budget before the following turn sees this hook. No `tool_choice`
+/// is patched alongside the allow-list; the agent sets none, so an empty list advertises
+/// nothing without making rig fail a request closed against the tools it withdraws.
 struct WithdrawSpentTools {
-    session: Arc<FetchSession>,
+    session: Option<Arc<FetchSession>>,
+    context_lookup: Option<Arc<ContextLookupSession>>,
 }
 
 impl WithdrawSpentTools {
-    /// Whether this turn's request must advertise no tools.
+    const fn new(
+        session: Option<Arc<FetchSession>>,
+        context_lookup: Option<Arc<ContextLookupSession>>,
+    ) -> Self {
+        Self {
+            session,
+            context_lookup,
+        }
+    }
+
+    /// Active names to put into the next request after a budget is spent.
     ///
-    /// The whole decision, kept out of [`AgentHook::on_event`] because rig's
-    /// `HookContext` has no public constructor, so this is the only surface a test can
-    /// hold the gate against.
+    /// `None` leaves rig's original tool set untouched. The vector is structural: a spent
+    /// tool no longer appears in the provider request, rather than merely telling the model
+    /// it ought not call it.
+    fn active_tools(&self) -> Option<Vec<String>> {
+        let session_spent = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.calls_used() >= MAX_FETCH_CALLS);
+        let context_lookup_spent = self
+            .context_lookup
+            .as_ref()
+            .is_some_and(|session| session.calls_used() >= MAX_CONTEXT_LOOKUP_CALLS);
+        if !session_spent && !context_lookup_spent {
+            return None;
+        }
+
+        let mut active = Vec::with_capacity(3);
+        if self.session.is_some() && !session_spent {
+            active.push(OverviewTool::NAME.to_owned());
+            active.push(MessagesTool::NAME.to_owned());
+        }
+        if self.context_lookup.is_some() && !context_lookup_spent {
+            active.push(ContextLookupTool::NAME.to_owned());
+        }
+        Some(active)
+    }
+
+    /// Whether any budget changes the next request's tool allow-list.
+    #[cfg(test)]
     fn withdraws(&self) -> bool {
-        self.session.calls_used() >= MAX_FETCH_CALLS
+        self.active_tools().is_some()
     }
 }
 
@@ -110,12 +140,15 @@ impl<M> AgentHook<M> for WithdrawSpentTools
 where
     M: CompletionModel,
 {
-    // The trait requires `async fn`; clippy 1.98 flags the missing .await.
-    #[allow(unknown_lints)] // older local clippy predates the 1.98 lint below
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
-        if matches!(event, StepEvent::CompletionCall { .. }) && self.withdraws() {
-            return Flow::patch_request(RequestPatch::new().active_tools(Vec::<String>::new()));
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "rig's AgentHook trait requires async even though this hook only patches"
+    )]
+    async fn on_event(&self, _hook_context: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        if matches!(event, StepEvent::CompletionCall { .. })
+            && let Some(active_tools) = self.active_tools()
+        {
+            return Flow::patch_request(RequestPatch::new().active_tools(active_tools));
         }
         Flow::cont()
     }
@@ -244,7 +277,8 @@ pub struct RigClassifier {
     client: anthropic::Client,
     model: String,
     runtime: tokio::runtime::Runtime,
-    tools: Option<Arc<SessionTools>>,
+    session_tools: Option<Arc<SessionTools>>,
+    context_provider: Option<Arc<ContextProviderTools>>,
 }
 
 impl RigClassifier {
@@ -259,7 +293,8 @@ impl RigClassifier {
             client,
             model: model.to_owned(),
             runtime,
-            tools: None,
+            session_tools: None,
+            context_provider: None,
         })
     }
 
@@ -270,54 +305,108 @@ impl RigClassifier {
     /// resolve instead of a guess it has to make.
     #[must_use]
     pub fn with_session_detail(mut self, tools: Arc<SessionTools>) -> Self {
-        self.tools = Some(tools);
+        self.session_tools = Some(tools);
         self
     }
 
-    /// Runs one classification, with the fetch tools registered when available.
+    /// Lets the classifier resolve unfamiliar terms through optional external knowledge.
+    ///
+    /// Without this, the prompt and tool set are identical to the session-detail-only
+    /// classifier; with it, the model gains one read-only `context_lookup` tool and an
+    /// independent budget.
+    #[must_use]
+    pub fn with_context_provider(mut self, provider: Arc<ContextProviderTools>) -> Self {
+        self.context_provider = Some(provider);
+        self
+    }
+
+    /// Runs one classification with whichever optional tool families are available.
     fn classify_with_tools(
         &self,
         input: &ClassificationInput,
         roster: &[StreamSummary],
     ) -> Result<ClassificationOutput, LlmError> {
-        let prompt = prompt::build(input, roster);
-        // No provider configured, or nothing for one to read. A scope with no session must
-        // not be offered the session-fetch tools: the preamble would promise it may "look
-        // further into the session", the model would call a tool that cannot succeed, and
-        // `SessionDetail` would answer `is not indexed` -- which reads as a broken system
-        // rather than as a scope that never had a session. Measured live, that reached 161
-        // of 518 pending proposals, all window-scoped, averaging 0.491 confidence against
-        // 0.597 for the rest of the queue. Withholding the tools is the same remedy
-        // `WithdrawSpentTools` applies to a spent budget: stop the model rather than inform
-        // it, because a tool it can see is a tool it will call.
-        let Some(tools) = self.tools.as_ref().filter(|_| input.has_session) else {
-            return self.extract::<ClassificationExtract>(&prompt)?.try_into();
+        // A window run has no session by design. It must never be offered session tools:
+        // those would report `not indexed`, which reads as a broken system rather than a
+        // scope that never had a session. Context lookup is independent of that scope and
+        // remains available when configured.
+        let session_tools = self.session_tools.as_ref().filter(|_| input.has_session);
+        let context_provider = self.context_provider.as_ref();
+        let prompt = if context_provider.is_some() {
+            prompt::build_with_context_provider(input, roster)
+        } else {
+            prompt::build(input, roster)
         };
+        if session_tools.is_none() && context_provider.is_none() {
+            return self.extract::<ClassificationExtract>(&prompt)?.try_into();
+        }
+
         let attempt = retrying(
             |remaining| {
-                // A fresh budget per attempt, not per classification: rig starts a new
-                // conversation each time, so a retry remembers nothing the previous
-                // attempt fetched. Reusing a spent budget would make the retry blind
+                // Rig starts a fresh conversation for a retry, so every attempt also gets
+                // fresh independent budgets. Reusing a spent one would make a retry blind
                 // while costing the same bounded `MAX_MODEL_TURNS` round trips.
-                let session = tools.begin(&input.session_id);
-                let agent = self
-                    .client
-                    .agent(&self.model)
-                    .preamble(&preamble())
-                    .tool(OverviewTool::new(Arc::clone(&session)))
-                    .tool(MessagesTool::new(Arc::clone(&session)))
-                    .build();
-                attempted(
-                    self.within(
-                        remaining,
-                        std::future::IntoFuture::into_future(
-                            agent
-                                .prompt_typed::<ClassificationExtract>(prompt.clone())
-                                .max_turns(MAX_MODEL_TURNS)
-                                .add_hook(WithdrawSpentTools { session }),
-                        ),
-                    )?,
-                )
+                let session = session_tools.map(|tools| tools.begin(&input.session_id));
+                let context_lookup = context_provider.map(ContextProviderTools::begin);
+                let hook = WithdrawSpentTools::new(session.clone(), context_lookup.clone());
+                let result = match (&session, &context_lookup) {
+                    (Some(session), Some(context_lookup)) => {
+                        let agent = self
+                            .client
+                            .agent(&self.model)
+                            .preamble(&preamble_with_context_lookup(true))
+                            .tool(OverviewTool::new(Arc::clone(session)))
+                            .tool(MessagesTool::new(Arc::clone(session)))
+                            .tool(ContextLookupTool::new(Arc::clone(context_lookup)))
+                            .build();
+                        self.within(
+                            remaining,
+                            std::future::IntoFuture::into_future(
+                                agent
+                                    .prompt_typed::<ClassificationExtract>(prompt.clone())
+                                    .max_turns(MAX_MODEL_TURNS)
+                                    .add_hook(hook),
+                            ),
+                        )
+                    }
+                    (Some(session), None) => {
+                        let agent = self
+                            .client
+                            .agent(&self.model)
+                            .preamble(&preamble())
+                            .tool(OverviewTool::new(Arc::clone(session)))
+                            .tool(MessagesTool::new(Arc::clone(session)))
+                            .build();
+                        self.within(
+                            remaining,
+                            std::future::IntoFuture::into_future(
+                                agent
+                                    .prompt_typed::<ClassificationExtract>(prompt.clone())
+                                    .max_turns(MAX_MODEL_TURNS)
+                                    .add_hook(hook),
+                            ),
+                        )
+                    }
+                    (None, Some(context_lookup)) => {
+                        let agent = self
+                            .client
+                            .agent(&self.model)
+                            .preamble(&preamble_with_context_lookup(false))
+                            .tool(ContextLookupTool::new(Arc::clone(context_lookup)))
+                            .build();
+                        self.within(
+                            remaining,
+                            std::future::IntoFuture::into_future(
+                                agent
+                                    .prompt_typed::<ClassificationExtract>(prompt.clone())
+                                    .max_turns(MAX_MODEL_TURNS)
+                                    .add_hook(hook),
+                            ),
+                        )
+                    }
+                    (None, None) => unreachable!("tool-less classifications returned before retry"),
+                };
+                attempted(result?)
             },
             std::thread::sleep,
         )?;
@@ -432,8 +521,9 @@ mod tests {
     use crate::fetch::{FetchRequest, SessionTools};
     use crate::transport::{MAX_TOTAL_BACKOFF_MS, MAX_TRANSPORT_RETRIES};
     use crate::{
-        ClassificationExtract, ClassificationInput, Classifier, LlmError, RigClassifier,
-        StreamSummary,
+        ClassificationExtract, ClassificationInput, Classifier, ContextLookupRequest,
+        ContextProvider, ContextProviderError, ContextProviderTools, LlmError,
+        MAX_CONTEXT_LOOKUP_CALLS, RigClassifier, StreamSummary,
     };
 
     fn deserialization_error() -> serde_json::Error {
@@ -629,13 +719,64 @@ mod tests {
     ///
     /// Built as the variant rather than as a rendered string, because the whole point
     /// is that the outcome is read structurally: `MaxTurnsError: reached max turns
-    /// limit: 6` is rig's prose to reword.
+    /// limit: 10` is rig's prose to reword.
     fn turn_budget_exhausted() -> StructuredOutputError {
         StructuredOutputError::PromptError(Box::new(PromptError::MaxTurnsError {
             max_turns: MAX_MODEL_TURNS,
             chat_history: Box::new(Vec::new()),
             prompt: Box::new("classify this session".into()),
         }))
+    }
+
+    struct UnavailableContextProvider;
+
+    impl ContextProvider for UnavailableContextProvider {
+        fn lookup(&self, _query: &str) -> Result<String, ContextProviderError> {
+            Err(ContextProviderError::Backend(
+                "test provider unavailable".to_owned(),
+            ))
+        }
+    }
+
+    /// A gate over a context-lookup budget that has served `spent` calls.
+    fn context_lookup_gate_after(spent: usize) -> WithdrawSpentTools {
+        let provider = ContextProviderTools::new(std::sync::Arc::new(UnavailableContextProvider));
+        let session = provider.begin();
+        for _ in 0..spent {
+            session.dispatch(&ContextLookupRequest {
+                query: "Apollo".to_owned(),
+            });
+        }
+        WithdrawSpentTools::new(None, Some(session))
+    }
+
+    #[test]
+    fn a_spent_context_lookup_budget_withdraws_only_that_tool_from_the_next_request() {
+        // Given: session fetches still have room, while context lookups are spent.
+        let session = SessionTools::unavailable().begin("ses-1");
+        let context_lookup =
+            ContextProviderTools::new(std::sync::Arc::new(UnavailableContextProvider)).begin();
+        for _ in 0..MAX_CONTEXT_LOOKUP_CALLS {
+            context_lookup.dispatch(&ContextLookupRequest {
+                query: "Apollo".to_owned(),
+            });
+        }
+        let gate = WithdrawSpentTools::new(Some(session), Some(context_lookup));
+
+        // Then: this is the request's actual allow-list, not prose that merely asks the
+        // model not to call the lookup again. Session tools remain available.
+        assert_eq!(
+            gate.active_tools(),
+            Some(vec![
+                "session_overview".to_owned(),
+                "session_messages".to_owned(),
+            ])
+        );
+        assert_eq!(context_lookup_gate_after(0).active_tools(), None);
+        assert_eq!(
+            context_lookup_gate_after(MAX_CONTEXT_LOOKUP_CALLS).active_tools(),
+            Some(Vec::new())
+        );
     }
 
     /// A gate over a budget that has served `spent` calls.
@@ -649,7 +790,7 @@ mod tests {
                 session_id: "ses-1".to_owned(),
             });
         }
-        WithdrawSpentTools { session }
+        WithdrawSpentTools::new(Some(session), None)
     }
 
     #[test]
@@ -953,7 +1094,8 @@ mod tests {
             client,
             model: "claude-haiku-4-5".to_owned(),
             runtime: tokio::runtime::Runtime::new().expect("a runtime is buildable"),
-            tools: None,
+            session_tools: None,
+            context_provider: None,
         }
     }
 

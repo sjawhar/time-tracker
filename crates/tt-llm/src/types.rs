@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::context_provider::{ContextLookupRequest, ContextLookupSession, ContextProviderTools};
 use crate::fetch::{FetchRequest, FetchSession, SessionTools};
 use crate::transport::HttpFailure;
 
@@ -230,16 +231,18 @@ pub trait Classifier: Send + Sync {
     fn describe_stream(&self, evidence: &str) -> Result<String, LlmError>;
 }
 
-/// A scripted stand-in for a model, including its decision to fetch.
+/// A scripted stand-in for a model, including its decisions to fetch and look up knowledge.
 ///
-/// A [`brain`](MockClassifier::brain) turns this from a canned answer into a real
-/// agentic loop: it sees the payload, may spend the fetch budget through the same
-/// [`FetchSession`] the live model uses, and answers from whatever it ends up seeing.
-/// That is what lets a test prove fetching *changed* a verdict without a network call.
-/// Leave it unset and the classifier behaves exactly as before, popping
-/// [`scripted`](MockClassifier::scripted).
+/// A [`brain`](MockClassifier::brain) sees the same session and context-lookup budgets a live
+/// classifier would expose. The context argument is `None` without a configured provider,
+/// exactly matching `RigClassifier`: it is not a fake unavailable tool that a model can waste
+/// a turn on. Leave a brain unset to retain the older scripted-answer behavior.
 pub type MockBrain = Box<
-    dyn Fn(&ClassificationInput, &FetchSession) -> Result<ClassificationOutput, LlmError>
+    dyn Fn(
+            &ClassificationInput,
+            &FetchSession,
+            Option<&ContextLookupSession>,
+        ) -> Result<ClassificationOutput, LlmError>
         + Send
         + Sync,
 >;
@@ -249,11 +252,15 @@ pub struct MockClassifier {
     pub descriptions: Mutex<VecDeque<Result<String, LlmError>>>,
     /// How this mock decides, when it is allowed to look further than the payload.
     pub brain: Option<MockBrain>,
-    /// What it may look at. When unset, every fetch reports itself unavailable, which
-    /// is the control arm for "could the payload alone have answered this?".
+    /// What it may read from a session. A sessionless scope gets an unavailable session
+    /// budget, preserving the established mock control arm.
     pub tools: Option<Arc<SessionTools>>,
-    /// Requests the last classification actually served, in order.
+    /// Optional context provider. Its budget is withheld entirely when no provider is wired.
+    pub context_provider: Option<Arc<ContextProviderTools>>,
+    /// Session requests the last classification actually served, in order.
     pub fetches: Mutex<Vec<FetchRequest>>,
+    /// Context lookup requests the last classification actually served, in order.
+    pub context_lookups: Mutex<Vec<ContextLookupRequest>>,
 }
 
 impl Default for MockClassifier {
@@ -263,13 +270,15 @@ impl Default for MockClassifier {
             descriptions: Mutex::new(VecDeque::new()),
             brain: None,
             tools: None,
+            context_provider: None,
             fetches: Mutex::new(Vec::new()),
+            context_lookups: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl MockClassifier {
-    /// Requests the last classification served.
+    /// Session requests the last classification served.
     #[must_use]
     pub fn fetches(&self) -> Vec<FetchRequest> {
         self.fetches
@@ -277,8 +286,16 @@ impl MockClassifier {
             .map(|fetches| fetches.clone())
             .unwrap_or_default()
     }
-}
 
+    /// Context lookup requests the last classification served.
+    #[must_use]
+    pub fn context_lookups(&self) -> Vec<ContextLookupRequest> {
+        self.context_lookups
+            .lock()
+            .map(|lookups| lookups.clone())
+            .unwrap_or_default()
+    }
+}
 impl Classifier for MockClassifier {
     fn classify(
         &self,
@@ -302,11 +319,20 @@ impl Classifier for MockClassifier {
             .clone()
             .filter(|_| input.has_session)
             .unwrap_or_else(SessionTools::unavailable);
-        // A fresh budget per classification, exactly as `RigClassifier` does.
+        // Fresh budgets per classification, exactly as `RigClassifier` does. A context
+        // lookup is absent rather than unavailable when no provider was configured, because
+        // the live request never advertises that tool in that state.
         let session = tools.begin(&input.session_id);
-        let output = brain(input, &session);
+        let context = self
+            .context_provider
+            .as_ref()
+            .map(ContextProviderTools::begin);
+        let output = brain(input, &session, context.as_deref());
         if let Ok(mut fetches) = self.fetches.lock() {
             *fetches = session.log();
+        }
+        if let Ok(mut lookups) = self.context_lookups.lock() {
+            *lookups = context.map_or_else(Vec::new, |context| context.log());
         }
         output
     }

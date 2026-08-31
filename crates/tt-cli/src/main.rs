@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -331,6 +332,14 @@ fn main() -> Result<()> {
                 classify_auto::session_detail::session_tools(&config.database_path)
                     .context("open the classifier's session access")?,
             );
+            let classifier = if let Some(command) = config.classifier.context_command.as_deref() {
+                classifier.with_context_provider(tt_llm::ContextProviderTools::new(Arc::new(
+                    classify_auto::context_provider::CommandContextProvider::new(command)
+                        .context("configure classifier context lookup command")?,
+                )))
+            } else {
+                classifier
+            };
             classify_auto::run_auto(&db, &config, &classifier)?;
         }
         Some(Commands::Proposals(action)) => {

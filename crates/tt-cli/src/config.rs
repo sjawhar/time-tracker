@@ -46,6 +46,11 @@ pub struct ClassifierConfig {
     pub confidence_threshold: f64,
     /// Environment variable containing the provider API key.
     pub api_key_env: String,
+    /// Read-only context-lookup command line; absent leaves the tool disabled.
+    ///
+    /// It is split with POSIX shell-word rules before the model's query is appended as one
+    /// final argument.
+    pub context_command: Option<String>,
 }
 
 impl Default for ClassifierConfig {
@@ -54,6 +59,7 @@ impl Default for ClassifierConfig {
             model: "claude-haiku-4-5".to_string(),
             confidence_threshold: 0.8,
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            context_command: None,
         }
     }
 }
@@ -284,6 +290,38 @@ mod tests {
             "child test failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn default_classifier_context_lookup_is_disabled() {
+        // Given / When: no `[classifier]` context command is supplied.
+        let classifier = ClassifierConfig::default();
+
+        // Then: context cannot alter prompts or offer tools until an operator explicitly
+        // configures a read-only lookup command.
+        assert!(classifier.context_command.is_none());
+    }
+
+    #[test]
+    fn classifier_context_command_loads_from_the_classifier_table() {
+        // Given: the explicit opt-in command shape operators use.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[classifier]\ncontext_command = \"/usr/local/bin/lookup --scope primary\"\n",
+        )
+        .unwrap();
+
+        // When
+        let config = Config::load_from(Some(&config_path)).unwrap();
+
+        // Then: the command remains a shell-word command line and is disabled only when
+        // its key is absent.
+        assert_eq!(
+            config.classifier.context_command.as_deref(),
+            Some("/usr/local/bin/lookup --scope primary")
         );
     }
 }
