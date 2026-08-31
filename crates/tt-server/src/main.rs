@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     let loops = LoopRuntime::new(LoopRuntimeConfig {
         database_path: config.database_path.clone(),
         config,
-        classifier,
+        classifier: classifier.map(|classifier| classifier as Arc<dyn tt_llm::Classifier>),
         events,
     });
     let loop_task = tokio::spawn(loops.run(shutdown_rx));
@@ -78,52 +78,29 @@ async fn shutdown_signal() {
     }
 }
 
-fn configure_classifier(config: &tt_cli::Config) -> Option<Arc<dyn tt_llm::Classifier>> {
-    match tt_llm::RigClassifier::from_config(
-        &config.classifier.model,
-        &config.classifier.api_key_env,
-    ) {
+fn configure_classifier(config: &tt_cli::Config) -> Option<Arc<tt_llm::RigClassifier>> {
+    match tt_cli::commands::classify_auto::build_classifier(config) {
         Ok(classifier) => {
             persist_classifier_state(config, None);
-            Some(Arc::new(with_session_detail(classifier, config)))
+            Some(Arc::new(classifier))
         }
         Err(error) => {
-            match &error {
-                tt_llm::LlmError::MissingApiKey(variable) => tracing::warn!(
+            let detail = logging::chain(&error);
+            if let Some(tt_llm::LlmError::MissingApiKey(variable)) =
+                error.downcast_ref::<tt_llm::LlmError>()
+            {
+                tracing::warn!(
                     api_key_env = %variable,
                     "classifier unavailable; environment variable is not set; classification loop disabled"
-                ),
-                tt_llm::LlmError::Api(_)
-                | tt_llm::LlmError::Overloaded(_)
-                | tt_llm::LlmError::Timeout(_)
-                | tt_llm::LlmError::Parse(_) => tracing::warn!(
-                    %error,
-                    "classifier unavailable; classification loop disabled"
-                ),
+                );
+            } else {
+                tracing::warn!(
+                    error = %detail,
+                    "classifier unavailable; configuration failed; classification loop disabled"
+                );
             }
-            persist_classifier_state(config, Some(&error.to_string()));
+            persist_classifier_state(config, Some(&detail));
             None
-        }
-    }
-}
-
-/// Gives the classifier read access to the sessions it judges.
-///
-/// Losing that access is a degradation, not a failure: the classifier falls back to
-/// the fixed payload, which is exactly how it behaved before fetching existed. It is
-/// logged at warn because thin-prompt sessions will start going unattributed again.
-fn with_session_detail(
-    classifier: tt_llm::RigClassifier,
-    config: &tt_cli::Config,
-) -> tt_llm::RigClassifier {
-    match tt_cli::commands::classify_auto::session_detail::session_tools(&config.database_path) {
-        Ok(tools) => classifier.with_session_detail(tools),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "classifier cannot read session detail; classifying from the fixed payload only"
-            );
-            classifier
         }
     }
 }
@@ -147,6 +124,7 @@ fn persist_classifier_state(config: &tt_cli::Config, unavailable_error: Option<&
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::time::Duration;
 
     use anyhow::Result;
@@ -184,7 +162,9 @@ mod tests {
             LoopRuntime::new(LoopRuntimeConfig {
                 database_path: database_file.path().to_path_buf(),
                 config: config.clone(),
-                classifier: classifier.clone(),
+                classifier: classifier
+                    .clone()
+                    .map(|classifier| classifier as std::sync::Arc<dyn tt_llm::Classifier>),
                 events: events.clone(),
             })
             .run(shutdown_rx.clone()),
@@ -214,6 +194,102 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), loop_task).await??;
         tokio::time::timeout(Duration::from_secs(1), server_task).await???;
         Ok(())
+    }
+
+    #[test]
+    fn daemon_configured_context_command_enables_context_lookup() {
+        const CHILD_MARKER: &str = "TT_SERVER_CONTEXT_LOOKUP_TEST_CHILD";
+        const API_KEY_ENV: &str = "TT_SERVER_CONTEXT_LOOKUP_TEST_API_KEY";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let database_file = tempfile::NamedTempFile::new().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                database_path: database_file.path().to_path_buf(),
+                todo_store_path: temp.path().join("todos"),
+                ..Config::default()
+            };
+            config.classifier.api_key_env = API_KEY_ENV.to_owned();
+            config.classifier.context_command = Some("printf".to_owned());
+
+            let classifier = configure_classifier(&config).expect("configured classifier");
+
+            assert!(classifier.context_lookup_enabled());
+            assert_eq!(
+                Database::open(database_file.path())
+                    .unwrap()
+                    .get_classifier_health()
+                    .unwrap()
+                    .state,
+                ClassifierHealthState::Ready
+            );
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::daemon_configured_context_command_enables_context_lookup")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(API_KEY_ENV, "test-key")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn malformed_daemon_context_command_disables_classifier_and_records_health() {
+        const CHILD_MARKER: &str = "TT_SERVER_MALFORMED_CONTEXT_COMMAND_TEST_CHILD";
+        const API_KEY_ENV: &str = "TT_SERVER_MALFORMED_CONTEXT_COMMAND_TEST_API_KEY";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let database_file = tempfile::NamedTempFile::new().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                database_path: database_file.path().to_path_buf(),
+                todo_store_path: temp.path().join("todos"),
+                ..Config::default()
+            };
+            config.classifier.api_key_env = API_KEY_ENV.to_owned();
+            config.classifier.context_command = Some("'".to_owned());
+
+            assert!(configure_classifier(&config).is_none());
+            let health = Database::open(database_file.path())
+                .unwrap()
+                .get_classifier_health()
+                .unwrap();
+            assert_eq!(health.state, ClassifierHealthState::Unconfigured);
+            assert!(
+                health
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("unmatched quote")),
+                "{health:?}"
+            );
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::malformed_daemon_context_command_disables_classifier_and_records_health")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(API_KEY_ENV, "test-key")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     async fn shutdown_requested(mut shutdown: watch::Receiver<bool>) {

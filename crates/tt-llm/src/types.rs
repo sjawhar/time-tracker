@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::context_provider::{ContextLookupRequest, ContextLookupSession, ContextProviderTools};
 use crate::fetch::{FetchRequest, FetchSession, SessionTools};
 use crate::transport::HttpFailure;
 
@@ -98,13 +99,12 @@ pub enum StreamChoice {
     /// The model spent every call it was allowed without ever delivering an answer.
     ///
     /// Not a choice at all, which is why it is held apart from the three that are and
-    /// from [`Self::Undetermined`], which *is* an answer. rig bounds an agentic run at
-    /// `MAX_MODEL_TURNS` model calls and hard-errors past it, and that error used to
-    /// reach `tt-cli` as [`LlmError::Api`]: every occurrence cost a session its
-    /// classification and incremented `classifier_consecutive_failures`, whose
-    /// exponential backoff throttled the daemon's drain to 0.17 classifications a
-    /// minute. Nothing had failed — the provider answered every call — so the failure
-    /// tally was the wrong place for it.
+    /// from [`Self::Undetermined`], which *is* an answer. rig bounds an agentic run by the
+    /// enabled tool families and hard-errors past that limit, and that error used to reach
+    /// `tt-cli` as [`LlmError::Api`]: every occurrence cost a session its classification and
+    /// incremented `classifier_consecutive_failures`, whose exponential backoff throttled the
+    /// daemon's drain to 0.17 classifications a minute. Nothing had failed — the provider
+    /// answered every call — so the failure tally was the wrong place for it.
     ///
     /// Resting place is the same as [`Self::Undetermined`]: unassigned, where it reads
     /// as classification lag and stays reachable by a later pass. The counter is not,
@@ -221,25 +221,30 @@ impl TryFrom<ClassificationExtract> for ClassificationOutput {
 }
 
 pub trait Classifier: Send + Sync {
+    /// Places one unit of work, choosing from the roster and operator context supplied by the
+    /// classifier caller.
     fn classify(
         &self,
         input: &ClassificationInput,
         roster: &[StreamSummary],
+        operator_context: Option<&str>,
     ) -> Result<ClassificationOutput, LlmError>;
 
     fn describe_stream(&self, evidence: &str) -> Result<String, LlmError>;
 }
 
-/// A scripted stand-in for a model, including its decision to fetch.
+/// A scripted stand-in for a model, including its decisions to fetch and look up knowledge.
 ///
-/// A [`brain`](MockClassifier::brain) turns this from a canned answer into a real
-/// agentic loop: it sees the payload, may spend the fetch budget through the same
-/// [`FetchSession`] the live model uses, and answers from whatever it ends up seeing.
-/// That is what lets a test prove fetching *changed* a verdict without a network call.
-/// Leave it unset and the classifier behaves exactly as before, popping
-/// [`scripted`](MockClassifier::scripted).
+/// A [`brain`](MockClassifier::brain) sees the same session and context-lookup budgets a live
+/// classifier would expose. The context argument is `None` without a configured provider,
+/// exactly matching `RigClassifier`: it is not a fake unavailable tool that a model can waste
+/// a turn on. Leave a brain unset to retain the older scripted-answer behavior.
 pub type MockBrain = Box<
-    dyn Fn(&ClassificationInput, &FetchSession) -> Result<ClassificationOutput, LlmError>
+    dyn Fn(
+            &ClassificationInput,
+            &FetchSession,
+            Option<&ContextLookupSession>,
+        ) -> Result<ClassificationOutput, LlmError>
         + Send
         + Sync,
 >;
@@ -249,11 +254,15 @@ pub struct MockClassifier {
     pub descriptions: Mutex<VecDeque<Result<String, LlmError>>>,
     /// How this mock decides, when it is allowed to look further than the payload.
     pub brain: Option<MockBrain>,
-    /// What it may look at. When unset, every fetch reports itself unavailable, which
-    /// is the control arm for "could the payload alone have answered this?".
+    /// What it may read from a session. A sessionless scope gets an unavailable session
+    /// budget, preserving the established mock control arm.
     pub tools: Option<Arc<SessionTools>>,
-    /// Requests the last classification actually served, in order.
+    /// Optional context provider. Its budget is withheld entirely when no provider is wired.
+    pub context_provider: Option<Arc<ContextProviderTools>>,
+    /// Session requests the last classification actually served, in order.
     pub fetches: Mutex<Vec<FetchRequest>>,
+    /// Context lookup requests the last classification actually served, in order.
+    pub context_lookups: Mutex<Vec<ContextLookupRequest>>,
 }
 
 impl Default for MockClassifier {
@@ -263,13 +272,15 @@ impl Default for MockClassifier {
             descriptions: Mutex::new(VecDeque::new()),
             brain: None,
             tools: None,
+            context_provider: None,
             fetches: Mutex::new(Vec::new()),
+            context_lookups: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl MockClassifier {
-    /// Requests the last classification served.
+    /// Session requests the last classification served.
     #[must_use]
     pub fn fetches(&self) -> Vec<FetchRequest> {
         self.fetches
@@ -277,13 +288,22 @@ impl MockClassifier {
             .map(|fetches| fetches.clone())
             .unwrap_or_default()
     }
-}
 
+    /// Context lookup requests the last classification served.
+    #[must_use]
+    pub fn context_lookups(&self) -> Vec<ContextLookupRequest> {
+        self.context_lookups
+            .lock()
+            .map(|lookups| lookups.clone())
+            .unwrap_or_default()
+    }
+}
 impl Classifier for MockClassifier {
     fn classify(
         &self,
         input: &ClassificationInput,
         _roster: &[StreamSummary],
+        _operator_context: Option<&str>,
     ) -> Result<ClassificationOutput, LlmError> {
         let Some(brain) = self.brain.as_ref() else {
             return self
@@ -302,11 +322,20 @@ impl Classifier for MockClassifier {
             .clone()
             .filter(|_| input.has_session)
             .unwrap_or_else(SessionTools::unavailable);
-        // A fresh budget per classification, exactly as `RigClassifier` does.
+        // Fresh budgets per classification, exactly as `RigClassifier` does. A context
+        // lookup is absent rather than unavailable when no provider was configured, because
+        // the live request never advertises that tool in that state.
         let session = tools.begin(&input.session_id);
-        let output = brain(input, &session);
+        let context = self
+            .context_provider
+            .as_ref()
+            .map(ContextProviderTools::begin);
+        let output = brain(input, &session, context.as_deref());
         if let Ok(mut fetches) = self.fetches.lock() {
             *fetches = session.log();
+        }
+        if let Ok(mut lookups) = self.context_lookups.lock() {
+            *lookups = context.map_or_else(Vec::new, |context| context.log());
         }
         output
     }
@@ -322,7 +351,13 @@ impl Classifier for MockClassifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassificationExtract, ClassificationOutput, StreamChoice};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::{
+        ClassificationExtract, ClassificationInput, ClassificationOutput, Classifier,
+        MockClassifier, StreamChoice,
+    };
 
     fn extract() -> ClassificationExtract {
         ClassificationExtract {
@@ -545,5 +580,39 @@ mod tests {
                 description: None,
             }
         );
+    }
+    #[test]
+    fn mock_classifier_keeps_its_scripted_path_when_operator_context_is_present() {
+        // Given: a test classifier with one ordinary scripted verdict.
+        let expected = ClassificationOutput {
+            choice: StreamChoice::Existing {
+                stream_id: "stream-a".to_owned(),
+            },
+            confidence: 0.9,
+            reasoning: "scripted".to_owned(),
+        };
+        let classifier = MockClassifier {
+            scripted: Mutex::new(VecDeque::from([Ok(expected.clone())])),
+            ..MockClassifier::default()
+        };
+        let input = ClassificationInput {
+            has_session: true,
+            session_id: "session-1".to_owned(),
+            machine: None,
+            cwd: None,
+            starting_prompt: None,
+            user_prompts: Vec::new(),
+            window_titles: Vec::new(),
+            started_at: None,
+        };
+
+        // When: the caller supplies prompt context alongside the normal roster.
+        let output = classifier
+            .classify(&input, &[], Some("Treat shared terms consistently."))
+            .unwrap();
+
+        // Then: MockClassifier stays a deterministic script rather than growing a second
+        // prompt-rendering path.
+        assert_eq!(output, expected);
     }
 }

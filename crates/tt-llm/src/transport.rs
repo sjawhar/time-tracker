@@ -39,12 +39,12 @@
 //!
 //! The third bound is wall clock, and it exists because the first two multiply. A
 //! per-*request* timeout is not a per-*classification* budget: an agentic attempt is up
-//! to `MAX_MODEL_TURNS` requests, and a classification is up to five attempts, so a
-//! 120-second request bound alone permits 5 × 6 × 120 s ≈ 72 minutes on one session —
-//! and 200 of those is a 241-hour pass. [`Deadline`] caps the whole classification at
-//! [`MAX_CLASSIFICATION_MS`] instead: every attempt is told what is left and may not
-//! outlive it, and an attempt is never started with nothing left. The arithmetic that
-//! picks the number is on [`MAX_CLASSIFICATION_MS`].
+//! to ten requests when both tool families are enabled, and a classification is up to five
+//! attempts, so a 120-second request bound alone permits 5 × 10 × 120 s ≈ 100 minutes on one
+//! session — and 200 of those is a 333-hour pass. [`Deadline`] caps the whole classification
+//! at [`MAX_CLASSIFICATION_MS`] instead: every attempt is told what is left and may not outlive
+//! it, and an attempt is never started with nothing left. The arithmetic that picks the number
+//! is on [`MAX_CLASSIFICATION_MS`].
 //!
 //! # The bounds are per classification, not per attempt
 //!
@@ -96,12 +96,12 @@ pub const MAX_TOTAL_BACKOFF_MS: u64 = 20_000;
 /// provider is genuinely serving gets cut short.
 ///
 /// What it does cut short is the multiplication. The per-request timeout bounds one
-/// request, and a classification is up to `MAX_MODEL_TURNS` requests per attempt across
-/// up to `1 + MAX_TRANSPORT_RETRIES` attempts:
+/// request, and a classification is up to ten requests per attempt when both tool families
+/// are enabled, across up to `1 + MAX_TRANSPORT_RETRIES` attempts:
 ///
 /// | bound | worst case per classification | worst case per 200-session pass |
 /// |---|---|---|
-/// | request timeout alone | 5 × 6 × 120 s ≈ 72 min | ≈ 241 h |
+/// | request timeout alone | 5 × 10 × 120 s ≈ 100 min | ≈ 333 h |
 /// | plus this ceiling | 300 s | ≈ 16.7 h |
 /// | before either | unbounded (3,077 s and counting, measured) | never terminates |
 ///

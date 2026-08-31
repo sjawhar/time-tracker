@@ -291,7 +291,7 @@ fn counting_classifier(
 ) -> Arc<dyn Classifier> {
     let calls = Arc::clone(calls);
     Arc::new(MockClassifier {
-        brain: Some(Box::new(move |input, _session| {
+        brain: Some(Box::new(move |input, _session, _context| {
             calls.fetch_add(1, Ordering::SeqCst);
             answer(&input.session_id)
         })),

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 
+use crate::context_provider::{ContextLookupRequest, ContextLookupSession};
 use crate::fetch::{FetchRequest, FetchSession, MAX_FETCH_CALLS, MAX_MESSAGES_PER_PAGE};
 
 /// A tool never fails: an unanswerable fetch is rendered as text the model can act on,
@@ -133,6 +134,63 @@ impl Tool for MessagesTool {
     }
 }
 
+/// Arguments for [`ContextLookupTool`].
+#[derive(Debug, Deserialize)]
+pub struct ContextLookupArgs {
+    /// An unfamiliar person, organization, project, codename, or relationship.
+    pub query: String,
+}
+
+/// Looks up operator-configured knowledge for the query named by the model.
+pub struct ContextLookupTool {
+    session: Arc<ContextLookupSession>,
+}
+
+impl ContextLookupTool {
+    pub(crate) const fn new(session: Arc<ContextLookupSession>) -> Self {
+        Self { session }
+    }
+}
+
+impl Tool for ContextLookupTool {
+    const NAME: &'static str = "context_lookup";
+
+    type Error = ToolNeverFails;
+    type Args = ContextLookupArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Look up operator-configured knowledge to resolve an unfamiliar person, organization, \
+         project, codename, or relationship before choosing a stream. Query only when the \
+         result would change the initiative you assign."
+            .to_owned()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The unfamiliar name, codename, or question to resolve.",
+                }
+            },
+            "required": ["query"],
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "rig's Tool trait requires async even though dispatch is synchronous"
+    )]
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(self
+            .session
+            .dispatch(&ContextLookupRequest { query: args.query })
+            .rendered())
+    }
+}
+
 /// What the model is told about its fetch tools, appended to the classification prompt.
 ///
 /// The sentence about what happens at the bound is load-bearing and is stated as
@@ -151,4 +209,27 @@ pub fn preamble() -> String {
          If you still cannot identify the work, answer with low confidence rather than \
          inventing a stream to hold it."
     )
+}
+
+/// Appends the context-lookup instructions only when a provider is wired.
+///
+/// Keeping [`preamble`] separate preserves the no-provider text byte-for-byte. A
+/// sessionless scope receives only these instructions, never the session-fetch preamble
+/// for tools it cannot use.
+pub fn preamble_with_context_lookup(has_session: bool) -> String {
+    let mut text = if has_session {
+        preamble()
+    } else {
+        String::new()
+    };
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(
+        "You may resolve unfamiliar people, organizations, projects, codenames, and \
+         relationships through `context_lookup` before choosing a stream. Use it only when \
+         grounding would change the initiative you choose; it has a limit of four context \
+         lookups, after which it is withdrawn.",
+    );
+    text
 }

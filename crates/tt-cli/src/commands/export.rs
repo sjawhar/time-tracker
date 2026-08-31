@@ -2158,6 +2158,83 @@ not valid json
             "the injected turn must not count toward message_count either"
         );
     }
+    /// The remote exporter shares the omp scanner, so replayed continuation turns do
+    /// not become a second user-message event on the receiving machine.
+    #[test]
+    fn test_omp_continuation_export_excludes_replayed_user_message() {
+        let (_temp, data_dir, claude_dir) = setup_test_dirs();
+        let omp_dir = data_dir.join("omp-sessions");
+        fs::create_dir_all(&omp_dir).unwrap();
+        let parent_id = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        let continuation_id = "01a0082d-014b-7000-9fdb-71cdbcef63be";
+
+        write_omp_session(
+            &omp_dir,
+            parent_id,
+            "2026-02-02T09-00-00-000Z",
+            &[
+                omp_session_line(
+                    parent_id,
+                    "2026-02-02T09:00:00.000Z",
+                    "/home/user/project-a",
+                ),
+                omp_user_message_line("start the work", "2026-02-02T09:01:00.000Z"),
+            ],
+        );
+        write_omp_session(
+            &omp_dir,
+            continuation_id,
+            "2026-02-02T10-00-00-000Z",
+            &[
+                format!(
+                    r#"{{"type":"session","version":3,"id":"{continuation_id}","parentSession":"{parent_id}","timestamp":"2026-02-02T10:00:00.000Z","cwd":"/home/user/project-a"}}"#
+                ),
+                omp_user_message_line("start the work", "2026-02-02T09:01:00.000Z"),
+                omp_user_message_line("finish the work", "2026-02-02T10:01:00.000Z"),
+            ],
+        );
+
+        let mut output = Cursor::new(Vec::new());
+        run_impl(
+            &data_dir,
+            &claude_dir,
+            &data_dir,
+            None,
+            Some(&omp_dir),
+            TEST_MACHINE_ID,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        let events: Vec<Value> = String::from_utf8(output.into_inner())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let user_messages: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == "user_message")
+            .collect();
+        assert_eq!(user_messages.len(), 2);
+        assert_eq!(
+            user_messages
+                .iter()
+                .filter(|event| event["session_id"] == continuation_id)
+                .count(),
+            1
+        );
+        let metadata = events
+            .iter()
+            .find(|event| {
+                event["type"] == "session_metadata" && event["session_id"] == continuation_id
+            })
+            .expect("continuation metadata");
+        assert_eq!(metadata["message_count"], 1);
+        assert_eq!(metadata["session_type"], "continuation");
+        assert_eq!(metadata["parent_session_id"], parent_id);
+    }
 
     /// Given an omp transcript whose file mtime predates `since`, When export
     /// runs, Then it is skipped — the same incremental contract
