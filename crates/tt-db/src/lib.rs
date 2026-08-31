@@ -2443,12 +2443,17 @@ impl Database {
         Ok(count as u64)
     }
 
-    /// Gives a subagent's events the stream its parent resolved to.
+    /// Gives a dependent session's events the stream its parent resolved to.
     ///
-    /// Claims the events that have no stream and the ones a previous inheritance
-    /// wrote, so a subagent follows its parent when the parent is reclassified. Every
-    /// other `assignment_source` is a verdict about this session in particular —
-    /// human, inferred, todo link, terminal focus — and inheritance never overrides one.
+    /// Claims events without a stream and those a previous inheritance wrote, so a
+    /// subagent follows its parent when the parent is reclassified. Per-session
+    /// human, todo-link, and terminal-focus assignments remain authoritative.
+    ///
+    /// A top-level omp continuation is the exception to the inferred guard. It may be
+    /// classified directly while its parent remains unclassified; when the parent later
+    /// resolves, its inherited stream replaces that tentative verdict so the two
+    /// transcripts remain one conversation. Human and non-classifier assignments remain
+    /// authoritative.
     pub fn inherit_stream_for_session(
         &self,
         session_id: &str,
@@ -2458,7 +2463,10 @@ impl Database {
         let count = tx.execute(
             "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
              WHERE session_id = ?3 \
-               AND (stream_id IS NULL OR assignment_source = ?2) \
+               AND (stream_id IS NULL OR assignment_source = ?2 \
+                    OR (assignment_source = 'inferred' AND EXISTS \
+                        (SELECT 1 FROM agent_sessions \
+                         WHERE session_id = ?3 AND session_type = 'continuation'))) \
                AND (?4 != ?5 OR type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus'))",
             params![
                 stream_id,
@@ -3388,11 +3396,12 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Deletes `user_message` events belonging to non-user agent sessions.
+    /// Deletes `user_message` events belonging to automated agent sessions.
     ///
-    /// When sessions are reclassified (e.g., from `user` to `agent`), stale
+    /// When sessions are reclassified (e.g., from human-driven to automated), stale
     /// `user_message` events from previous ingestions create false focus signals
-    /// in the allocation algorithm. This cleans them up.
+    /// in the allocation algorithm. This cleans them up while retaining top-level
+    /// continuation messages, which are human attention.
     ///
     /// Returns the number of events deleted.
     pub fn delete_non_user_message_events(&self) -> Result<u64, DbError> {
@@ -3400,7 +3409,8 @@ impl Database {
         let count = tx.execute(
             "DELETE FROM events WHERE type = 'user_message' \
              AND session_id IN (\
-               SELECT session_id FROM agent_sessions WHERE session_type != 'user'\
+               SELECT session_id FROM agent_sessions \
+               WHERE session_type NOT IN ('user', 'continuation')\
              )",
             [],
         )?;
@@ -4777,8 +4787,8 @@ impl Database {
     /// Lists the user sessions a classification pass should spend LLM calls on,
     /// newest first, with the machine each ran on.
     ///
-    /// Only `session_type = 'user'` sessions appear: a subagent serves its parent's
-    /// task and has no independent work stream, so it inherits instead of being
+    /// Human-driven top-level sessions appear: direct user sessions and omp
+    /// continuations. Subagents serve their parent's task and inherit instead of being
     /// classified. Ordering is `start_time DESC` and the pass is bounded by `limit`,
     /// so every pass advances the reporting window before touching backfill — the
     /// arbitrary `ORDER BY session_id` this replaces left today's work unreached for
@@ -4803,7 +4813,7 @@ impl Database {
     ) -> Result<Vec<(tt_core::session::AgentSession, Option<String>)>, DbError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {AGENT_SESSION_COLUMNS} FROM agent_sessions s
-             WHERE s.session_type = 'user'
+             WHERE s.session_type IN ('user', 'continuation')
                AND EXISTS (SELECT 1 FROM events e
                            WHERE e.session_id = s.session_id AND e.stream_id IS NULL)
              ORDER BY s.start_time DESC
@@ -4833,7 +4843,7 @@ impl Database {
     ) -> Result<Vec<(tt_core::session::AgentSession, Option<String>)>, DbError> {
         let mut stmt = conn.prepare(&format!(
             "SELECT {AGENT_SESSION_COLUMNS} FROM agent_sessions s
-             WHERE s.session_type = 'user'
+             WHERE s.session_type IN ('user', 'continuation')
                AND s.tool_call_count = 0
                AND s.message_count <= 2
                AND EXISTS (SELECT 1 FROM events e
@@ -4903,13 +4913,17 @@ impl Database {
                    AND type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus')",
             )?;
             // The same claim `inherit_stream_for_session` makes, and it must stay the
-            // same: unassigned events plus ones already `inherited`, so a subagent
-            // follows a reclassified parent and every other source is left standing.
+            // same: unassigned events, prior inheritance, and directly inferred omp
+            // continuations so a parent eventually takes precedence. Human and other
+            // per-session assignments remain intact.
             let mut inherit = tx.prepare(
                 "UPDATE events SET stream_id = ?1, assignment_source = ?2 \
                  WHERE session_id IN \
                        (SELECT session_id FROM agent_sessions WHERE parent_session_id = ?3) \
-                   AND (stream_id IS NULL OR assignment_source = ?2) \
+                   AND (stream_id IS NULL OR assignment_source = ?2 \
+                        OR (assignment_source = 'inferred' AND session_id IN \
+                            (SELECT session_id FROM agent_sessions \
+                             WHERE parent_session_id = ?3 AND session_type = 'continuation'))) \
                    AND type NOT IN ('user_message', 'window_focus', 'tmux_pane_focus')",
             )?;
             let mut record = tx.prepare(
@@ -4972,6 +4986,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT s.session_id FROM agent_sessions s
              WHERE s.parent_session_id IS NOT NULL
+               AND s.session_type = 'subagent'
                AND NOT EXISTS (SELECT 1 FROM agent_sessions p
                                WHERE p.session_id = s.parent_session_id)
                AND EXISTS (SELECT 1 FROM events e
@@ -9457,13 +9472,14 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_user_sessions_returns_only_user_sessions_newest_first() {
-        // Given: three unclassified user sessions and one unclassified subagent.
+    fn unclassified_user_sessions_returns_human_sessions_newest_first() {
+        // Given: three direct user sessions, one continuation, and one subagent.
         let db = Database::open_in_memory().unwrap();
         for (session_id, session_type, hours) in [
             ("user-oldest", SessionType::User, 0),
             ("user-newest", SessionType::User, 48),
             ("user-middle", SessionType::User, 24),
+            ("continuation", SessionType::Continuation, 36),
             ("subagent", SessionType::Subagent, 72),
         ] {
             db.upsert_agent_session(
@@ -9477,12 +9493,16 @@ mod tests {
         // When
         let selected = db.unclassified_user_sessions(10).unwrap();
 
-        // Then: the subagent never reaches the classifier, and recency wins.
+        // Then: continuations reach the classifier as human work, subagents do not,
+        // and recency wins.
         let ids: Vec<&str> = selected
             .iter()
             .map(|(session, _)| session.session_id.as_str())
             .collect();
-        assert_eq!(ids, ["user-newest", "user-middle", "user-oldest"]);
+        assert_eq!(
+            ids,
+            ["user-newest", "continuation", "user-middle", "user-oldest"]
+        );
         assert_eq!(selected[0].1.as_deref(), Some("machine-a"));
     }
 
@@ -9714,9 +9734,9 @@ mod tests {
     }
 
     #[test]
-    fn orphan_subagent_ids_lists_unclassified_subagents_whose_parent_was_never_indexed() {
-        // Given: one subagent under an indexed parent, one under a parent that was
-        // never ingested, and one orphan whose events are already classified.
+    fn orphan_subagent_ids_lists_only_unclassified_subagents_whose_parent_was_never_indexed() {
+        // Given: one subagent under an indexed parent, one orphan subagent, one
+        // already-classified orphan, and an orphan continuation that must classify.
         let db = Database::open_in_memory().unwrap();
         db.insert_stream(&make_stream("stream-a", None)).unwrap();
         db.upsert_agent_session(&candidate_session("parent", SessionType::User, ts(0)), None)
@@ -9731,6 +9751,10 @@ mod tests {
             db.upsert_agent_session(&subagent, None).unwrap();
             insert_unassigned_event(&db, session_id);
         }
+        let mut continuation = candidate_session("continuation", SessionType::Continuation, ts(0));
+        continuation.parent_session_id = Some("never-ingested".to_string());
+        db.upsert_agent_session(&continuation, None).unwrap();
+        insert_unassigned_event(&db, "continuation");
         db.assign_events_by_session_id("orphan-classified", "stream-a", "inferred")
             .unwrap();
 

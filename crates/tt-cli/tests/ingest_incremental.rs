@@ -10,7 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
+use serde_json::json;
 use tt_cli::commands::ingest::{self, IngestPaths, SCAN_OVERLAP_MINUTES, ScanMode};
 
 /// A Claude transcript whose mtime is `age` before now.
@@ -56,6 +57,29 @@ fn plant_omp_session(sessions_dir: &Path, uuid: &str, age: Duration) {
     .expect("write omp transcript");
     drop(file);
     touch(&path, age);
+}
+
+/// An omp continuation whose opening history is replayed before its creation time.
+fn plant_omp_continuation(sessions_dir: &Path, continuation_id: &str, parent_id: &str) {
+    let cwd_dir = sessions_dir.join("-tmp-proj");
+    std::fs::create_dir_all(&cwd_dir).expect("create omp cwd dir");
+    let path = cwd_dir.join(format!("2026-02-02T10-00-00-000Z_{continuation_id}.jsonl"));
+    let mut file = File::create(path).expect("create omp continuation");
+    writeln!(
+        file,
+        r#"{{"type":"session","version":3,"id":"{continuation_id}","parentSession":"{parent_id}","timestamp":"2026-02-02T10:00:00.000Z","cwd":"/tmp/proj"}}"#
+    )
+    .expect("write session");
+    writeln!(
+        file,
+        r#"{{"type":"message","id":"old","parentId":null,"timestamp":"2026-02-02T09:00:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"parent prompt"}}]}}}}"#
+    )
+    .expect("write replayed prompt");
+    writeln!(
+        file,
+        r#"{{"type":"message","id":"new","parentId":"old","timestamp":"2026-02-02T10:01:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"continuation prompt"}}]}}}}"#
+    )
+    .expect("write continuation prompt");
 }
 
 /// Stamps a file's mtime to `age` before now.
@@ -332,6 +356,67 @@ fn omp_session_is_ingested_with_source_omp() {
         .expect("session row present");
     assert_eq!(session.source, tt_core::session::SessionSource::Omp);
     assert_eq!(session.message_count, 2);
+}
+
+/// Given a continuation whose transcript embeds its parent's opening prompt, When
+/// `--full` re-derives it, Then only its new prompt remains and the stale event from
+/// the earlier derivation is pruned.
+#[test]
+fn full_rederive_prunes_replayed_omp_continuation_user_messages() {
+    let fixture = Fixture::new();
+    let parent_id = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+    let continuation_id = "01a0082d-014b-7000-9fdb-71cdbcef63be";
+    plant_omp_continuation(fixture.omp(), continuation_id, parent_id);
+    let db = open_db();
+
+    fixture.ingest(&db, ScanMode::Full);
+    let (session, _) = db
+        .get_agent_session(continuation_id)
+        .expect("read continuation")
+        .expect("continuation present");
+    assert_eq!(
+        session.session_type,
+        tt_core::session::SessionType::Continuation
+    );
+    assert_eq!(session.parent_session_id.as_deref(), Some(parent_id));
+    assert_eq!(session.message_count, 1);
+    assert_eq!(user_message_count(&db, continuation_id), 1);
+
+    let replayed_at = Utc
+        .with_ymd_and_hms(2026, 2, 2, 9, 0, 0)
+        .single()
+        .expect("timestamp");
+    db.insert_event(&tt_db::StoredEvent {
+        id: format!(
+            "{continuation_id}-user_message-{}",
+            replayed_at.timestamp_millis()
+        ),
+        timestamp: replayed_at,
+        event_type: tt_core::EventType::UserMessage,
+        source: "omp".to_string(),
+        machine_id: None,
+        schema_version: 1,
+        pane_id: None,
+        tmux_session: None,
+        window_index: None,
+        git_project: None,
+        git_workspace: None,
+        status: None,
+        idle_duration_ms: None,
+        window_app_id: None,
+        window_title: None,
+        action: None,
+        cwd: Some("/tmp/proj".to_string()),
+        session_id: Some(continuation_id.to_string()),
+        stream_id: None,
+        assignment_source: None,
+        data: json!({}),
+    })
+    .expect("insert stale replay event");
+    assert_eq!(user_message_count(&db, continuation_id), 2);
+
+    fixture.ingest(&db, ScanMode::Full);
+    assert_eq!(user_message_count(&db, continuation_id), 1);
 }
 
 /// Given an omp corpus that has not changed, When ingest runs a second time, Then

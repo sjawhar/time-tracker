@@ -22,7 +22,9 @@
 //! Every line is a JSON object with a `"type"` discriminant:
 //!
 //! - `"session"` (always first): `{"type":"session","version":3,"id","timestamp","cwd`,
-//!   and, on newer transcripts, `"title"`/`"titleSource"` inline.
+//!   and, on newer transcripts, `"title"`/`"titleSource"` inline. A top-level
+//!   continuation also carries `"parentSession"` as either a parent UUID or absolute
+//!   path to the parent's transcript.
 //! - `"title"` (older transcripts; rewritten in place as the title changes, padded
 //!   with trailing spaces inside the JSON string so the rewrite never changes the
 //!   line's byte length): `{"type":"title","v":1,"title","updatedAt","pad"}`. Note
@@ -55,11 +57,13 @@
 //! `"message"` line's `message.content` array. `message_count` is therefore a count
 //! of `"message"` lines, one per turn, with the same rule Claude's scanner applies:
 //! a `"user"` turn whose text is harness-injected (see [`crate::injection`]) is
-//! skipped entirely rather than counted, because it carries no human attention.
-//! Every other role — including tool results, bash panes, file mentions, and
-//! `"developer"` banners — still represents a turn that occupied the transcript, so
-//! it counts, but only `"user"` and `"assistant"` turns feed prompts, timestamps, or
-//! `assistant_message_count`.
+//! skipped entirely rather than counted, because it carries no human attention. In a
+//! continuation, user turns earlier than the `"session"` creation timestamp are
+//! embedded parent history and are skipped for the same reason: the parent transcript
+//! already accounts for that attention. Every other role — including tool results,
+//! bash panes, file mentions, and `"developer"` banners — still represents a turn that
+//! occupied the transcript, so it counts, but only `"user"` and `"assistant"` turns
+//! feed prompts, timestamps, or `assistant_message_count`.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -67,7 +71,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use uuid::Uuid;
 
 use crate::session::{
     AgentSession, MAX_TOOL_CALLS_PER_MESSAGE, MAX_USER_MESSAGE_TIMESTAMPS, MAX_USER_PROMPTS,
@@ -95,6 +100,23 @@ struct OmpLine {
     title: Option<String>,
     /// Present only on `"message"` lines.
     message: Option<OmpMessage>,
+    /// Present on a top-level continuation's `"session"` line. Non-string values
+    /// are malformed metadata and intentionally ignored.
+    #[serde(
+        rename = "parentSession",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    parent_session: Option<String>,
+}
+
+/// Deserializes optional metadata without rejecting an otherwise valid transcript line.
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.as_str().map(str::to_owned)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,11 +172,28 @@ fn fallback_session_id(stem: &str) -> String {
         .to_string()
 }
 
+/// Parses omp's continuation-parent forms without trusting malformed metadata.
+///
+/// Omp writes either the parent's bare UUID or an absolute transcript path whose
+/// filename stem ends in `_<uuid>`. Both forms retain their original UUID spelling so
+/// they match the id stored from the parent's own session line.
+fn parse_continuation_parent_session_id(value: &str) -> Option<String> {
+    let candidate = if Path::new(value).is_absolute() {
+        Path::new(value).file_stem()?.to_str()?.rsplit_once('_')?.1
+    } else {
+        value
+    };
+    Uuid::parse_str(candidate)
+        .ok()
+        .map(|_| candidate.to_string())
+}
+
 /// Parses one omp transcript file into an [`AgentSession`].
 ///
 /// `fallback_id` is used only when the `"session"` line is missing or its `id`
 /// field fails to parse — see [`fallback_session_id`]. `parent_session_id` is
-/// `Some` for a subagent transcript nested one directory below its parent.
+/// `Some` for a subagent transcript nested one directory below its parent; top-level
+/// continuations derive their own parent from omp's `"session"` metadata.
 #[expect(
     clippy::too_many_lines,
     reason = "Session parser keeps the IO loop in one function for clarity, matching session::parse_session_file"
@@ -180,6 +219,7 @@ pub fn parse_session_file(
     let mut starting_prompt: Option<String> = None;
     let mut user_message_timestamps: Vec<DateTime<Utc>> = Vec::new();
     let mut tool_call_timestamps: Vec<DateTime<Utc>> = Vec::new();
+    let mut continuation_parent_session_id: Option<String> = None;
 
     // Title resolution prefers the most recently known update mechanism: an
     // appended `"title_change"` record beats the session line's own inline title
@@ -233,6 +273,12 @@ pub fn parse_session_file(
                 if session_timestamp.is_none() {
                     session_timestamp = parsed.timestamp.as_deref().and_then(parse_ts);
                 }
+                if continuation_parent_session_id.is_none() {
+                    continuation_parent_session_id = parsed
+                        .parent_session
+                        .as_deref()
+                        .and_then(parse_continuation_parent_session_id);
+                }
                 if let Some(title) = parsed.title.filter(|t| !t.is_empty()) {
                     session_line_title = Some(title);
                 }
@@ -259,6 +305,14 @@ pub fn parse_session_file(
 
                 match msg.role.as_deref() {
                     Some("user") => {
+                        let is_replayed_continuation_turn = continuation_parent_session_id
+                            .is_some()
+                            && session_timestamp.is_some_and(|created_at| {
+                                ts.is_some_and(|message_at| message_at < created_at)
+                            });
+                        if is_replayed_continuation_turn {
+                            continue;
+                        }
                         let text = first_text_block(msg.content.as_deref());
                         if text.is_some_and(crate::injection::is_injected) {
                             // Injected text is the harness talking to the agent,
@@ -326,15 +380,22 @@ pub fn parse_session_file(
         .or(first_message_timestamp)
         .ok_or(SessionError::NoMessageRecords)?;
 
+    let session_type = if parent_session_id.is_some() {
+        SessionType::Subagent
+    } else if continuation_parent_session_id.is_some() {
+        SessionType::Continuation
+    } else {
+        SessionType::User
+    };
+    let linked_parent_session_id = parent_session_id
+        .map(String::from)
+        .or(continuation_parent_session_id);
+
     Ok(AgentSession {
         session_id,
         source: SessionSource::Omp,
-        parent_session_id: parent_session_id.map(String::from),
-        session_type: if parent_session_id.is_some() {
-            SessionType::Subagent
-        } else {
-            SessionType::User
-        },
+        parent_session_id: linked_parent_session_id,
+        session_type,
         project_name: extract_project_name(&project_path),
         project_path,
         start_time,
@@ -732,5 +793,107 @@ mod tests {
 
         let session = parse_session_file(&path, "titled", None).expect("parse");
         assert_eq!(session.summary.as_deref(), Some("final title"));
+    }
+    #[test]
+    fn top_level_continuations_record_bare_and_path_parent_session_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd_dir = temp.path().join("-tmp-proj");
+        std::fs::create_dir_all(&cwd_dir).expect("create cwd dir");
+        let parent_id = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        let bare_id = "01a0082d-014b-7000-9fdb-71cdbcef63be";
+        let path_id = "01a0082e-014b-7000-9fdb-71cdbcef63be";
+        let parent_path = cwd_dir.join(format!("2026-08-16T01-24-02-000Z_{parent_id}.jsonl"));
+        write_lines(
+            &parent_path,
+            &[
+                SESSION_LINE,
+                &user_line("start the work", "2026-08-16T01:24:03.000Z"),
+            ],
+        );
+        let parent_transcript = parent_path.display();
+        write_lines(
+            &cwd_dir.join(format!("2026-08-16T02-24-02-000Z_{bare_id}.jsonl")),
+            &[
+                &format!(
+                    r#"{{"type":"session","version":3,"id":"{bare_id}","parentSession":"{parent_id}","timestamp":"2026-08-16T02:24:02.000Z","cwd":"/tmp/proj"}}"#
+                ),
+                &user_line("continue the work", "2026-08-16T02:24:03.000Z"),
+            ],
+        );
+        write_lines(
+            &cwd_dir.join(format!("2026-08-16T03-24-02-000Z_{path_id}.jsonl")),
+            &[
+                &format!(
+                    r#"{{"type":"session","version":3,"id":"{path_id}","parentSession":"{parent_transcript}","timestamp":"2026-08-16T03:24:02.000Z","cwd":"/tmp/proj"}}"#
+                ),
+                &user_line("finish the work", "2026-08-16T03:24:03.000Z"),
+            ],
+        );
+
+        let sessions = scan_omp_sessions(temp.path()).expect("scan");
+        for continuation_id in [bare_id, path_id] {
+            let continuation = sessions
+                .iter()
+                .find(|session| session.session_id == continuation_id)
+                .expect("continuation present");
+            assert_eq!(continuation.parent_session_id.as_deref(), Some(parent_id));
+            assert_eq!(continuation.session_type, SessionType::Continuation);
+        }
+    }
+
+    #[test]
+    fn continuation_replayed_user_messages_are_not_derived() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent_id = "01a0082b-2c9d-7000-b52c-10ef998c3061";
+        let continuation_id = "01a0082d-014b-7000-9fdb-71cdbcef63be";
+        let path = temp.path().join("continuation.jsonl");
+        write_lines(
+            &path,
+            &[
+                &format!(
+                    r#"{{"type":"session","version":3,"id":"{continuation_id}","parentSession":"{parent_id}","timestamp":"2026-08-16T02:00:00.000Z","cwd":"/tmp/proj"}}"#
+                ),
+                &user_line("the parent already asked this", "2026-08-16T01:00:00.000Z"),
+                &user_line("continue from the parent", "2026-08-16T02:01:00.000Z"),
+                &assistant_line("2026-08-16T02:02:00.000Z", 0),
+            ],
+        );
+
+        let continuation = parse_session_file(&path, continuation_id, None).expect("parse");
+        assert_eq!(continuation.session_type, SessionType::Continuation);
+        assert_eq!(continuation.message_count, 2);
+        assert_eq!(
+            continuation.user_prompts,
+            vec!["continue from the parent".to_string()]
+        );
+        assert_eq!(
+            continuation.starting_prompt.as_deref(),
+            Some("continue from the parent")
+        );
+        assert_eq!(continuation.user_message_timestamps.len(), 1);
+        assert_eq!(
+            continuation.user_message_timestamps[0],
+            DateTime::parse_from_rfc3339("2026-08-16T02:01:00.000Z")
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn malformed_continuation_parent_is_ignored() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("malformed-parent.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"session","version":3,"id":"01a0082d-014b-7000-9fdb-71cdbcef63be","parentSession":7,"timestamp":"2026-08-16T02:00:00.000Z","cwd":"/tmp/proj"}"#,
+                &user_line("continue normally", "2026-08-16T02:01:00.000Z"),
+            ],
+        );
+
+        let session =
+            parse_session_file(&path, "01a0082d-014b-7000-9fdb-71cdbcef63be", None).expect("parse");
+        assert!(session.parent_session_id.is_none());
+        assert_eq!(session.session_type, SessionType::User);
     }
 }

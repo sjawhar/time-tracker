@@ -150,6 +150,28 @@ fn insert_subagent(db: &tt_db::Database, session_id: &str, parent_session_id: &s
     .unwrap();
 }
 
+/// Stores a top-level omp continuation with one unassigned event.
+fn insert_continuation(
+    db: &tt_db::Database,
+    session_id: &str,
+    parent_session_id: &str,
+    start_time: DateTime<Utc>,
+) {
+    let mut continuation = session(session_id, &["continue the work"]);
+    continuation.source = SessionSource::Omp;
+    continuation.parent_session_id = Some(parent_session_id.to_string());
+    continuation.session_type = SessionType::Continuation;
+    continuation.start_time = start_time;
+    db.upsert_agent_session(&continuation, Some("machine-a"))
+        .unwrap();
+    db.insert_event(&event(
+        &format!("event-{session_id}"),
+        Some(session_id),
+        EventType::AgentToolUse,
+    ))
+    .unwrap();
+}
+
 fn scripted(choice: StreamChoice, confidence: f64) -> MockClassifier {
     let classifier = MockClassifier::default();
     classifier
@@ -1543,6 +1565,113 @@ fn subagents_whose_parent_was_never_indexed_are_junked_without_an_llm_call() {
         Some(junk_stream_id(&db).as_str())
     );
     assert_eq!(junked.assignment_source.as_deref(), Some("junk"));
+}
+
+#[test]
+fn orphan_continuations_are_classified_as_user_work_not_junked() {
+    // Given: a top-level continuation with genuine work whose parent transcript was
+    // never ingested.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&stream("stream-a", None)).unwrap();
+    insert_continuation(&db, "continuation-orphan", "never-ingested", timestamp(0));
+    let classifier = scripted(
+        StreamChoice::Existing {
+            stream_id: "stream-a".to_string(),
+        },
+        0.9,
+    );
+
+    // When
+    let outcome = run_auto(&db, &Config::default(), &classifier).unwrap();
+
+    // Then: continuations are human sessions, not orphan subagents.
+    assert_eq!(outcome.junked, 0);
+    let assigned_event = stored_event(&db, "event-continuation-orphan");
+    assert_eq!(assigned_event.stream_id.as_deref(), Some("stream-a"));
+    assert_eq!(
+        assigned_event.assignment_source.as_deref(),
+        Some("inferred")
+    );
+}
+
+#[test]
+fn a_parent_classification_overrides_a_continuations_earlier_direct_verdict() {
+    // Given: newest-first selection answers the continuation before its parent.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&stream("parent-stream", None)).unwrap();
+    db.insert_stream(&stream("continuation-stream", None))
+        .unwrap();
+    insert_session_candidate(&db, "parent", &["start the work"]);
+    insert_continuation(&db, "continuation", "parent", timestamp(1));
+    let classifier = by_session(vec![
+        (
+            "continuation",
+            Ok(ClassificationOutput {
+                choice: StreamChoice::Existing {
+                    stream_id: "continuation-stream".to_string(),
+                },
+                confidence: 0.9,
+                reasoning: "direct continuation verdict".to_string(),
+            }),
+        ),
+        (
+            "parent",
+            Ok(ClassificationOutput {
+                choice: StreamChoice::Existing {
+                    stream_id: "parent-stream".to_string(),
+                },
+                confidence: 0.9,
+                reasoning: "parent verdict".to_string(),
+            }),
+        ),
+    ]);
+
+    // When
+    let outcome = run_auto(&db, &Config::default(), &classifier).unwrap();
+
+    // Then: parent-to-continuation inheritance wins, preserving one stream.
+    assert_eq!(outcome.errors, 0);
+    let continuation = stored_event(&db, "event-continuation");
+    assert_eq!(continuation.stream_id.as_deref(), Some("parent-stream"));
+    assert_eq!(continuation.assignment_source.as_deref(), Some("inherited"));
+}
+
+#[test]
+fn a_continuation_is_classified_when_its_indexed_parent_remains_unclassified() {
+    // Given: the parent cannot produce a verdict while the continuation can.
+    let db = tt_db::Database::open_in_memory().unwrap();
+    db.insert_stream(&stream("continuation-stream", None))
+        .unwrap();
+    insert_session_candidate(&db, "parent", &["start the work"]);
+    insert_continuation(&db, "continuation", "parent", timestamp(1));
+    let classifier = by_session(vec![
+        (
+            "parent",
+            Err(LlmError::Api("parent unavailable".to_string())),
+        ),
+        (
+            "continuation",
+            Ok(ClassificationOutput {
+                choice: StreamChoice::Existing {
+                    stream_id: "continuation-stream".to_string(),
+                },
+                confidence: 0.9,
+                reasoning: "continuation verdict".to_string(),
+            }),
+        ),
+    ]);
+
+    // When
+    let outcome = run_auto(&db, &Config::default(), &classifier).unwrap();
+
+    // Then: the continuation still makes progress and no reverse inheritance occurs.
+    assert_eq!(outcome.errors, 1);
+    let continuation = stored_event(&db, "event-continuation");
+    assert_eq!(
+        continuation.stream_id.as_deref(),
+        Some("continuation-stream")
+    );
+    assert_eq!(continuation.assignment_source.as_deref(), Some("inferred"));
 }
 
 #[test]
