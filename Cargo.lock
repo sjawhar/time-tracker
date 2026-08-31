@@ -3006,7 +3006,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tt-cli"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "tt-core"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "insta",
@@ -3050,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "tt-db"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "tt-llm"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "insta",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "tt-server"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3106,7 +3106,7 @@ dependencies = [
 
 [[package]]
 name = "tt-watcher"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
