@@ -83,7 +83,26 @@ pub const ROSTER_LIMIT: usize = 200;
 /// clause does that; the rest is detail the model does not need to match on.
 pub const ROSTER_DESCRIPTION_BUDGET: usize = 160;
 
-pub fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
+/// Builds the classifier prompt from the optional operator text and lookup capability supplied
+/// through the classifier seam.
+///
+/// When both options are absent, this retains the prompt bytes from before optional operator
+/// context and context lookup existed.
+pub fn build_with_prompt_inputs(
+    input: &ClassificationInput,
+    roster: &[StreamSummary],
+    operator_context: Option<&str>,
+    has_context_provider: bool,
+) -> String {
+    build_inner(input, roster, operator_context, has_context_provider)
+}
+
+fn build_inner(
+    input: &ClassificationInput,
+    roster: &[StreamSummary],
+    operator_context: Option<&str>,
+    has_context_provider: bool,
+) -> String {
     let mut prompt = String::new();
     let _ = writeln!(prompt, "Session ID: {}", input.session_id);
     append_option(&mut prompt, "Machine", input.machine.as_deref());
@@ -104,6 +123,8 @@ pub fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
         let truncated: String = user_prompt.chars().take(USER_PROMPT_BUDGET).collect();
         let _ = writeln!(prompt, "{truncated}");
     }
+
+    append_operator_context(&mut prompt, operator_context);
 
     append_roster(&mut prompt, roster, input.started_at);
 
@@ -128,7 +149,34 @@ pub fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
          Whenever you can identify the work, name a choice even when you are unsure of it, \
          and say how sure you are in confidence. Confidence must be within 0..1."
     );
+    if has_context_provider {
+        append_context_lookup_grounding(&mut prompt);
+    }
+
     prompt
+}
+
+fn append_operator_context(prompt: &mut String, operator_context: Option<&str>) {
+    let Some(operator_context) = operator_context.filter(|context| !context.is_empty()) else {
+        return;
+    };
+    let _ = writeln!(
+        prompt,
+        "Operator-provided context:\n---\n{operator_context}\n---"
+    );
+}
+
+fn append_context_lookup_grounding(prompt: &mut String) {
+    let _ = writeln!(
+        prompt,
+        "Grounding and stream taxonomy: You MAY resolve unfamiliar people, organizations, \
+         projects, codenames, and their relationships through an operator-configured knowledge \
+         lookup before choosing. A stream names ONE initiative: a deliverable, customer, or \
+         program. NEVER name a stream after a session, a dispatch mechanism, an activity \
+         (navigation, ops, admin, coordination, or meetings), a date range, or a catch-all. \
+         Name a stream \"A + B\" only when A and B are facets of one deliverable. Strongly \
+         prefer reusing an existing roster stream over minting a near-duplicate."
+    );
 }
 
 /// Writes the streams the model may choose from, closest to the session's moment first.
@@ -205,12 +253,23 @@ fn append_option(prompt: &mut String, label: &str, value: Option<&str>) {
 mod tests {
     use chrono::Utc;
 
-    use super::{ROSTER_DESCRIPTION_BUDGET, ROSTER_LIMIT, build};
+    use super::{ROSTER_DESCRIPTION_BUDGET, ROSTER_LIMIT, build_with_prompt_inputs};
     use crate::{ClassificationInput, StreamSummary};
 
     fn at(minutes: i64) -> chrono::DateTime<Utc> {
         chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 4, 25, 12, 0, 0).unwrap()
             + chrono::Duration::minutes(minutes)
+    }
+
+    fn build(input: &ClassificationInput, roster: &[StreamSummary]) -> String {
+        build_with_prompt_inputs(input, roster, None, false)
+    }
+
+    fn build_with_context_provider(
+        input: &ClassificationInput,
+        roster: &[StreamSummary],
+    ) -> String {
+        build_with_prompt_inputs(input, roster, None, true)
     }
 
     fn input(user_prompts: Vec<String>) -> ClassificationInput {
@@ -578,5 +637,63 @@ mod tests {
         let lowered = prompt.to_lowercase();
         assert!(lowered.contains("closest to this session"));
         assert!(lowered.contains("not every stream"));
+    }
+
+    #[test]
+    fn context_lookup_is_the_only_prompt_change_when_a_provider_is_wired() {
+        // Given: identical classification evidence, with and without the optional
+        // provider. Leaving it unwired must retain the byte-for-byte prompt that was
+        // already in production.
+        let input = input(vec![
+            "Identify the customer for example-initiative".to_owned(),
+        ]);
+        let roster = roster();
+
+        // When / Then
+        insta::assert_snapshot!(
+            "classification_prompt_without_context_provider",
+            build(&input, &roster)
+        );
+        insta::assert_snapshot!(
+            "classification_prompt_with_context_provider",
+            build_with_context_provider(&input, &roster)
+        );
+    }
+
+    #[test]
+    fn operator_context_is_delimited_before_the_roster() {
+        // Given: operator-authored vocabulary that explains terms the roster uses.
+        let input = input(vec!["Classify the session using shared terms.".to_owned()]);
+        let roster = roster();
+
+        // When / Then: the operator text is visible before the choices it explains.
+        insta::assert_snapshot!(
+            "classification_prompt_with_operator_context",
+            build_with_prompt_inputs(
+                &input,
+                &roster,
+                Some("Treat shared terms as domain vocabulary."),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn operator_context_and_context_provider_render_together() {
+        // Given: both optional operator capabilities are enabled.
+        let input = input(vec!["Classify the session using shared terms.".to_owned()]);
+        let roster = roster();
+
+        // When / Then: static context remains before the roster and lookup grounding remains
+        // available after the classification instructions.
+        insta::assert_snapshot!(
+            "classification_prompt_with_operator_context_and_context_provider",
+            build_with_prompt_inputs(
+                &input,
+                &roster,
+                Some("Treat shared terms as domain vocabulary."),
+                true
+            )
+        );
     }
 }

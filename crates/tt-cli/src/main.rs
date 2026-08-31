@@ -322,15 +322,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Classify { auto: _ }) => {
             let (db, config) = open_database(cli.config.as_deref())?;
-            let classifier = tt_llm::RigClassifier::from_config(
-                &config.classifier.model,
-                &config.classifier.api_key_env,
-            )
-            .context("initialize automatic classifier")?
-            .with_session_detail(
-                classify_auto::session_detail::session_tools(&config.database_path)
-                    .context("open the classifier's session access")?,
-            );
+            let classifier = classify_auto::build_classifier(&config)?;
             classify_auto::run_auto(&db, &config, &classifier)?;
         }
         Some(Commands::Proposals(action)) => {

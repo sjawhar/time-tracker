@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 /// Application configuration.
@@ -46,6 +47,17 @@ pub struct ClassifierConfig {
     pub confidence_threshold: f64,
     /// Environment variable containing the provider API key.
     pub api_key_env: String,
+    /// Read-only context-lookup command line; absent leaves the tool disabled.
+    ///
+    /// It is split with POSIX shell-word rules before the model's query is appended as one
+    /// final argument.
+    pub context_command: Option<String>,
+    /// Operator-provided domain vocabulary, entity glossaries, or classification guidance.
+    ///
+    /// Trailing whitespace is ignored and the rendered value is capped to keep one
+    /// classification prompt bounded.
+    #[serde(default, deserialize_with = "deserialize_context_instructions")]
+    pub context_instructions: Option<String>,
 }
 
 impl Default for ClassifierConfig {
@@ -54,6 +66,8 @@ impl Default for ClassifierConfig {
             model: "claude-haiku-4-5".to_string(),
             confidence_threshold: 0.8,
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            context_command: None,
+            context_instructions: None,
         }
     }
 }
@@ -69,6 +83,24 @@ impl Default for ServeConfig {
     fn default() -> Self {
         Self { port: 8765 }
     }
+}
+
+const MAX_CONTEXT_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+fn deserialize_context_instructions<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(mut context_instructions) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    context_instructions.truncate(context_instructions.trim_end().len());
+    if context_instructions.len() > MAX_CONTEXT_INSTRUCTIONS_BYTES {
+        return Err(D::Error::custom(format!(
+            "classifier.context_instructions exceeds {MAX_CONTEXT_INSTRUCTIONS_BYTES} bytes"
+        )));
+    }
+    Ok((!context_instructions.is_empty()).then_some(context_instructions))
 }
 
 const fn default_wip_limit() -> u32 {
@@ -285,5 +317,85 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn default_classifier_context_lookup_is_disabled() {
+        // Given / When: no `[classifier]` context command is supplied.
+        let classifier = ClassifierConfig::default();
+
+        // Then: context cannot alter prompts or offer tools until an operator explicitly
+        // configures a read-only lookup command.
+        assert!(classifier.context_command.is_none());
+    }
+
+    #[test]
+    fn classifier_context_command_loads_from_the_classifier_table() {
+        // Given: the explicit opt-in command shape operators use.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[classifier]\ncontext_command = \"/usr/local/bin/lookup --scope primary\"\n",
+        )
+        .unwrap();
+
+        // When
+        let config = Config::load_from(Some(&config_path)).unwrap();
+
+        // Then: the command remains a shell-word command line and is disabled only when
+        // its key is absent.
+        assert_eq!(
+            config.classifier.context_command.as_deref(),
+            Some("/usr/local/bin/lookup --scope primary")
+        );
+    }
+
+    #[test]
+    fn classifier_context_instructions_load_and_trim_trailing_whitespace() {
+        // Given: vocabulary operators want present in every classification prompt, with
+        // harmless TOML indentation and trailing whitespace.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[classifier]\ncontext_instructions = \"\"\"\nUse shared terms consistently.   \n\"\"\"\n",
+        )
+        .unwrap();
+
+        // When
+        let config = Config::load_from(Some(&config_path)).unwrap();
+
+        // Then: prompt rendering receives the authored text, not layout whitespace.
+        assert_eq!(
+            config.classifier.context_instructions.as_deref(),
+            Some("Use shared terms consistently.")
+        );
+    }
+
+    #[test]
+    fn classifier_context_instructions_over_eight_kib_fail_to_load() {
+        // Given: an instruction block one byte larger than the prompt budget.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[classifier]\ncontext_instructions = \"{}\"\n",
+                "x".repeat(8 * 1024 + 1)
+            ),
+        )
+        .unwrap();
+
+        // When
+        let error = Config::load_from(Some(&config_path)).expect_err("oversized context must fail");
+
+        // Then: the operator can identify both the key and the byte limit to correct.
+        assert!(
+            error
+                .to_string()
+                .contains("classifier.context_instructions")
+        );
+        assert!(error.to_string().contains("8192"));
     }
 }

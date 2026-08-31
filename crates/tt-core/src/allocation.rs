@@ -461,14 +461,13 @@ impl<'a> Allocator<'a> {
             EventType::UserMessage => {
                 // User messages represent active work — sending a message to an
                 // agent IS direct work. Establish focus on the message's stream,
-                // just like switching to a tmux pane. Exception: user_message events
-                // emitted by a subagent (or any non-User session type) reflect the
-                // parent agent's delegation, not human attention, so they are skipped.
-                let is_subagent_message = event
+                // just like switching to a tmux pane. Automated session types reflect
+                // delegation rather than human attention, so they are skipped.
+                let is_automated_message = event
                     .session_id()
                     .and_then(|session_id| self.session_types.get(session_id))
-                    .is_some_and(|session_type| *session_type != SessionType::User);
-                if is_subagent_message {
+                    .is_some_and(|session_type| !session_type.is_human_driven());
+                if is_automated_message {
                     return;
                 }
                 let stream_id = event.stream_id().unwrap_or(UNASSIGNED_STREAM_ID);

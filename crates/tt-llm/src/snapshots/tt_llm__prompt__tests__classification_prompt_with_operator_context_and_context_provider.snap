@@ -1,0 +1,20 @@
+---
+source: crates/tt-llm/src/prompt.rs
+expression: "build_with_prompt_inputs(&input, &roster,\nSome(\"Treat shared terms as domain vocabulary.\"), true)"
+---
+Session ID: session-1
+Machine: laptop
+Working directory: /work/project
+Starting prompt: Classify my work
+Window titles:
+Recent user prompts:
+Classify the session using shared terms.
+Operator-provided context:
+---
+Treat shared terms as domain vocabulary.
+---
+Available streams, closest to this session's own activity first (this is not every stream that exists, so a stream being absent is not evidence against it):
+stream-1  Time Tracker — Build the tracker  [rust]
+stream-2  Documentation
+Prefer an existing stream. A stream is one initiative that spans many sessions over days or weeks, not one row per task instance: the sessions that stood up six applications for the same integration all belong to that one integration stream, not to six streams named after the applications. If this session is another task within work a listed stream already covers, answer with that stream_id even when the wording differs. Only create a new stream when the work genuinely belongs to no listed initiative, and then give it a name and a description that identify the initiative rather than this session's task. Set throwaway when the session holds no work worth attributing at all. Never name a stream after an activity or posture (shell, navigation, context-switching), a date range, or a leftover bucket (misc, other, stragglers): those describe how the user was sitting, not what they were doing, and such a name is refused. If you cannot identify the work, leave stream_id, new_stream_name and throwaway all unset and answer with low confidence, rather than inventing a container for it. That is not the same as a throwaway: throwaway asserts this session holds no work, while leaving all three unset says only that the work was not identified. Whenever you can identify the work, name a choice even when you are unsure of it, and say how sure you are in confidence. Confidence must be within 0..1.
+Grounding and stream taxonomy: You MAY resolve unfamiliar people, organizations, projects, codenames, and their relationships through an operator-configured knowledge lookup before choosing. A stream names ONE initiative: a deliverable, customer, or program. NEVER name a stream after a session, a dispatch mechanism, an activity (navigation, ops, admin, coordination, or meetings), a date range, or a catch-all. Name a stream "A + B" only when A and B are facets of one deliverable. Strongly prefer reusing an existing roster stream over minting a near-duplicate.

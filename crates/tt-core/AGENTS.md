@@ -94,7 +94,7 @@ The two sources detect it differently, and in both cases the discriminator is st
 
 - `AgentSession` — parsed session: `session_id`, `source`, `parent_session_id`, `session_type`, `project_path`, `start_time`, `end_time`, `message_count`, `user_prompts`, etc.
 - `SessionSource` — enum: `Claude` | `OpenCode` | `Omp`
-- `SessionType` — enum: `User` | `Agent` | `Subagent`. In `session.rs` inferred from session_id format; in `opencode.rs` and `omp.rs`, `Subagent` is set when `parent_id` is present.
+- `SessionType` — enum: `User` | `Agent` | `Subagent` | `Continuation`. In `session.rs` inferred from session_id format; in `opencode.rs` and `omp.rs`, `Subagent` is set when `parent_id` is present. omp sets `Continuation` only when `parentSession` names a valid parent UUID distinct from the transcript's own session ID.
 
 ### Parsing Rules
 

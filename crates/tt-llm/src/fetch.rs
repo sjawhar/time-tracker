@@ -4,6 +4,9 @@
 //! rig tools; [`crate::MockClassifier`] drives it from a scripted brain. Because the
 //! budget and the injection filter live here rather than in either caller, a test that
 //! exercises the mock exercises the same guards the real model meets.
+//!
+//! This budget mirrors [`crate::context_provider`] deliberately. Two tool families do not earn
+//! a shared abstraction; unify their mechanics when a third family makes the rule of three.
 
 use std::sync::Arc;
 use std::sync::Mutex;

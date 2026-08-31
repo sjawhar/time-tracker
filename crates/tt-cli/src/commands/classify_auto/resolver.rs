@@ -4,6 +4,8 @@
 //! module decides what each answer means: assign it, propose it for review, junk
 //! it, or refuse it.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
@@ -25,6 +27,7 @@ pub(super) struct Resolver<'a> {
     pub(super) db: &'a tt_db::Database,
     pub(super) classifier: &'a dyn Classifier,
     pub(super) roster: Vec<StreamSummary>,
+    pub(super) context_instructions: Option<&'a str>,
     confidence_threshold: f64,
     pub(super) outcome: AutoClassifyOutcome,
 }
@@ -67,13 +70,16 @@ impl<'a> Resolver<'a> {
             db,
             classifier,
             roster,
+            context_instructions: config.classifier.context_instructions.as_deref(),
             confidence_threshold: config.classifier.confidence_threshold,
             outcome: AutoClassifyOutcome::default(),
         })
     }
 
     pub(super) fn classify(&mut self, input: &ClassificationInput) -> Option<ClassificationOutput> {
-        let result = self.classifier.classify(input, &self.roster);
+        let result = self
+            .classifier
+            .classify(input, &self.roster, self.context_instructions);
         self.record_call(&input.session_id, result)
     }
 
@@ -329,17 +335,25 @@ impl<'a> Resolver<'a> {
         );
     }
 
-    /// Gives every subagent of `parent_session_id` the stream its parent resolved to.
+    /// Gives every dependent session of `parent_session_id` the stream its parent resolved to.
     pub(super) fn inherit(&mut self, parent_session_id: &str, stream_id: &str) -> Result<()> {
-        for subagent_id in self
-            .db
-            .subagent_ids_for_parent(parent_session_id)
-            .context("load subagents of a classified session")?
-        {
-            self.outcome.assigned += self
+        let mut visited = HashSet::new();
+        let mut pending = vec![parent_session_id.to_owned()];
+        while let Some(parent_id) = pending.pop() {
+            if !visited.insert(parent_id.clone()) {
+                continue;
+            }
+            for dependent_id in self
                 .db
-                .inherit_stream_for_session(&subagent_id, stream_id)
-                .context("give a subagent its parent's stream")?;
+                .dependent_session_ids_for_parent(&parent_id)
+                .context("load dependents of a classified session")?
+            {
+                self.outcome.assigned += self
+                    .db
+                    .inherit_stream_for_session(&dependent_id, stream_id)
+                    .context("give a dependent session its parent's stream")?;
+                pending.push(dependent_id);
+            }
         }
         Ok(())
     }

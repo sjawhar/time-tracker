@@ -27,7 +27,7 @@ The file will be created if it doesn't exist. Data is appended (one JSON object 
 
 ## Quick Reference
 
-1. **Classify**: Tag untagged streams — the data-integrity gate, NOT optional prep (see Phase 1). Every later number depends on it.
+1. **Classify**: Tag untagged streams — the data-integrity gate, NOT optional prep (see Phase 1). Every later number depends on it. Includes primary-source verification: read the week's own user messages before trusting any stream name.
 2. **Trends**: Show 8-week historical patterns with bar charts
 3. **Data**: Ingest sessions + fetch tt report for time breakdown
 4. **Context**: Present time tables, session summary, reflection questions
@@ -131,12 +131,64 @@ overwrite. That is exactly why it must stay small: name only the sessions and ev
 actually judged, and never use it to sweep a remainder. It will not create the target stream —
 if the stream should exist, `tt streams create` it deliberately first.
 
-### Hard gate — do NOT advance to Phase 2 until BOTH hold
+### Primary-source verification — read the week's messages before trusting any stream name
+
+Coverage says every event has *a* stream; it says nothing about whether the streams are
+*right*. The check that catches what every mechanical pass misses is reading the primary
+source: the user's own messages. It is small — a week is roughly 100–150 top-level
+sessions — and it takes minutes with a digest, not hours.
+
+1. **Extract the week's human turns** from the agent-session transcripts (top-level session
+   files only — subagent "user" turns are dispatch prompts written by other agents, not the
+   user). Filter harness-injected text with the same leading-marker rules
+   `tt_core::injection` uses.
+2. **Build a per-session digest**: session id, turn count, first/middle/last turns, and the
+   stream its events currently carry. Read all of it.
+3. **Judge each session's stream against what the user actually said.** The defect classes
+   this reliably catches, none of which coverage numbers or window titles reveal:
+   - **Split conversations** — a continued/resumed session recorded under a new id whose
+     halves landed on different streams (one conversation, two rows).
+   - **Conglomerates** — an "A + B" stream gluing two unrelated initiatives that interleaved
+     in time. The converse is NOT a defect: one initiative with two facets ("verification +
+     the report it feeds") is coherent.
+   - **Streams named after the vehicle, not the work** — a session name, a dispatch
+     mechanism, an output artifact. A stream names an initiative.
+   - **Duplicate families** — one long-running thread re-minted under many near-identical
+     names as its topic drifted day to day.
+   - **Anchor-less accretion** — a stream with zero sessions and zero user messages whose
+     time is pure ambient focus events; its events belong to whatever the user was actually
+     messaging at those moments.
+4. **Repair through the sanctioned surfaces only** — `tt streams merge` for duplicate
+   families, `tt streams rename` for wrong names, `tt streams assign --session` for misfiled
+   sessions, `tt streams dissolve` for rows that never named work. Never invent a container
+   for what the reading cannot place.
+
+When a time figure looks wrong to the user, decompose it to the event level before defending
+it: a stream can be exactly right and still surprising (a standing thread touched 100+ times
+in five-minute sips reads as hours the user never *felt*), or plausibly named and completely
+hollow (all ambient focus, no sessions). The event composition tells you which.
+
+**Operator guidance for this verification lives in config, never in this skill.** Two homes:
+
+- `~/.config/time-tracker/weekly-review.toml` may carry a `[classification]` section with a
+  freeform `instructions` string — domain vocabulary, entity glossaries, which initiatives the
+  operator considers one workstream vs several, known duplicate-prone thread names. Load it (if
+  present) before judging any session's stream and treat it as the operator's own taxonomy
+  rulings. Absent section: proceed on the generic rules above.
+- The always-on equivalents for the automatic classifier are tt's own `[classifier]`
+  `context_instructions` (a prompt block every classification sees) and `context_command`
+  (a lookup command the model may call mid-classification). Anything the verification keeps
+  re-teaching belongs there, so the daemon learns it too.
+
+### Hard gate — do NOT advance to Phase 2 until ALL THREE hold
 
 1. You checked coverage against `tt report` (not just glanced at a session list).
 2. **`tt report` `totals.unassigned_direct_ms` is small enough that the week's shape is not in
    question** — minutes, or a residue that cannot move any project's share. Hours of unattributed
    *direct* time means the instrument is broken; do not rationalize it, present it, or save it.
+3. You ran the primary-source verification above and repaired what it caught — a week whose
+   coverage is perfect but whose stream names are wrong presents confidently and reviews
+   garbage.
 
 **Why direct and not delegated:** direct time is the human-attention signal the whole review rests on. 8 unattributed hours is an entire workday you cannot see — enough to flip "you barely touched sales" into "sales was a third of your week." Delegated time may retain a larger unattributed tail (boundary agent sessions) without distorting the review.
 

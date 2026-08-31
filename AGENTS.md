@@ -262,7 +262,7 @@ Use `#[expect(clippy::lint_name, reason = "...")]` — never bare `#[allow]`. Ev
 
 ### Configuration
 
-Figment layered loading: compiled defaults → `~/.config/time-tracker/config.toml` → `TT_*` env vars. Keys: `database_path`, `todo_store_path`, `wip_limit`, `drift_window_min`, `ingest_interval_s`, `sync_interval_s`, `[classifier]` (`model`, `confidence_threshold`, `api_key_env`), `[serve]` (`port`).
+Figment layered loading: compiled defaults → `~/.config/time-tracker/config.toml` → `TT_*` env vars. Keys: `database_path`, `todo_store_path`, `wip_limit`, `drift_window_min`, `ingest_interval_s`, `sync_interval_s`, `[classifier]` (`model`, `confidence_threshold`, `api_key_env`, `context_instructions`: optional multiline domain vocabulary, entity glossaries, or classification guidance the operator wants every classification to see; `context_command`: optional read-only command the classifier can query for external context), `[serve]` (`port`).
 
 XDG directory layout:
 ```

@@ -58,6 +58,8 @@ pub enum SessionType {
     /// Direct user session (UUID format, no agent- prefix)
     #[default]
     User,
+    /// A user-driven omp transcript continuing another top-level session.
+    Continuation,
     /// Background agent (`prompt_suggestion`, `compact`)
     Agent,
     /// Task tool subagent (agent-a{hash})
@@ -77,11 +79,18 @@ impl SessionType {
         }
     }
 
+    /// Whether the session's user messages represent human attention.
+    #[must_use]
+    pub const fn is_human_driven(self) -> bool {
+        matches!(self, Self::User | Self::Continuation)
+    }
+
     /// Returns the string representation for SQL storage.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::User => "user",
+            Self::Continuation => "continuation",
             Self::Agent => "agent",
             Self::Subagent => "subagent",
         }
@@ -100,6 +109,7 @@ impl std::str::FromStr for SessionType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "user" => Ok(Self::User),
+            "continuation" => Ok(Self::Continuation),
             "agent" => Ok(Self::Agent),
             "subagent" => Ok(Self::Subagent),
             _ => Err(format!("invalid session type: {s}")),
@@ -167,7 +177,7 @@ pub struct AgentSession {
     #[serde(default)]
     pub source: SessionSource,
     pub parent_session_id: Option<String>,
-    /// Type of session (user, agent, subagent).
+    /// Type of session (user, continuation, agent, subagent).
     #[serde(default)]
     pub session_type: SessionType,
     pub project_path: String,
@@ -1285,7 +1295,12 @@ mod tests {
 
     #[test]
     fn test_session_type_roundtrip() {
-        for st in [SessionType::User, SessionType::Agent, SessionType::Subagent] {
+        for st in [
+            SessionType::User,
+            SessionType::Continuation,
+            SessionType::Agent,
+            SessionType::Subagent,
+        ] {
             let s = st.as_str();
             let parsed: SessionType = s.parse().unwrap();
             assert_eq!(parsed, st);
@@ -1327,7 +1342,12 @@ mod tests {
     #[test]
     fn test_session_type_serde_matches_as_str() {
         // Verify serde serialization produces the same string as as_str().
-        for st in [SessionType::User, SessionType::Agent, SessionType::Subagent] {
+        for st in [
+            SessionType::User,
+            SessionType::Continuation,
+            SessionType::Agent,
+            SessionType::Subagent,
+        ] {
             let serde_value = serde_json::to_value(st).unwrap();
             assert_eq!(
                 serde_value.as_str().unwrap(),

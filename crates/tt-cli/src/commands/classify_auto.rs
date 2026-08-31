@@ -23,13 +23,15 @@
 //! What each answer *means* lives in [`resolver`].
 
 use std::any::Any;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tt_core::is_structurally_junk;
+use tt_core::{is_structurally_junk, session::SessionType};
 use tt_db::JUNK_ASSIGNMENT_SOURCE;
 use tt_llm::{
-    CLASSIFIER_GENERATION, ClassificationInput, ClassificationOutput, Classifier, LlmError,
+    CLASSIFIER_GENERATION, ClassificationInput, ClassificationOutput, Classifier,
+    ContextProviderTools, LlmError, RigClassifier,
 };
 
 use crate::Config;
@@ -37,12 +39,34 @@ use resolver::Resolver;
 use target::AssignmentTarget;
 use window_runs::{build_unassigned_window_runs, newest_first};
 
+pub mod context_provider;
 mod resolver;
 pub mod session_detail;
 mod target;
 #[cfg(test)]
 mod tests;
 mod window_runs;
+
+/// Builds the automatic classifier with every optional tool family configured for this host.
+///
+/// # Errors
+/// Returns an error when the model client, session detail access, or configured context command
+/// cannot be initialized.
+pub fn build_classifier(config: &Config) -> Result<RigClassifier> {
+    let classifier =
+        RigClassifier::from_config(&config.classifier.model, &config.classifier.api_key_env)
+            .context("initialize automatic classifier")?
+            .with_session_detail(
+                session_detail::session_tools(&config.database_path)
+                    .context("open the classifier's session access")?,
+            );
+    let Some(command) = config.classifier.context_command.as_deref() else {
+        return Ok(classifier);
+    };
+    let provider = context_provider::CommandContextProvider::new(command)
+        .context("configure classifier context lookup command")?;
+    Ok(classifier.with_context_provider(ContextProviderTools::new(Arc::new(provider))))
+}
 
 /// Sessions one pass may look at.
 ///
@@ -442,7 +466,9 @@ impl Resolver<'_> {
             // Junk is settled here rather than taking a slot in a chunk, because it costs
             // no model call: a session that ran no tool and held at most one exchange
             // cannot carry work, and structure alone says so.
-            if is_structurally_junk(session.tool_call_count, session.message_count) {
+            if session.session_type != SessionType::Continuation
+                && is_structurally_junk(session.tool_call_count, session.message_count)
+            {
                 let session_id = session.session_id;
                 let stream_id = self.junk(&AssignmentTarget::Session {
                     session_id: &session_id,
@@ -506,6 +532,7 @@ impl Resolver<'_> {
     ) -> Vec<Result<ClassificationOutput, LlmError>> {
         let classifier = self.classifier;
         let roster = self.roster.as_slice();
+        let context_instructions = self.context_instructions;
         std::thread::scope(|scope| {
             // Every call is spawned before any of them is joined. Chaining the two into
             // one lazy iterator would spawn a thread and immediately wait on it, which is
@@ -513,7 +540,9 @@ impl Resolver<'_> {
             // `needless_collect` suggests here.
             let mut calls = Vec::with_capacity(chunk.len());
             for (input, _) in chunk {
-                calls.push(scope.spawn(move || classifier.classify(input, roster)));
+                calls.push(
+                    scope.spawn(move || classifier.classify(input, roster, context_instructions)),
+                );
             }
             calls
                 .into_iter()

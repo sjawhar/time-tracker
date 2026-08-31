@@ -1058,10 +1058,9 @@ fn create_session_events(session: &AgentSession, machine_id: Option<&str>) -> Ve
     start_event.data["project_name"] = json!(session.project_name);
     events.push(start_event);
 
-    // User message events — only for human-driven sessions.
-    // Non-User sessions (Agent, Subagent) have automated prompts that would
-    // create false focus signals in the allocation algorithm.
-    if session.session_type == tt_core::session::SessionType::User {
+    // User-message events are direct attention for human-driven sessions, including
+    // omp continuations. Agent and subagent prompts remain automated activity.
+    if session.session_type.is_human_driven() {
         for ts in &session.user_message_timestamps {
             let id_suffix = format!("user_message-{}", ts.timestamp_millis());
             events.push(make_event(&id_suffix, *ts, EventType::UserMessage));
