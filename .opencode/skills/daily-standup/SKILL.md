@@ -86,7 +86,7 @@ digraph standup {
   ask [label="10. Ask user\n(plans? blockers?)"];
   draft [label="11. Draft + show user"];
   iterate [label="12. Iterate with user"];
-  post [label="13. Post via blocks\n(slack-bot MCP)"];
+  post [label="13. Post via\nslack_send_message"];
   archive [label="14. Archive\nw<WEEK>/<DATE>.md"];
 
   cfg -> start -> ingest -> gather -> analyze -> coverage -> compute -> prio -> prs -> filter -> ask -> draft -> iterate -> post -> archive;
@@ -311,9 +311,8 @@ gh search prs --author=@me --updated=">=$(date -u -d "yesterday" +%Y-%m-%d)" --j
 
 **Hyperlink rules.** Every shipped PR in the standup should be linked with a **friendly description**, NOT the PR number. The PR number can appear in parentheses but the link text is the description.
 
-- ✅ `<https://example.com/repo/pull/123|fixes hover state on contact page> (closes 5 open issues)`
-- ❌ `[PR #123](https://example.com/repo/pull/123)` — markdown syntax doesn't render in Slack
-- ❌ `<https://example.com/repo/pull/123|#123>` — link text is uninformative
+- ✅ `[fixes hover state on contact page](https://example.com/repo/pull/123) (closes 5 open issues)`
+- ❌ `[PR #123](https://example.com/repo/pull/123)` — link text is uninformative
 - ❌ Bare `https://example.com/repo/pull/123` — giant URL clutter
 
 ## Phase 9: Filter to Audience
@@ -346,34 +345,36 @@ may appear in `by_tag`. State the number in your working notes, and carry any re
 into the draft as a stated caveat rather than silently rounding it away. If the classifier is
 behind, STOP drafting and return to Phase 5.
 
-Draft using Slack mrkdwn so the user can read it easily. The structure must map cleanly to Block Kit `rich_text` elements when posting (Phase 13).
+Draft in standard markdown. It is what Slack's `slack_send_message` tool takes, and Slack converts it to native formatting on send, so the draft the user approves is the exact text that gets posted (Phase 13).
 
 **Template:**
 
 ```
-*Standup - {DayOfWeek} {Date}*
+**Standup - {DayOfWeek} {Date}**
 
-*Yesterday*
-- *{Logical Project 1}* {— optional Nh direct / Mh delegated}
+**Yesterday**
+- **{Logical Project 1}** {— optional Nh direct / Mh delegated}
   - {Outcome 1 with hyperlinked PR description}
   - {Outcome 2}
-- *{Logical Project 2}*
+- **{Logical Project 2}**
   - {Outcome with hyperlinked PR}
-- *Misc tooling*
+- **Misc tooling**
   - {one-line summary of small bits}
-*Today*
+
+**Today**
 - {Plan item, verbatim from user, with caveats preserved}
 - {Plan item}
-*Blockers*
+
+**Blockers**
 - {Blocker or "None"}
 ```
 
 **Writing rules:**
 
-- Top-level bullets: `-` flush left. Sub-bullets: two-space indent then `-`. This maps to `rich_text_list` with `indent: 0` and `indent: 1` (see Phase 13).
-- Exactly one blank line after the header line (`*Standup - ...*`). **No blank lines elsewhere** — sections (`*Yesterday*`, `*Today*`, `*Blockers*`) and projects flow directly without spacing.
-- Bold: `*…*` (single asterisks). `**…**` renders as literal asterisks in Slack mrkdwn.
-- Hyperlinks: `<url|friendly outcome description>`. Never bare URLs, never `<url|#NNNN>`.
+- Top-level bullets: `-` flush left. Sub-bullets: two-space indent then `-`. Slack renders them as a bulleted list with a nested level.
+- One blank line after the header line, and one before `**Today**` and before `**Blockers**`: a section label on the line straight after a bullet is folded into that bullet. No other blank lines.
+- Bold: `**…**`. Slack's own `*…*` means italic in markdown.
+- Hyperlinks: `[friendly outcome description](url)`. Never bare URLs, never `[#NNNN](url)`.
 - Time: copy ms→h from `tt report` exactly. Use 1 decimal (`9h`, `2.5h`, `~30m`). Drop the time annotation entirely when the user says times are wrong or unreliable.
 - Apply any user-specific layers from the personal config's *Format / tone preferences* section (e.g., theme song line, post-content additions). The skill template above is the generic baseline.
 
@@ -397,52 +398,11 @@ catch-all buckets. Posting is irreversible; a standup posted over a stale classi
 worst outcome this skill has. If the gate fails here, apologize to nobody — just go fix it
 (Phase 5) and come back.
 
-**Use the slack-bot MCP `conversations_add_message` tool with the `blocks` parameter.** This bypasses the markdown converter and posts native Block Kit `rich_text`. Requires slack-mcp-server v1.3.0+. See the `slack-bot` skill for the full Block Kit reference — the short version follows.
+**Send the approved draft with `slack_send_message`**: `channel_id` from config, `message` the draft text exactly as approved. Slack converts the markdown into native rich text — bold, links, `:emoji:` shortcodes, and the `-` / `  -` bullets as a bulleted list with a nested level — so nothing is converted by hand. Slack appends a small *Sent using* footer naming the app that posted.
 
-**Structure** (single `rich_text` block containing a sequence of `rich_text_section` and `rich_text_list` elements):
+The tool returns the message link: give it to the user. To check a format complaint, read the post back with `slack_read_channel` (`oldest` and `latest` both set to the message's `ts`).
 
-| Draft line | Block element |
-|------------|---------------|
-| Header line `*Standup - Fri May 22*` + emoji + theme song link | First `rich_text_section`, ending with `\n\n` then bold section label `Yesterday` then `\n` |
-| Top-level bullet `- *{Project}*` | `rich_text_list` with `style: "bullet"`, `indent: 0`, one `rich_text_section` per top-level bullet |
-| Sub-bullet `  - {Outcome}` | Separate `rich_text_list` with `indent: 1`, placed directly after its parent list |
-| Section transition (`*Today*`, `*Blockers*`) | `rich_text_section` with `\n` + bold label + `\n` |
-| Inline hyperlink `<url|text>` | `{type: "link", url, text}` inside a `rich_text_section` |
-| Inline `*bold*` | `{type: "text", text, style: {bold: true}}` |
-
-**Important rendering rules:**
-
-- **No literal `•` / `◦` characters in the text.** Slack renders the bullet glyphs from the list structure. Including the characters yourself produces a visually-similar but semantically-broken message (breaks copy/paste, accessibility, search).
-- **No blank lines except after the header.** The `rich_text_section` transition elements between lists handle spacing.
-- Each indent level is its own `rich_text_list` block placed directly after its parent. Slack does not support nested-list-inside-list.
-
-**Send:**
-
-```
-skill_mcp(mcp_name="slack", tool_name="conversations_add_message", arguments='{
-  "channel_id": "<from config>",
-  "text": "<one-line fallback: e.g. Standup - Fri May 22>",
-  "blocks": "[{\"type\":\"rich_text\",\"elements\":[ ... ]}]"
-}')
-```
-
-**Verify after posting:**
-
-- The MCP response includes the message timestamp.
-- To confirm the structure rendered correctly (e.g. for debugging a format complaint), fetch the raw blocks via Slack's API (debug-only, not the send path):
-  ```bash
-  secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s "https://slack.com/api/conversations.history?channel=$CH&latest=$TS&oldest=$TS&inclusive=true&limit=1" -H "Authorization: Bearer $SLACK_MCP_XOXP_TOKEN"' | jq '.messages[0].blocks'
-  ```
-  A correctly-formatted standup is **one** `rich_text` block; if you see multiple `section` blocks the message was sent via the markdown path (wrong).
-
-**Delete a message** (only on user request or to retry):
-
-```bash
-secrets SLACK_MCP_XOXP_TOKEN -- sh -c 'curl -s -X POST "https://slack.com/api/chat.delete" \
-  -H "Authorization: Bearer $SLACK_MCP_XOXP_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"channel\": \"<channel_id>\", \"ts\": \"<message_ts>\"}"'
-```
+The Slack tools cannot edit or delete a sent message. If a post has to be redone, ask the user to delete it in Slack, then post again.
 
 ## Phase 14: Archive the Day
 
@@ -466,11 +426,9 @@ mkdir -p "$DIR"
 | Mentioning anything in the config's exclude list | **Drop it.** Audience doesn't care. If unsure, leave out. |
 | "from my side" / "on my end" / first-person framing | Use team language: "we", "ready for the team", "X is usable now" |
 | Internal jargon (project-internal codenames, bucket labels, etc.) | Translate to plain description of what was actually done |
-| Giant raw URLs in post | Hyperlink friendly description: `<url|short outcome>` |
-| `[PR #N](url)` markdown syntax | Use Slack mrkdwn `<url|description>`. Markdown links DON'T render. |
-| `content_type: "text/markdown"` for structured messages | Use the `blocks` parameter with `rich_text` block kit — markdown content_type creates fragmented `section` blocks (80-char wrap, breaks editability) |
-| `**bold**` (double asterisk) | Use `*bold*` (single asterisk) — Slack mrkdwn |
-| `## headers` | Slack mrkdwn has no headers. Use bold lines. |
+| Giant raw URLs in post | Hyperlink friendly description: `[short outcome](url)` |
+| Slack mrkdwn in the draft (`*bold*`, `<url\|text>`) | Standard markdown: `**bold**`, `[description](url)`. `slack_send_message` converts it; the mrkdwn forms mean something else in markdown. |
+| `#` headers | Section labels are bold lines (`**Today**`), as in the template. |
 | `gh search prs --author=@me` for private repos | Use local clones from your config |
 | Hyperlinking `#NNNN` instead of description | Hyperlink the **outcome description**, not the number |
 | Inferring/upgrading today's plans | Copy user's framing verbatim. "might do" stays "may do". |
@@ -481,9 +439,8 @@ mkdir -p "$DIR"
 | Wrong day boundary | Use the timezone from your config, not UTC or Pacific by default |
 | Posting without confirming | Always show draft → wait for explicit go-ahead |
 | Annotating "(excluding personal)" | Don't draw attention to what was dropped. Just omit. |
-| Literal `•` / `◦` characters in posted text | Use Block Kit `rich_text_list` with `indent: 0` / `indent: 1`. Slack renders the bullet glyphs from the list structure. Literal characters break copy/paste, accessibility, and search. |
-| Blank lines between sections (`*Yesterday*` → `*Today*`) | Only ONE blank line in the entire message: after the header line. Section transitions are `rich_text_section` elements with `\n` + bold label + `\n`. |
-| Sending the draft markdown text directly via `text` or `content_type: "text/plain"` | Convert the approved draft to Block Kit `rich_text` JSON and send via `blocks`. The draft's `-` / `  -` indentation maps to `rich_text_list` indent 0 / 1. |
+| Literal `•` / `◦` characters in posted text | Use `-` list items (two-space indent for sub-bullets). Slack renders the bullet glyphs from the list structure; literal characters break copy/paste, accessibility, and search. |
+| `**Today**` or `**Blockers**` on the line straight after a bullet | Put a blank line before each section label, or Slack folds it into that bullet. |
 | Weekly Priority Check delivered as a verdict ("you're off-track") | It's collaborative debugging. State observations as hypotheses you expect to be wrong; ask what's really going on. No shame, no moralizing. |
 | Assuming a priority with no `tt` time wasn't done | Ask: off-keyboard (tick it) or not started? You can't see 1:1s, calls, thinking. |
 | Inventing a per-priority % | Most priorities have no `tt` signal. Show where time *did* go and reason about alignment; attach hours only when a priority cleanly maps to a stream/tag. |
@@ -494,64 +451,28 @@ mkdir -p "$DIR"
 
 ## Example Output
 
-**Draft preview the user sees during iteration:**
+**The draft the user approves, which is also exactly what gets posted:**
 
 ```
-*Standup - Wed Mar 12*
+**Standup - Wed Mar 12**
 
-*Yesterday*
-- *Project A — milestone work* — 6h direct / 12h delegated
-  - Shipped <https://example.com/repo/pull/123|customer-facing fix for hover bug> (closes 3 reported issues)
-  - Landed supporting changes: <https://example.com/repo/pull/124|docs into agents/skills>, <https://example.com/repo/pull/125|error surfacing on infra failures>
-- *Project B — consolidation* — 2h direct / 4h delegated
-  - Landed <https://example.com/repo/pull/130|combined three follow-up fixes into one PR>
-  - Plus <https://example.com/repo/pull/131|restore safety check> and <https://example.com/repo/pull/132|filter env contexts>
-- *Misc tooling* — ~30m direct / ~3h delegated
+**Yesterday**
+- **Project A — milestone work** — 6h direct / 12h delegated
+  - Shipped [customer-facing fix for hover bug](https://example.com/repo/pull/123) (closes 3 reported issues)
+  - Landed supporting changes: [docs into agents/skills](https://example.com/repo/pull/124), [error surfacing on infra failures](https://example.com/repo/pull/125)
+- **Project B — consolidation** — 2h direct / 4h delegated
+  - Landed [combined three follow-up fixes into one PR](https://example.com/repo/pull/130)
+  - Plus [restore safety check](https://example.com/repo/pull/131) and [filter env contexts](https://example.com/repo/pull/132)
+- **Misc tooling** — ~30m direct / ~3h delegated
   - CI workflow inputs, devbox connectivity recovery, standup pipeline sync improvements
-*Today*
+
+**Today**
 - Weekly review
 - May land the long-running refactor PR (might deploy to a test repo first as a precaution before submission)
-*Blockers*
+
+**Blockers**
 - None
 ```
-
-**What actually gets posted** (Block Kit `blocks` parameter, abbreviated):
-
-```json
-[
-  {
-    "type": "rich_text",
-    "elements": [
-      {"type": "rich_text_section", "elements": [
-        {"type": "text", "text": "Standup - Wed Mar 12", "style": {"bold": true}},
-        {"type": "text", "text": "\n\n"},
-        {"type": "text", "text": "Yesterday", "style": {"bold": true}},
-        {"type": "text", "text": "\n"}
-      ]},
-      {"type": "rich_text_list", "style": "bullet", "indent": 0, "elements": [
-        {"type": "rich_text_section", "elements": [
-          {"type": "text", "text": "Project A — milestone work", "style": {"bold": true}},
-          {"type": "text", "text": " — 6h direct / 12h delegated"}
-        ]}
-      ]},
-      {"type": "rich_text_list", "style": "bullet", "indent": 1, "elements": [
-        {"type": "rich_text_section", "elements": [
-          {"type": "text", "text": "Shipped "},
-          {"type": "link", "url": "https://example.com/repo/pull/123", "text": "customer-facing fix for hover bug"},
-          {"type": "text", "text": " (closes 3 reported issues)"}
-        ]}
-      ]},
-      {"type": "rich_text_section", "elements": [
-        {"type": "text", "text": "\n"},
-        {"type": "text", "text": "Today", "style": {"bold": true}},
-        {"type": "text", "text": "\n"}
-      ]}
-    ]
-  }
-]
-```
-
-See the `slack-bot` skill for the full Block Kit `rich_text` element reference.
 
 ## Setup (first run)
 
