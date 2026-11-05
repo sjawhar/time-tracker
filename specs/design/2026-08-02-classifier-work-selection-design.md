@@ -82,7 +82,7 @@ Adding a marker to the denylist is a deliberate act with a measured count behind
 
 A single stream with a stable reserved slug. Junked sessions are assigned to it, not deleted, so precision can be audited and a bad rule reversed by reassignment.
 
-Four overlapping streams currently serve this role by accident — `other: Misc (trivial sessions)`, `misc: stale test sessions`, `agent-c: remote misc`, `taiga: Misc agent-c sessions`. They consolidate into the reserved slug.
+Four overlapping streams currently serve this role by accident — `other: Misc (trivial sessions)`, `misc: stale test sessions`, `agent-c: remote misc`, `<platform>: Misc agent-c sessions`. They consolidate into the reserved slug.
 
 Junk time is excluded from stream reporting but remains visible, so a filter that starts eating real work is detectable rather than silent.
 

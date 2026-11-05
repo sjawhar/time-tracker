@@ -161,9 +161,9 @@ mod tests {
         assert_eq!(stream_label("abc", "short"), "abc     short");
         let label = stream_label(
             "abc123def456",
-            "workorder-5: Anthropic cross-model eval - runs/scoring/flow",
+            "workorder-5: ExampleCo cross-model eval - runs/scoring/flow",
         );
-        assert_eq!(label, "abc123  workorder-5: Anthropic cross-model…");
+        assert_eq!(label, "abc123  workorder-5: ExampleCo cross-model…");
     }
 
     #[test]
